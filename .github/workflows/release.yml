@@ -65,16 +65,22 @@ jobs:
           OPENCODE_VERSION: ${{ steps.version.outputs.version }}
         run: bun script/build.ts --single --skip-install
 
-      - name: Upload binary to release
+      - name: Create zip archive (max compression)
+        working-directory: packages/opencode/dist/opencode-windows-x64/bin
+        run: |
+          7z a -mx=9 "${{ github.workspace }}/opencode-windows-x64-${{ steps.version.outputs.version }}.zip" opencode.exe
+
+      - name: Upload binary and zip to release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "${{ steps.version.outputs.tag }}" \
             packages/opencode/dist/opencode-windows-x64/bin/opencode.exe \
+            opencode-windows-x64-${{ steps.version.outputs.version }}.zip \
             --clobber \
             --repo ${{ github.repository }}
 
-      - name: Upload artifact (backup)
+      - name: Upload artifacts (backup)
         uses: actions/upload-artifact@v4
         with:
           name: opencode-windows-${{ steps.version.outputs.version }}
