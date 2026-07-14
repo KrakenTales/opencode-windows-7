@@ -58,20 +58,23 @@ jobs:
             --title "${{ steps.version.outputs.tag }}" \
             --generate-notes
 
-      - name: Install zip
-        run: choco install zip -y
-
       - name: Build Windows CLI
         working-directory: packages/opencode
         env:
           OPENCODE_CHANNEL: latest
           OPENCODE_VERSION: ${{ steps.version.outputs.version }}
-          OPENCODE_RELEASE: "1"
-          GH_REPO: ${{ github.repository }}
-          GH_TOKEN: ${{ github.token }}
         run: bun script/build.ts --single --skip-install
 
-      - name: Upload artifact
+      - name: Upload binary to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ steps.version.outputs.tag }}" \
+            packages/opencode/dist/opencode-windows-x64/bin/opencode.exe \
+            --clobber \
+            --repo ${{ github.repository }}
+
+      - name: Upload artifact (backup)
         uses: actions/upload-artifact@v4
         with:
           name: opencode-windows-${{ steps.version.outputs.version }}
