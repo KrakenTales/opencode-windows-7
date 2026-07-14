@@ -51,9 +51,6 @@ jobs:
         run: |
           mkdir -p /tmp/custom
           cp .github/workflows/*.yml /tmp/custom/
-          if [ -f .github/scripts/patch-build.mjs ]; then
-            cp .github/scripts/patch-build.mjs /tmp/custom/
-          fi
 
       - name: Download and extract upstream source
         if: steps.check.outputs.update_needed
@@ -66,10 +63,6 @@ jobs:
         run: |
           rm -f .github/workflows/*.yml
           cp /tmp/custom/*.yml .github/workflows/
-          if [ -f /tmp/custom/patch-build.mjs ]; then
-            mkdir -p .github/scripts
-            cp /tmp/custom/patch-build.mjs .github/scripts/
-          fi
 
       - name: Patch package.json (bun@1.3.13)
         if: steps.check.outputs.update_needed
@@ -80,10 +73,6 @@ jobs:
             pkg.packageManager = 'bun@1.3.13';
             fs.writeFileSync('./package.json', JSON.stringify(pkg, null, 2) + '\n');
           "
-
-      - name: Patch build.ts (fix tar.gz glob for Windows)
-        if: steps.check.outputs.update_needed
-        run: node .github/scripts/patch-build.mjs
 
       - name: Patch README.md (add Win7 banner)
         if: steps.check.outputs.update_needed
