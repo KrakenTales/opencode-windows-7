@@ -1,0 +1,81 @@
+name: Release CLI minimal (exe only)
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version (e.g. 1.17.18). Leave empty to use current from package.json"
+        required: false
+        type: string
+      bump:
+        description: "Bump patch version (ignored if version is specified)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+
+      - name: Determine version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_BUMP: ${{ inputs.bump }}
+        run: |
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
+          else
+            CURRENT=$(node -p "require('./packages/opencode/package.json').version")
+            if [ "$INPUT_BUMP" = "true" ]; then
+              IFS='.' read -r MAJ MIN PATCH <<< "$CURRENT"
+              VERSION="${MAJ}.${MIN}.$((PATCH + 1))"
+            else
+              VERSION="$CURRENT"
+            fi
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.version.outputs.tag }}" \
+            --draft \
+            --title "${{ steps.version.outputs.tag }}" \
+            --generate-notes
+
+      - name: Build Windows CLI
+        working-directory: packages/opencode
+        env:
+          OPENCODE_CHANNEL: latest
+          OPENCODE_VERSION: ${{ steps.version.outputs.version }}
+        run: bun script/build.ts --single --skip-install
+
+      - name: Upload binary to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ steps.version.outputs.tag }}" \
+            packages/opencode/dist/opencode-windows-x64/bin/opencode.exe \
+            --clobber \
+            --repo ${{ github.repository }}
+
+      - name: Upload artifact (backup)
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-windows-${{ steps.version.outputs.version }}
+          path: packages/opencode/dist/opencode-windows-x64/bin/opencode.exe
