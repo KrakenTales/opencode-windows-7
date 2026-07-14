@@ -14,6 +14,9 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    outputs:
+      update_needed: ${{ steps.check.outputs.update_needed }}
+      version: ${{ steps.check.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -104,3 +107,28 @@ jobs:
           git add -A
           git commit -m "chore: sync with upstream ${{ steps.version.outputs.tag }}"
           git push
+
+  build:
+    needs: sync
+    if: needs.sync.outputs.update_needed == 'true'
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+
+      - name: Build Windows CLI (test build)
+        working-directory: packages/opencode
+        env:
+          OPENCODE_CHANNEL: latest
+        run: bun script/build.ts --single --skip-install
+
+      - name: Upload test artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-windows-test-${{ needs.sync.outputs.version }}
+          path: packages/opencode/dist/opencode-windows-x64/bin/opencode.exe
