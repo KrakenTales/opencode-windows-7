@@ -1,9 +1,9 @@
-export * as ProjectCopy from "./project-copy.js"
+export * as ProjectCopy from "./project-copy"
 
 import { Schema } from "effect"
-import { optional } from "./schema.js"
-import { ProjectID } from "./project-id.js"
-import { AbsolutePath } from "./schema.js"
+import { optional } from "./schema"
+import { ProjectID } from "./project-id"
+import { AbsolutePath } from "./schema"
 
 export const StrategyID = Schema.Trim.pipe(Schema.check(Schema.isNonEmpty()), Schema.brand("ProjectCopy.StrategyID"))
 export type StrategyID = typeof StrategyID.Type

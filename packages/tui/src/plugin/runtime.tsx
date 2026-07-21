@@ -4,6 +4,7 @@ import type {
   TuiPluginInstallResult,
   TuiPluginStatus,
 } from "@opencode-ai/plugin/tui"
+import type { TuiConfig } from "../config"
 import { createContext, createSignal, useContext, type JSX, type ParentProps } from "solid-js"
 import { createPluginRoutes } from "./api"
 import { createSlots, type HostSlots } from "./slots"
@@ -60,6 +61,7 @@ export type PluginRuntime = ReturnType<typeof createPluginRuntime>
 export type TuiPluginHost = {
   start(input: {
     api: TuiPluginApi
+    config: TuiConfig.Resolved
     runtime: PluginRuntime
     dispose?: () => void
   }): Promise<void>

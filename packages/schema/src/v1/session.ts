@@ -1,16 +1,16 @@
-export * as SessionV1 from "./session.js"
+export * as SessionV1 from "./session"
 
 import { Effect, Schema, Types } from "effect"
-import { durable, ephemeral, inventory } from "../event.js"
-import { Project } from "../project.js"
-import { Provider } from "../provider.js"
-import { Model } from "../model.js"
-import { NonNegativeInt, optional, statics } from "../schema.js"
-import { ascending } from "../identifier.js"
-import { SessionID } from "../session-id.js"
-import { WorkspaceID } from "../workspace-id.js"
-import { PermissionV1 } from "./permission.js"
-import { FileDiff } from "../file-diff.js"
+import { define, inventory } from "../event"
+import { FileDiff } from "../file-diff"
+import { Project } from "../project"
+import { Provider } from "../provider"
+import { Model } from "../model"
+import { NonNegativeInt, optional, statics } from "../schema"
+import { ascending } from "../identifier"
+import { SessionID } from "../session-id"
+import { WorkspaceID } from "../workspace-id"
+import { PermissionV1 } from "./permission"
 
 const Timestamp = Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))
 
@@ -340,7 +340,7 @@ export const User = Schema.Struct({
     Schema.Struct({
       title: Schema.optional(Schema.String),
       body: Schema.optional(Schema.String),
-      diffs: Schema.Array(FileDiff.LegacyInfo),
+      diffs: Schema.Array(FileDiff.Info),
     }),
   ),
   agent: Schema.String,
@@ -510,7 +510,7 @@ const SessionSummary = Schema.Struct({
   additions: Schema.Finite,
   deletions: Schema.Finite,
   files: Schema.Finite,
-  diffs: optional(Schema.Array(FileDiff.LegacyInfo)),
+  diffs: optional(Schema.Array(FileDiff.Info)),
 })
 
 const SessionTokens = Schema.Struct({
@@ -565,11 +565,11 @@ export const SessionInfo = Schema.Struct({
   }),
   permission: optional(PermissionV1.Ruleset),
   revert: optional(SessionRevert),
-}).annotate({ identifier: "SessionV1.Info" })
+}).annotate({ identifier: "Session" })
 export type SessionInfo = typeof SessionInfo.Type
 
 const events = {
-  Created: durable({
+  Created: define({
     type: "session.created",
     ...options,
     schema: {
@@ -577,7 +577,7 @@ const events = {
       info: SessionInfo,
     },
   }),
-  Updated: durable({
+  Updated: define({
     type: "session.updated",
     ...options,
     schema: {
@@ -585,7 +585,7 @@ const events = {
       info: SessionInfo,
     },
   }),
-  Deleted: durable({
+  Deleted: define({
     type: "session.deleted",
     ...options,
     schema: {
@@ -593,7 +593,7 @@ const events = {
       info: SessionInfo,
     },
   }),
-  MessageUpdated: durable({
+  MessageUpdated: define({
     type: "message.updated",
     ...options,
     schema: {
@@ -601,7 +601,7 @@ const events = {
       info: Info,
     },
   }),
-  MessageRemoved: durable({
+  MessageRemoved: define({
     type: "message.removed",
     ...options,
     schema: {
@@ -609,7 +609,7 @@ const events = {
       messageID: MessageID,
     },
   }),
-  PartUpdated: durable({
+  PartUpdated: define({
     type: "message.part.updated",
     ...options,
     schema: {
@@ -618,7 +618,7 @@ const events = {
       time: Schema.Finite,
     },
   }),
-  PartRemoved: durable({
+  PartRemoved: define({
     type: "message.part.removed",
     ...options,
     schema: {
@@ -629,7 +629,7 @@ const events = {
   }),
 }
 
-export const PartDelta = ephemeral({
+export const PartDelta = define({
   type: "message.part.delta",
   schema: {
     sessionID: SessionID,
@@ -640,15 +640,15 @@ export const PartDelta = ephemeral({
   },
 })
 
-export const Diff = ephemeral({
+export const Diff = define({
   type: "session.diff",
   schema: {
     sessionID: SessionID,
-    diff: Schema.Array(FileDiff.LegacyInfo),
+    diff: Schema.Array(FileDiff.Info),
   },
 })
 
-export const Error = ephemeral({
+export const Error = define({
   type: "session.error",
   schema: {
     sessionID: Schema.optional(SessionID),

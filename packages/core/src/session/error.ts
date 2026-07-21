@@ -1,14 +1,6 @@
-export * as SessionErrors from "./error"
-
 import { Schema } from "effect"
-import { Agent } from "@opencode-ai/schema/agent"
 import { SessionMessage } from "./message"
 import { SessionSchema } from "./schema"
-import { SessionError } from "@opencode-ai/schema/session-error"
-
-export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("Session.NotFoundError", {
-  sessionID: SessionSchema.ID,
-}) {}
 
 export class MessageDecodeError extends Schema.TaggedErrorClass<MessageDecodeError>()("Session.MessageDecodeError", {
   sessionID: SessionSchema.ID,
@@ -19,28 +11,14 @@ export class MessageDecodeError extends Schema.TaggedErrorClass<MessageDecodeErr
   }
 }
 
-export class AgentNotFoundError extends Schema.TaggedErrorClass<AgentNotFoundError>()("Session.AgentNotFoundError", {
-  sessionID: SessionSchema.ID,
-  agent: Agent.ID,
-}) {
-  override get message() {
-    return `Agent not found: "${this.agent}"`
-  }
-}
-
-export class StepFailedError extends Schema.TaggedErrorClass<StepFailedError>()("Session.StepFailedError", {
-  error: SessionError.Error,
-}) {
-  override get message() {
-    return this.error.message
-  }
-}
-
-export class UserInterruptedError extends Schema.TaggedErrorClass<UserInterruptedError>()(
-  "Session.UserInterruptedError",
-  {},
+export class ContextSnapshotDecodeError extends Schema.TaggedErrorClass<ContextSnapshotDecodeError>()(
+  "Session.ContextSnapshotDecodeError",
+  {
+    sessionID: SessionSchema.ID,
+    details: Schema.String,
+  },
 ) {
   override get message() {
-    return "Session interrupted by user"
+    return `Failed to decode context snapshot for session ${this.sessionID}: ${this.details}`
   }
 }

@@ -1,34 +1,63 @@
 import { createMemo } from "solid-js"
 import { DialogSelect, type DialogSelectRef } from "../ui/dialog-select"
 import { type DialogContext } from "../ui/dialog"
-import { COMMAND_PALETTE_COMMAND, Keymap, type KeymapCommand } from "../context/keymap"
+import {
+  COMMAND_PALETTE_COMMAND,
+  formatKeyBindings,
+  type OpenTuiKeymap,
+  useKeymapSelector,
+  useOpencodeKeymap,
+} from "../keymap"
+import { useTuiConfig } from "../config"
 
-function isSuggestedPaletteCommand(command: KeymapCommand) {
-  const suggested = command.suggested
+type PaletteCommandEntry = ReturnType<OpenTuiKeymap["getCommandEntries"]>[number]
+
+function isVisiblePaletteCommand(command: PaletteCommandEntry["command"]) {
+  return command.hidden !== true && command.name !== COMMAND_PALETTE_COMMAND
+}
+
+function isSuggestedPaletteCommand(entry: PaletteCommandEntry) {
+  const suggested = entry.command.suggested
   if (typeof suggested === "boolean") return suggested
   if (typeof suggested === "function") return suggested() === true
   return false
 }
 
 export function CommandPaletteDialog() {
-  const commands = Keymap.useCommands()
-  const shortcuts = Keymap.useShortcuts()
+  const config = useTuiConfig()
+  const keymap = useOpencodeKeymap()
+  const entries = useKeymapSelector((keymap: OpenTuiKeymap) => {
+    const query = {
+      namespace: "palette",
+    }
+    const reachable = keymap.getCommandEntries({
+      ...query,
+      visibility: "reachable",
+      filter: isVisiblePaletteCommand,
+    })
+    const registeredBindings = keymap.getCommandBindings({
+      visibility: "registered",
+      commands: reachable.map((entry) => entry.command.name),
+    })
+
+    return reachable.map((entry) => ({
+      ...entry,
+      bindings: registeredBindings.get(entry.command.name) ?? entry.bindings,
+    }))
+  })
   const options = createMemo(() =>
-    commands().flatMap((command) => {
-      if (!command.id || !command.palette || command.id === COMMAND_PALETTE_COMMAND) return []
-      return {
-        title: command.title ?? command.id,
-        description: command.description,
-        category: command.group,
-        footer: shortcuts.all(command.id),
-        value: command.id,
-        suggested: isSuggestedPaletteCommand(command),
-        onSelect: (dialog: DialogContext) => {
-          dialog.clear()
-          command.run()
-        },
-      }
-    }),
+    entries().map((entry) => ({
+      title: typeof entry.command.title === "string" ? entry.command.title : entry.command.name,
+      description: typeof entry.command.desc === "string" ? entry.command.desc : undefined,
+      category: typeof entry.command.category === "string" ? entry.command.category : undefined,
+      footer: formatKeyBindings(entry.bindings, config),
+      value: entry.command.name,
+      suggested: isSuggestedPaletteCommand(entry),
+      onSelect: (dialog: DialogContext) => {
+        dialog.clear()
+        keymap.dispatchCommand(entry.command.name)
+      },
+    })),
   )
 
   let ref: DialogSelectRef<string>

@@ -8,19 +8,12 @@
       "dependsOn": [],
       "outputs": ["dist/**"]
     },
-    "@opencode-ai/codemode#test": {
+    "opencode#test": {
       "dependsOn": ["^build"],
-      "outputs": []
+      "outputs": [],
+      "passThroughEnv": ["*"]
     },
     "@opencode-ai/core#test": {
-      "dependsOn": ["^build"],
-      "outputs": []
-    },
-    "@opencode-ai/cli#test": {
-      "dependsOn": ["^build"],
-      "outputs": []
-    },
-    "@opencode-ai/tui#test": {
       "dependsOn": ["^build"],
       "outputs": []
     },

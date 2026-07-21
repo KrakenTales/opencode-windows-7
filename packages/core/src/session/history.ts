@@ -1,28 +1,20 @@
-import { and, asc, desc, eq, gte, sql } from "drizzle-orm"
+import { and, asc, desc, eq, gt, gte, ne, or } from "drizzle-orm"
 import { Effect, Schema } from "effect"
 import { Database } from "../database/database"
 import { MessageDecodeError } from "./error"
 import { SessionMessage } from "./message"
 import { SessionSchema } from "./schema"
-import { Instructions } from "../instructions/index"
-import { InstructionState } from "./instruction-state"
-import { SessionMessageTable } from "./sql"
+import { SessionContextEpochTable, SessionMessageTable } from "./sql"
 
 type DatabaseService = Database.Interface["db"]
 
-const decode = Schema.decodeUnknownEffect(SessionMessage.Info)
+const decode = Schema.decodeUnknownEffect(SessionMessage.Message)
 
 export const latestCompaction = Effect.fnUntraced(function* (db: DatabaseService, sessionID: SessionSchema.ID) {
   return yield* db
     .select({ seq: SessionMessageTable.seq })
     .from(SessionMessageTable)
-    .where(
-      and(
-        eq(SessionMessageTable.session_id, sessionID),
-        eq(SessionMessageTable.type, "compaction"),
-        sql`json_extract(${SessionMessageTable.data}, '$.status') = 'completed'`,
-      ),
-    )
+    .where(and(eq(SessionMessageTable.session_id, sessionID), eq(SessionMessageTable.type, "compaction")))
     .orderBy(desc(SessionMessageTable.seq))
     .limit(1)
     .get()
@@ -33,6 +25,7 @@ const messageRows = Effect.fnUntraced(function* (
   db: DatabaseService,
   sessionID: SessionSchema.ID,
   compaction: { readonly seq: number } | undefined,
+  baselineSeq?: number,
 ) {
   const rows = yield* db
     .select()
@@ -40,7 +33,17 @@ const messageRows = Effect.fnUntraced(function* (
     .where(
       and(
         eq(SessionMessageTable.session_id, sessionID),
-        compaction ? gte(SessionMessageTable.seq, compaction.seq) : undefined,
+        compaction
+          ? or(
+              gte(SessionMessageTable.seq, compaction.seq),
+              baselineSeq === undefined
+                ? undefined
+                : and(eq(SessionMessageTable.type, "system"), gt(SessionMessageTable.seq, baselineSeq)),
+            )
+          : undefined,
+        baselineSeq === undefined
+          ? undefined
+          : or(ne(SessionMessageTable.type, "system"), gt(SessionMessageTable.seq, baselineSeq)),
       ),
     )
     .orderBy(asc(SessionMessageTable.seq))
@@ -60,79 +63,39 @@ const decodeMessageRow = (row: typeof SessionMessageTable.$inferSelect) =>
     ),
   )
 
-const messageEntries = Effect.fnUntraced(function* (db: DatabaseService, sessionID: SessionSchema.ID) {
-  const rows = yield* messageRows(db, sessionID, yield* latestCompaction(db, sessionID))
-  return yield* Effect.forEach(rows, (row) =>
-    decodeMessageRow(row).pipe(Effect.map((message) => ({ seq: row.seq, message }))),
+export const load = Effect.fn("SessionHistory.load")(function* (db: DatabaseService, sessionID: SessionSchema.ID) {
+  const [epoch, compaction] = yield* Effect.all(
+    [
+      db
+        .select({ baselineSeq: SessionContextEpochTable.baseline_seq })
+        .from(SessionContextEpochTable)
+        .where(eq(SessionContextEpochTable.session_id, sessionID))
+        .get()
+        .pipe(Effect.orDie),
+      latestCompaction(db, sessionID),
+    ],
+    { concurrency: "unbounded" },
   )
+  return yield* Effect.forEach(yield* messageRows(db, sessionID, compaction, epoch?.baselineSeq), decodeMessageRow)
 })
 
-export const load = Effect.fn("SessionHistory.load")(function* (db: DatabaseService, sessionID: SessionSchema.ID) {
-  return (yield* messageEntries(db, sessionID)).map((entry) => entry.message)
+export const loadForRunner = Effect.fn("SessionHistory.loadForRunner")(function* (
+  db: DatabaseService,
+  sessionID: SessionSchema.ID,
+  baselineSeq: number,
+) {
+  return (yield* entriesForRunner(db, sessionID, baselineSeq)).map((entry) => entry.message)
 })
 
 export const entriesForRunner = Effect.fn("SessionHistory.entriesForRunner")(function* (
   db: DatabaseService,
   sessionID: SessionSchema.ID,
-  instructions: Instructions.Instructions,
+  baselineSeq: number,
 ) {
-  return yield* db
-    .transaction(() =>
-      Effect.gen(function* () {
-        const messages = yield* messageEntries(db, sessionID)
-        const assembled = yield* InstructionState.assemble(db, sessionID, instructions)
-        return {
-          initial: assembled.initial,
-          entries: [...messages, ...assembled.updates].toSorted((a, b) => a.seq - b.seq),
-        }
-      }),
-    )
-    .pipe(Effect.orDie)
-})
-
-export const preview = Effect.fn("SessionHistory.preview")(function* (
-  db: DatabaseService,
-  sessionID: SessionSchema.ID,
-  instructions: Instructions.Instructions,
-) {
-  const observed = yield* Instructions.read(instructions)
-  return yield* db
-    .transaction(() =>
-      Effect.gen(function* () {
-        const messages = yield* messageEntries(db, sessionID)
-        // An active assistant may contain an unresolved tool call, so only preview the settled prefix.
-        const unsettled = messages.findIndex(
-          (entry) => entry.message.type === "assistant" && entry.message.time.completed === undefined,
-        )
-        const settled = unsettled === -1 ? messages : messages.slice(0, unsettled)
-        const assembled = yield* InstructionState.preview(db, sessionID, instructions, observed)
-        const entries = [...settled, ...assembled.updates].toSorted((a, b) => a.seq - b.seq)
-        return {
-          initial: assembled.initial,
-          messages: entries.map((entry) => entry.message),
-          instructionUpdate: assembled.update,
-        }
-      }),
-    )
-    .pipe(Effect.catch((error) => (error instanceof Instructions.InitializationBlocked ? error : Effect.die(error))))
-})
-
-/** Returns the session's sole user message, or `undefined` once a second one exists. */
-export const firstUserMessageIfOnly = Effect.fn("SessionHistory.firstUserMessageIfOnly")(function* (
-  db: DatabaseService,
-  sessionID: SessionSchema.ID,
-) {
-  const rows = yield* db
-    .select()
-    .from(SessionMessageTable)
-    .where(and(eq(SessionMessageTable.session_id, sessionID), eq(SessionMessageTable.type, "user")))
-    .orderBy(asc(SessionMessageTable.seq))
-    .limit(2)
-    .all()
-    .pipe(Effect.orDie)
-  if (rows.length !== 1) return undefined
-  const message = yield* decodeMessageRow(rows[0]).pipe(Effect.catch(() => Effect.succeed(undefined)))
-  return message?.type === "user" ? message : undefined
+  const rows = yield* messageRows(db, sessionID, yield* latestCompaction(db, sessionID), baselineSeq)
+  return yield* Effect.forEach(rows, (row) =>
+    decodeMessageRow(row).pipe(Effect.map((message) => ({ seq: row.seq, message }))),
+  )
 })
 
 export * as SessionHistory from "./history"

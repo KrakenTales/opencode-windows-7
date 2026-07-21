@@ -1,6 +1,5 @@
 import nodePath from "path"
 import { customType } from "drizzle-orm/sqlite-core"
-import { Schema } from "effect"
 import { AbsolutePath } from "../schema"
 
 function storagePath(input: string) {
@@ -75,8 +74,6 @@ export const pathColumn = customType<{
   },
 })
 
-const decodeAbsoluteArray = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Array(Schema.String)))
-
 export const absoluteArrayColumn = customType<{
   data: AbsolutePath[]
   driverData: string
@@ -89,6 +86,6 @@ export const absoluteArrayColumn = customType<{
     return JSON.stringify(input.map(absolute))
   },
   fromDriver(input) {
-    return decodeAbsoluteArray(input).map((item) => AbsolutePath.make(toPlatform(absolute(item))))
+    return (JSON.parse(input) as string[]).map((item) => AbsolutePath.make(toPlatform(absolute(item))))
   },
 })

@@ -1,18 +1,15 @@
-export * as FileSystem from "./filesystem.js"
+export * as FileSystem from "./filesystem"
 
 import { Schema } from "effect"
-import { optional } from "./schema.js"
-import { ephemeral, inventory } from "./event.js"
-import { NonNegativeInt, PositiveInt, RelativePath } from "./schema.js"
+import { optional } from "./schema"
+import { define, inventory } from "./event"
+import { NonNegativeInt, PositiveInt, RelativePath } from "./schema"
 
-const Changed = ephemeral({
-  type: "filesystem.changed",
-  schema: {
-    file: Schema.String,
-    event: Schema.Literals(["add", "change", "unlink"]),
-  },
+const Edited = define({
+  type: "file.edited",
+  schema: { file: Schema.String },
 })
-export const Event = { Changed, Definitions: inventory(Changed) }
+export const Event = { Edited, Definitions: inventory(Edited) }
 
 export interface Entry extends Schema.Schema.Type<typeof Entry> {}
 export const Entry = Schema.Struct({

@@ -72,6 +72,7 @@ const baseState = (input: Partial<State> = {}) =>
     sessionTotal: 0,
     session_status: {},
     session_diff: {},
+    todo: {},
     permission: {},
     question: {},
     mcp: {},
@@ -215,6 +216,7 @@ describe("applyDirectoryEvent", () => {
         message: { ses_1: [message] },
         part: { [message.id]: [textPart("prt_1", "ses_1", message.id)] },
         session_diff: { ses_1: [] },
+        todo: { ses_1: [] },
         permission: { ses_1: [] },
         question: { ses_1: [] },
         session_status: { ses_1: { type: "busy" } },
@@ -235,9 +237,26 @@ describe("applyDirectoryEvent", () => {
     expect(store.message.ses_1).toBeUndefined()
     expect(store.part[message.id]).toBeUndefined()
     expect(store.session_diff.ses_1).toBeUndefined()
+    expect(store.todo.ses_1).toBeUndefined()
     expect(store.permission.ses_1).toBeUndefined()
     expect(store.question.ses_1).toBeUndefined()
     expect(store.session_status.ses_1).toBeUndefined()
+  })
+
+  test("ignores an archived session absent from a passive directory store", () => {
+    const [store, setStore] = createStore(baseState({ session: [], sessionTotal: 0 }))
+
+    applyDirectoryEvent({
+      event: { type: "session.updated", properties: { info: rootSession({ id: "missing", archived: 10 }) } },
+      store,
+      setStore,
+      push() {},
+      directory: "/tmp",
+      loadLsp() {},
+    })
+
+    expect(store.session).toEqual([])
+    expect(store.sessionTotal).toBe(0)
   })
 
   test("cleans session caches when deleted and decrements only root totals", () => {
@@ -259,6 +278,7 @@ describe("applyDirectoryEvent", () => {
           message: { [item.info.id]: [message] },
           part: { [message.id]: [textPart("prt_1", item.info.id, message.id)] },
           session_diff: { [item.info.id]: [] },
+          todo: { [item.info.id]: [] },
           permission: { [item.info.id]: [] },
           question: { [item.info.id]: [] },
           session_status: { [item.info.id]: { type: "busy" } },
@@ -279,6 +299,7 @@ describe("applyDirectoryEvent", () => {
       expect(store.message[item.info.id]).toBeUndefined()
       expect(store.part[message.id]).toBeUndefined()
       expect(store.session_diff[item.info.id]).toBeUndefined()
+      expect(store.todo[item.info.id]).toBeUndefined()
       expect(store.permission[item.info.id]).toBeUndefined()
       expect(store.question[item.info.id]).toBeUndefined()
       expect(store.session_status[item.info.id]).toBeUndefined()
@@ -289,6 +310,7 @@ describe("applyDirectoryEvent", () => {
     const dropped = rootSession({ id: "ses_b" })
     const kept = rootSession({ id: "ses_a" })
     const message = userMessage("msg_1", dropped.id)
+    const todos: string[] = []
     const [store, setStore] = createStore(
       baseState({
         limit: 1,
@@ -296,6 +318,7 @@ describe("applyDirectoryEvent", () => {
         message: { [dropped.id]: [message] },
         part: { [message.id]: [textPart("prt_1", dropped.id, message.id)] },
         session_diff: { [dropped.id]: [] },
+        todo: { [dropped.id]: [] },
         permission: { [dropped.id]: [] },
         question: { [dropped.id]: [] },
         session_status: { [dropped.id]: { type: "busy" } },
@@ -309,15 +332,21 @@ describe("applyDirectoryEvent", () => {
       push() {},
       directory: "/tmp",
       loadLsp() {},
+      setSessionTodo(sessionID, value) {
+        if (value !== undefined) return
+        todos.push(sessionID)
+      },
     })
 
     expect(store.session.map((x) => x.id)).toEqual([kept.id])
     expect(store.message[dropped.id]).toBeUndefined()
     expect(store.part[message.id]).toBeUndefined()
     expect(store.session_diff[dropped.id]).toBeUndefined()
+    expect(store.todo[dropped.id]).toBeUndefined()
     expect(store.permission[dropped.id]).toBeUndefined()
     expect(store.question[dropped.id]).toBeUndefined()
     expect(store.session_status[dropped.id]).toBeUndefined()
+    expect(todos).toEqual([dropped.id])
   })
 
   test("cleanupDroppedSessionCaches clears part-only orphan state", () => {

@@ -1,6 +1,7 @@
 /** @jsxImportSource @opentui/solid */
 import { TextareaRenderable } from "@opentui/core"
-import { testRender } from "@opentui/solid"
+import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
+import { testRender, useRenderer } from "@opentui/solid"
 import { expect, test } from "bun:test"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
@@ -25,27 +26,35 @@ async function mountPrompt(input: {
 }) {
   const state = path.join(input.root, "state")
   await mkdir(state, { recursive: true })
+  await Bun.write(path.join(state, "kv.json"), "{}")
 
-  const [{ DialogProvider }, { DialogPrompt }, { ThemeProvider }, { ConfigProvider }, { ToastProvider }, { Keymap }] =
-    await Promise.all([
-      import("../../../src/ui/dialog"),
-      import("../../../src/ui/dialog-prompt"),
-      import("../../../src/context/theme"),
-      import("../../../src/config"),
-      import("../../../src/ui/toast"),
-      import("../../../src/context/keymap"),
-    ])
+  const [
+    { DialogProvider },
+    { DialogPrompt },
+    { KVProvider },
+    { ThemeProvider },
+    { TuiConfigProvider },
+    { ToastProvider },
+    { OpencodeKeymapProvider, registerOpencodeKeymap },
+  ] = await Promise.all([
+    import("../../../src/ui/dialog"),
+    import("../../../src/ui/dialog-prompt"),
+    import("../../../src/context/kv"),
+    import("../../../src/context/theme"),
+    import("../../../src/config"),
+    import("../../../src/ui/toast"),
+    import("../../../src/keymap"),
+  ])
 
   function Harness() {
+    const renderer = useRenderer()
+    const keymap = createDefaultOpenTuiKeymap(renderer)
     const resolvedConfig = createTuiResolvedConfig({
       keybinds: input.keybinds,
-      leader: { timeout: 1000 },
+      leader_timeout: 1000,
     })
-
-    function Prompt() {
-      onCleanup(Keymap.use().mode.push("modal"))
-      return <DialogPrompt title="Rename Session" value="draft" onConfirm={input.onConfirm} />
-    }
+    const off = registerOpencodeKeymap(keymap, renderer, resolvedConfig)
+    onCleanup(off)
 
     return (
       <TestTuiContexts
@@ -56,23 +65,24 @@ async function mountPrompt(input: {
           worktree: input.root,
         }}
       >
-        <ConfigProvider config={resolvedConfig}>
-          <Keymap.Provider>
-            <ThemeProvider mode="dark">
-              <ToastProvider>
-                <DialogProvider>
-                  <Prompt />
-                </DialogProvider>
-              </ToastProvider>
-            </ThemeProvider>
-          </Keymap.Provider>
-        </ConfigProvider>
+        <OpencodeKeymapProvider keymap={keymap}>
+          <TuiConfigProvider config={resolvedConfig}>
+            <KVProvider>
+              <ThemeProvider mode="dark">
+                <ToastProvider>
+                  <DialogProvider>
+                    <DialogPrompt title="Rename Session" value="draft" onConfirm={input.onConfirm} />
+                  </DialogProvider>
+                </ToastProvider>
+              </ThemeProvider>
+            </KVProvider>
+          </TuiConfigProvider>
+        </OpencodeKeymapProvider>
       </TestTuiContexts>
     )
   }
 
   const app = await testRender(() => <Harness />, { kittyKeyboard: true })
-  app.renderer.start()
   return {
     app,
     async cleanup() {

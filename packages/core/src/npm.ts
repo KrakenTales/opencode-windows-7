@@ -12,7 +12,6 @@ import { filesystem } from "./effect/app-node-platform"
 import { LayerNode } from "./effect/layer-node"
 import { makeRuntime } from "./effect/runtime"
 import { NpmConfig } from "./npm-config"
-import { resolveModule } from "#runtime-import"
 
 export class InstallFailedError extends Schema.TaggedErrorClass<InstallFailedError>()("NpmInstallFailedError", {
   add: Schema.Array(Schema.String).pipe(Schema.optional),
@@ -26,10 +25,7 @@ export interface EntryPoint {
 }
 
 export interface Interface {
-  readonly add: (
-    pkg: string,
-    options?: { readonly subpaths?: readonly string[] },
-  ) => Effect.Effect<EntryPoint, InstallFailedError | EffectFlock.LockError>
+  readonly add: (pkg: string) => Effect.Effect<EntryPoint, InstallFailedError | EffectFlock.LockError>
   readonly install: (
     dir: string,
     input?: {
@@ -51,16 +47,13 @@ export function sanitize(pkg: string) {
   return Array.from(pkg, (char) => (illegal.has(char) || char.charCodeAt(0) < 32 ? "_" : char)).join("")
 }
 
-const resolveEntryPoint = (name: string, dir: string, subpaths: readonly string[] = [""]): EntryPoint => {
-  const entrypoint = subpaths
-    .map((subpath) => {
-      try {
-        return resolveModule([name, subpath].filter(Boolean).join("/"), dir)
-      } catch {
-        return undefined
-      }
-    })
-    .find((entrypoint) => entrypoint !== undefined)
+const resolveEntryPoint = (name: string, dir: string): EntryPoint => {
+  let entrypoint: string | undefined
+  try {
+    entrypoint = typeof Bun !== "undefined" ? import.meta.resolve(name, dir) : import.meta.resolve(dir)
+  } catch {
+    entrypoint = undefined
+  }
   return {
     directory: dir,
     entrypoint,
@@ -119,7 +112,7 @@ const layer = Layer.effect(
         }),
       )
 
-    const add = Effect.fn("Npm.add")(function* (pkg: string, options?: { readonly subpaths?: readonly string[] }) {
+    const add = Effect.fn("Npm.add")(function* (pkg: string) {
       const dir = directory(pkg)
       const name = (() => {
         try {
@@ -130,17 +123,17 @@ const layer = Layer.effect(
       })()
 
       if (yield* afs.existsSafe(path.join(dir, "node_modules", name))) {
-        return resolveEntryPoint(name, path.join(dir, "node_modules", name), options?.subpaths)
+        return resolveEntryPoint(name, path.join(dir, "node_modules", name))
       }
 
       const tree = yield* reify({ dir, add: [pkg] })
       const first = tree.edgesOut.values().next().value?.to
       if (!first) {
-        const result = resolveEntryPoint(name, path.join(dir, "node_modules", name), options?.subpaths)
+        const result = resolveEntryPoint(name, path.join(dir, "node_modules", name))
         if (result.entrypoint) return result
         return yield* new InstallFailedError({ add: [pkg], dir })
       }
-      return resolveEntryPoint(first.name, first.path, options?.subpaths)
+      return resolveEntryPoint(first.name, first.path)
     }, Effect.scoped)
 
     const install: Interface["install"] = Effect.fn("Npm.install")(function* (dir, input) {

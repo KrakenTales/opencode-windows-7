@@ -5,15 +5,13 @@ import path from "path"
 import { Context, Effect, Layer, Schema } from "effect"
 import { FSUtil } from "./fs-util"
 import { Location } from "./location"
-import { Project } from "./project"
-import { AbsolutePath } from "./schema"
 
 export const Kind = Schema.Literals(["file", "directory"])
 export type Kind = typeof Kind.Type
 
 /**
- * Mutation paths do not accept project references. Relative paths resolve
- * from the active Location. Paths outside it require separate
+ * Mutation paths do not accept project references. Relative paths must stay
+ * inside the active Location. Absolute paths outside it require separate
  * `external_directory` approval.
  */
 export const ResolveInput = Schema.Struct({
@@ -25,7 +23,7 @@ export type ResolveInput = typeof ResolveInput.Type
 
 export class PathError extends Schema.TaggedErrorClass<PathError>()("LocationMutation.PathError", {
   path: Schema.String,
-  reason: Schema.Literals(["location_escape", "non_directory_ancestor"]),
+  reason: Schema.Literals(["relative_escape", "location_escape", "non_directory_ancestor"]),
 }) {}
 
 export interface ExternalDirectoryAuthorization {
@@ -53,9 +51,9 @@ export interface Target {
 
 export interface Interface {
   /**
-   * Resolve a path and derive its permission resources. Relative paths resolve
-   * from the Location. Paths outside it require separate `external_directory`
-   * approval. This does not approve the mutation.
+   * Resolve a path and derive its permission resources. Relative paths must
+   * stay inside the Location. Absolute paths outside it require separate
+   * `external_directory` approval. This does not approve the mutation.
    */
   readonly resolve: (input: ResolveInput) => Effect.Effect<Target, PathError | FSUtil.Error>
 }
@@ -120,8 +118,10 @@ const layer = Layer.effect(
     })
 
     const resolve = Effect.fn("LocationMutation.resolve")(function* (input: ResolveInput) {
+      const relative = !path.isAbsolute(input.path)
       const absolute = path.resolve(location.directory, input.path)
       const lexicallyInternal = FSUtil.contains(location.directory, absolute)
+      if (relative && !lexicallyInternal) return yield* new PathError({ path: input.path, reason: "relative_escape" })
 
       const resolved = yield* resolvePath(absolute)
       if (lexicallyInternal && !FSUtil.contains(locationRoot, resolved.canonical)) {
@@ -143,9 +143,7 @@ const layer = Layer.effect(
               action: "external_directory",
               directory: externalDirectory,
               resource: externalResource,
-              save: slash(
-                path.join((yield* Project.root(fs, AbsolutePath.make(externalDirectory))) ?? externalDirectory, "*"),
-              ),
+              save: externalResource,
             }
           : undefined,
       } satisfies Target
@@ -154,6 +152,8 @@ const layer = Layer.effect(
     return Service.of({ resolve })
   }),
 )
+
+export const locationLayer = layer
 
 export const node = makeLocationNode({
   service: Service,

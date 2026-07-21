@@ -221,7 +221,7 @@ export const SettingsProvidersV2: Component<{ onBack?: () => void }> = (props) =
             <div class="settings-v2-provider-row" data-component="custom-provider-section">
               <div class="settings-v2-provider-lead">
                 <ProviderIcon
-                  id="session.synthetic"
+                  id="synthetic"
                   width={PROVIDER_ICON_SIZE}
                   height={PROVIDER_ICON_SIZE}
                   class="settings-v2-provider-icon shrink-0"

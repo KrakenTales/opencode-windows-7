@@ -1,35 +1,30 @@
 import { NodeFileSystem } from "@effect/platform-node"
-import { compile, emitEffectImported, emitEffectShape, emitPromise, write } from "@opencode-ai/httpapi-codegen"
-import {
-  ClientApi,
-  effectOmitEndpoints,
-  groupNames,
-  promiseOmitEndpoints,
-} from "@opencode-ai/protocol/client"
+import { compile, emitEffectImported, emitPromise, write } from "@opencode-ai/httpapi-codegen"
+import { ClientApi, endpointNames, groupNames, omitEndpoints } from "../src/contract"
 import { Effect } from "effect"
 import { fileURLToPath } from "url"
 
-const promiseContract = compile(ClientApi, { groupNames, omitEndpoints: promiseOmitEndpoints })
-const effectContract = compile(ClientApi, { groupNames, omitEndpoints: effectOmitEndpoints })
+const contract = compile(ClientApi, { groupNames, endpointNames, omitEndpoints })
 
 await Effect.runPromise(
   Effect.all(
     [
       write(
-        emitPromise(promiseContract, {
-          mutableOutputs: true,
+        emitPromise(contract, {
+          outputTypes: {
+            "events.subscribe": {
+              name: "OpenCodeEventEncoded",
+              import: 'import type { OpenCodeEventEncoded } from "@opencode-ai/protocol/groups/event"',
+            },
+          },
         }),
-        fileURLToPath(new URL("../src/promise/generated", import.meta.url)),
+        fileURLToPath(new URL("../src/generated", import.meta.url)),
       ),
       write(
-        emitEffectImported(effectContract, { module: "../../contract", api: "ClientApi" }),
-        fileURLToPath(new URL("../src/effect/generated", import.meta.url)),
-      ),
-      write(
-        emitEffectShape(effectContract, { module: "../../contract", api: "ClientApi" }),
-        fileURLToPath(new URL("../src/effect/api", import.meta.url)),
+        emitEffectImported(contract, { module: "../contract", api: "ClientApi" }),
+        fileURLToPath(new URL("../src/generated-effect", import.meta.url)),
       ),
     ],
-    { concurrency: 3, discard: true },
+    { concurrency: 2, discard: true },
   ).pipe(Effect.provide(NodeFileSystem.layer)),
 )

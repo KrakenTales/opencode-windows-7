@@ -1,9 +1,8 @@
 import {
   AssistantMessage,
-  type FileDiffInfo,
+  type SnapshotFileDiff,
   Message as MessageType,
   Part as PartType,
-  type UserMessage,
 } from "@opencode-ai/sdk/v2/client"
 import type { SessionStatus } from "@opencode-ai/sdk/v2"
 import { useData } from "../context"
@@ -91,21 +90,17 @@ function list<T>(value: T[] | undefined | null, fallback: T[]) {
   return fallback
 }
 
-type SummaryDiffInput = NonNullable<NonNullable<UserMessage["summary"]>["diffs"]>[number]
-type SummaryDiff = FileDiffInfo
+type SummaryDiff = SnapshotFileDiff & { file: string }
 
-function summaryDiff(value: SummaryDiffInput): value is SummaryDiff {
-  return (
-    typeof value.file === "string" &&
-    typeof value.patch === "string" &&
-    typeof value.additions === "number" &&
-    typeof value.deletions === "number" &&
-    value.status !== undefined
-  )
+function summaryDiff(value: SnapshotFileDiff): value is SummaryDiff {
+  return typeof value.file === "string"
 }
+
+const hidden = new Set(["todowrite"])
 
 function partState(part: PartType, showReasoningSummaries: boolean) {
   if (part.type === "tool") {
+    if (hidden.has(part.tool)) return
     if (part.tool === "question" && (part.state.status === "pending" || part.state.status === "running")) return
     return "visible" as const
   }

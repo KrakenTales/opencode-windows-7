@@ -1,22 +1,13 @@
-export * as Plugin from "./plugin.js"
+export * as Plugin from "./plugin"
 
 import { Schema } from "effect"
-import { ephemeral, inventory } from "./event.js"
+import { define, inventory } from "./event"
 
 export const ID = Schema.String.pipe(Schema.brand("Plugin.ID"))
 export type ID = typeof ID.Type
 
-export interface Info extends Schema.Schema.Type<typeof Info> {}
-export const Info = Schema.Struct({
-  id: ID,
-}).annotate({ identifier: "Plugin.Info" })
-
-const Added = ephemeral({
+const Added = define({
   type: "plugin.added",
   schema: { id: ID },
 })
-const Updated = ephemeral({
-  type: "plugin.updated",
-  schema: {},
-})
-export const Event = { Added, Updated, Definitions: inventory(Added, Updated) }
+export const Event = { Added, Definitions: inventory(Added) }

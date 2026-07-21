@@ -66,16 +66,18 @@ describe("AzureCognitiveServicesPlugin", () => {
         const catalog = yield* Catalog.Service
         yield* catalog.transform((catalog) => {
           catalog.provider.update(ProviderV2.ID.make("azure-cognitive-services"), (item) => {
-            item.package = ProviderV2.aisdk("@ai-sdk/openai-compatible")
+            item.api = { type: "aisdk", package: "@ai-sdk/openai-compatible" }
           })
         })
         yield* addPlugin()
         const result = required(yield* catalog.provider.get(ProviderV2.ID.make("azure-cognitive-services")))
-        expect(result).toMatchObject({
-          package: "aisdk:@ai-sdk/openai-compatible",
-          settings: { baseURL: "https://cognitive.cognitiveservices.azure.com/openai" },
+        expect(result.api).toEqual({
+          type: "aisdk",
+          package: "@ai-sdk/openai-compatible",
+          url: "https://cognitive.cognitiveservices.azure.com/openai",
         })
-        expect(result.settings?.resourceName).toBeUndefined()
+        expect(result.request.body.baseURL).toBeUndefined()
+        expect(result.request.body.resourceName).toBeUndefined()
       }),
     ),
   )
@@ -87,28 +89,26 @@ describe("AzureCognitiveServicesPlugin", () => {
         yield* catalog.transform((catalog) => {
           const azure = ProviderV2.Info.make({
             ...ProviderV2.Info.empty(ProviderV2.ID.make("azure-cognitive-services")),
-            package: "aisdk:@ai-sdk/openai-compatible",
+            api: { type: "aisdk", package: "@ai-sdk/openai-compatible" },
           })
           const openai = ProviderV2.Info.make({
             ...ProviderV2.Info.empty(ProviderV2.ID.openai),
-            package: "aisdk:test-provider",
+            api: { type: "aisdk", package: "test-provider" },
           })
           catalog.provider.update(azure.id, (item) => {
-            item.package = azure.package
-            item.package = azure.package
+            item.api = azure.api
           })
           catalog.provider.update(openai.id, (item) => {
-            item.package = openai.package
-            item.package = openai.package
+            item.api = openai.api
           })
         })
         yield* addPlugin()
         const azure = required(yield* catalog.provider.get(ProviderV2.ID.make("azure-cognitive-services")))
         const openai = required(yield* catalog.provider.get(ProviderV2.ID.openai))
-        expect(azure.settings?.baseURL).toBeUndefined()
-        expect(azure).toMatchObject({ package: "aisdk:@ai-sdk/openai-compatible" })
-        expect(openai.settings?.baseURL).toBeUndefined()
-        expect(openai).toMatchObject({ package: "aisdk:test-provider" })
+        expect(azure.request.body.baseURL).toBeUndefined()
+        expect(azure.api).toEqual({ type: "aisdk", package: "@ai-sdk/openai-compatible" })
+        expect(openai.request.body.baseURL).toBeUndefined()
+        expect(openai.api).toEqual({ type: "aisdk", package: "test-provider" })
       }),
     ),
   )
@@ -122,8 +122,7 @@ describe("AzureCognitiveServicesPlugin", () => {
       yield* aisdk.runLanguage({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.make("azure-cognitive-services"), ModelV2.ID.make("deployment")),
-          modelID: ModelV2.ID.make("deployment"),
-          package: "aisdk:test-provider",
+          api: { id: ModelV2.ID.make("deployment"), type: "aisdk", package: "test-provider" },
         }),
         sdk: fakeSelectorSdk(calls),
         options: { useCompletionUrls: true },
@@ -141,8 +140,7 @@ describe("AzureCognitiveServicesPlugin", () => {
       yield* aisdk.runLanguage({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.make("azure-cognitive-services"), ModelV2.ID.make("deployment")),
-          modelID: ModelV2.ID.make("deployment"),
-          package: "aisdk:test-provider",
+          api: { id: ModelV2.ID.make("deployment"), type: "aisdk", package: "test-provider" },
         }),
         sdk: fakeSelectorSdk(calls),
         options: {},
@@ -150,8 +148,7 @@ describe("AzureCognitiveServicesPlugin", () => {
       const ignored = yield* aisdk.runLanguage({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.openai, ModelV2.ID.make("deployment")),
-          modelID: ModelV2.ID.make("deployment"),
-          package: "aisdk:test-provider",
+          api: { id: ModelV2.ID.make("deployment"), type: "aisdk", package: "test-provider" },
         }),
         sdk: fakeSelectorSdk(calls),
         options: {},
@@ -171,8 +168,7 @@ describe("AzureCognitiveServicesPlugin", () => {
       yield* aisdk.runLanguage({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.make("azure-cognitive-services"), ModelV2.ID.make("messages-deployment")),
-          modelID: ModelV2.ID.make("messages-deployment"),
-          package: "aisdk:test-provider",
+          api: { id: ModelV2.ID.make("messages-deployment"), type: "aisdk", package: "test-provider" },
         }),
         sdk: { messages: sdk.messages, chat: sdk.chat, languageModel: sdk.languageModel },
         options: {},
@@ -180,8 +176,7 @@ describe("AzureCognitiveServicesPlugin", () => {
       yield* aisdk.runLanguage({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.make("azure-cognitive-services"), ModelV2.ID.make("chat-deployment")),
-          modelID: ModelV2.ID.make("chat-deployment"),
-          package: "aisdk:test-provider",
+          api: { id: ModelV2.ID.make("chat-deployment"), type: "aisdk", package: "test-provider" },
         }),
         sdk: { chat: sdk.chat, languageModel: sdk.languageModel },
         options: {},
@@ -189,8 +184,7 @@ describe("AzureCognitiveServicesPlugin", () => {
       yield* aisdk.runLanguage({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.make("azure-cognitive-services"), ModelV2.ID.make("language-deployment")),
-          modelID: ModelV2.ID.make("language-deployment"),
-          package: "aisdk:test-provider",
+          api: { id: ModelV2.ID.make("language-deployment"), type: "aisdk", package: "test-provider" },
         }),
         sdk: { languageModel: sdk.languageModel },
         options: {},

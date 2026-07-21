@@ -1,15 +1,13 @@
 import { EOL } from "os"
-import { Effect } from "effect"
-import { Service } from "@opencode-ai/client/effect/service"
+import * as Effect from "effect/Effect"
 import { Commands } from "../../commands"
 import { Runtime } from "../../../framework/runtime"
-import { ServiceConfig } from "../../../services/service-config"
+import { Daemon } from "../../../services/daemon"
 
 export default Runtime.handler(
   Commands.commands.service.commands.status,
   Effect.fn("cli.service.status")(function* () {
-    const options = yield* ServiceConfig.options()
-    const found = yield* Service.discover({ ...options, version: undefined })
-    process.stdout.write((found?.url ?? "stopped") + EOL)
+    const url = yield* (yield* Daemon.Service).status()
+    process.stdout.write((url ? `running ${url}` : "stopped") + EOL)
   }),
 )

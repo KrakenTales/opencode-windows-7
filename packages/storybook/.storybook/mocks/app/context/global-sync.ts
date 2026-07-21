@@ -18,6 +18,7 @@ const provider = {
 }
 
 const [store, setStore] = createStore({
+  todo: {} as Record<string, any[]>,
   provider,
   session: [] as any[],
   config: { permission: {} },
@@ -27,9 +28,15 @@ export function useServerSync() {
   return {
     data: {
       provider,
+      session_todo: store.todo,
     },
     child() {
       return [store, setStore] as const
+    },
+    todo: {
+      set(sessionID: string, todos: any[]) {
+        setStore("todo", sessionID, todos)
+      },
     },
   }
 }

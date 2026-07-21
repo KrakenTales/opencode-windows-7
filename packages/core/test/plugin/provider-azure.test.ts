@@ -66,11 +66,11 @@ describe("AzurePlugin", () => {
         const catalog = yield* Catalog.Service
         yield* catalog.transform((catalog) => {
           catalog.provider.update(ProviderV2.ID.azure, (item) => {
-            item.package = ProviderV2.aisdk("@ai-sdk/azure")
+            item.api = { type: "aisdk", package: "@ai-sdk/azure" }
           })
         })
         yield* addPlugin()
-        expect(required(yield* catalog.provider.get(ProviderV2.ID.azure)).settings?.resourceName).toBe("from-env")
+        expect(required(yield* catalog.provider.get(ProviderV2.ID.azure)).request.body.resourceName).toBe("from-env")
       }),
     ),
   )
@@ -82,18 +82,18 @@ describe("AzurePlugin", () => {
         yield* catalog.transform((catalog) => {
           const azure = ProviderV2.Info.make({
             ...ProviderV2.Info.empty(ProviderV2.ID.azure),
-            package: ProviderV2.aisdk("@ai-sdk/azure"),
-            settings: { resourceName: "from-config" },
+            api: { type: "aisdk", package: "@ai-sdk/azure" },
+            request: { headers: {}, body: { resourceName: "from-config" } },
           })
           catalog.provider.update(azure.id, (item) => {
-            item.package = azure.package
-            item.settings = { resourceName: "from-config" }
+            item.api = azure.api
+            item.request = azure.request
           })
           catalog.provider.update(ProviderV2.ID.openai, () => {})
         })
         yield* addPlugin()
-        expect(required(yield* catalog.provider.get(ProviderV2.ID.azure)).settings?.resourceName).toBe("from-config")
-        expect(required(yield* catalog.provider.get(ProviderV2.ID.openai)).settings?.resourceName).toBeUndefined()
+        expect(required(yield* catalog.provider.get(ProviderV2.ID.azure)).request.body.resourceName).toBe("from-config")
+        expect(required(yield* catalog.provider.get(ProviderV2.ID.openai)).request.body.resourceName).toBeUndefined()
       }),
     ),
   )
@@ -105,16 +105,16 @@ describe("AzurePlugin", () => {
         yield* catalog.transform((catalog) => {
           const azure = ProviderV2.Info.make({
             ...ProviderV2.Info.empty(ProviderV2.ID.azure),
-            package: ProviderV2.aisdk("@ai-sdk/azure"),
-            settings: { resourceName: "" },
+            api: { type: "aisdk", package: "@ai-sdk/azure" },
+            request: { headers: {}, body: { resourceName: "" } },
           })
           catalog.provider.update(azure.id, (item) => {
-            item.package = azure.package
-            item.settings = { resourceName: "" }
+            item.api = azure.api
+            item.request = azure.request
           })
         })
         yield* addPlugin()
-        expect(required(yield* catalog.provider.get(ProviderV2.ID.azure)).settings?.resourceName).toBe("from-env")
+        expect(required(yield* catalog.provider.get(ProviderV2.ID.azure)).request.body.resourceName).toBe("from-env")
       }),
     ),
   )
@@ -126,16 +126,16 @@ describe("AzurePlugin", () => {
         yield* catalog.transform((catalog) => {
           const azure = ProviderV2.Info.make({
             ...ProviderV2.Info.empty(ProviderV2.ID.azure),
-            package: ProviderV2.aisdk("@ai-sdk/azure"),
-            settings: { resourceName: "   " },
+            api: { type: "aisdk", package: "@ai-sdk/azure" },
+            request: { headers: {}, body: { resourceName: "   " } },
           })
           catalog.provider.update(azure.id, (item) => {
-            item.package = azure.package
-            item.settings = { resourceName: "   " }
+            item.api = azure.api
+            item.request = azure.request
           })
         })
         yield* addPlugin()
-        expect(required(yield* catalog.provider.get(ProviderV2.ID.azure)).settings?.resourceName).toBe("from-env")
+        expect(required(yield* catalog.provider.get(ProviderV2.ID.azure)).request.body.resourceName).toBe("from-env")
       }),
     ),
   )
@@ -149,8 +149,7 @@ describe("AzurePlugin", () => {
         const result = yield* aisdk.runSDK({
           model: ModelV2.Info.make({
             ...ModelV2.Info.empty(ProviderV2.ID.azure, ModelV2.ID.make("deployment")),
-            modelID: ModelV2.ID.make("deployment"),
-            package: ProviderV2.aisdk("test-provider"),
+            api: { id: ModelV2.ID.make("deployment"), type: "aisdk", package: "test-provider" },
           }),
           package: "@ai-sdk/azure",
           options: { name: "azure", baseURL: "https://proxy.example.com/openai" },
@@ -169,8 +168,7 @@ describe("AzurePlugin", () => {
           .runSDK({
             model: ModelV2.Info.make({
               ...ModelV2.Info.empty(ProviderV2.ID.azure, ModelV2.ID.make("deployment")),
-              modelID: ModelV2.ID.make("deployment"),
-              package: ProviderV2.aisdk("test-provider"),
+              api: { id: ModelV2.ID.make("deployment"), type: "aisdk", package: "test-provider" },
             }),
             package: "@ai-sdk/azure",
             options: { name: "azure" },
@@ -190,8 +188,7 @@ describe("AzurePlugin", () => {
       yield* aisdk.runLanguage({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.azure, ModelV2.ID.make("deployment")),
-          modelID: ModelV2.ID.make("deployment"),
-          package: ProviderV2.aisdk("test-provider"),
+          api: { id: ModelV2.ID.make("deployment"), type: "aisdk", package: "test-provider" },
         }),
         sdk: fakeSelectorSdk(calls),
         options: { useCompletionUrls: true },
@@ -209,8 +206,7 @@ describe("AzurePlugin", () => {
       yield* aisdk.runLanguage({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.azure, ModelV2.ID.make("deployment")),
-          modelID: ModelV2.ID.make("deployment"),
-          package: ProviderV2.aisdk("test-provider"),
+          api: { id: ModelV2.ID.make("deployment"), type: "aisdk", package: "test-provider" },
         }),
         sdk: fakeSelectorSdk(calls),
         options: { useCompletionUrls: true },
@@ -228,9 +224,8 @@ describe("AzurePlugin", () => {
       yield* aisdk.runLanguage({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.azure, ModelV2.ID.make("deployment")),
-          modelID: ModelV2.ID.make("deployment"),
-          package: ProviderV2.aisdk("test-provider"),
-          body: { useCompletionUrls: true },
+          api: { id: ModelV2.ID.make("deployment"), type: "aisdk", package: "test-provider" },
+          request: { headers: {}, body: { useCompletionUrls: true } },
         }),
         sdk: fakeSelectorSdk(calls),
         options: {},
@@ -248,8 +243,7 @@ describe("AzurePlugin", () => {
       yield* aisdk.runLanguage({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.azure, ModelV2.ID.make("deployment")),
-          modelID: ModelV2.ID.make("deployment"),
-          package: ProviderV2.aisdk("test-provider"),
+          api: { id: ModelV2.ID.make("deployment"), type: "aisdk", package: "test-provider" },
         }),
         sdk: fakeSelectorSdk(calls),
         options: {},
@@ -257,8 +251,7 @@ describe("AzurePlugin", () => {
       const ignored = yield* aisdk.runLanguage({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.openai, ModelV2.ID.make("deployment")),
-          modelID: ModelV2.ID.make("deployment"),
-          package: ProviderV2.aisdk("test-provider"),
+          api: { id: ModelV2.ID.make("deployment"), type: "aisdk", package: "test-provider" },
         }),
         sdk: fakeSelectorSdk(calls),
         options: {},
@@ -281,8 +274,7 @@ describe("AzurePlugin", () => {
       yield* aisdk.runLanguage({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.azure, ModelV2.ID.make("messages-deployment")),
-          modelID: ModelV2.ID.make("messages-deployment"),
-          package: ProviderV2.aisdk("test-provider"),
+          api: { id: ModelV2.ID.make("messages-deployment"), type: "aisdk", package: "test-provider" },
         }),
         sdk: { messages: make("messages"), chat: make("chat"), languageModel: make("languageModel") },
         options: {},
@@ -290,8 +282,7 @@ describe("AzurePlugin", () => {
       yield* aisdk.runLanguage({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.azure, ModelV2.ID.make("language-deployment")),
-          modelID: ModelV2.ID.make("language-deployment"),
-          package: ProviderV2.aisdk("test-provider"),
+          api: { id: ModelV2.ID.make("language-deployment"), type: "aisdk", package: "test-provider" },
         }),
         sdk: { languageModel: make("languageModel") },
         options: {},

@@ -1,48 +1,22 @@
 import { describe, expect } from "bun:test"
-import { Effect, Exit, Fiber, Layer, Scope, Stream } from "effect"
-import { TestClock } from "effect/testing"
+import { Effect, Exit, Scope } from "effect"
 import { AgentV2 } from "@opencode-ai/core/agent"
-import { EventV2 } from "@opencode-ai/core/event"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
-import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Location } from "@opencode-ai/core/location"
-import { PermissionV2 } from "@opencode-ai/core/permission"
 import { AgentPlugin } from "@opencode-ai/core/plugin/agent"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { location } from "./fixture/location"
 import { testEffect } from "./lib/effect"
 import { agentHost, host } from "./plugin/host"
 
-const testLocation = location({ directory: AbsolutePath.make("/project") })
-const locationLayer = Layer.succeed(Location.Service, Location.Service.of(testLocation))
-
-const it = testEffect(
-  AppNodeBuilder.build(LayerNode.group([AgentV2.node, EventV2.node, Location.node]), [
-    [Location.node, locationLayer],
-  ]) as unknown as Layer.Layer<unknown, never>,
-)
+const it = testEffect(AppNodeBuilder.build(AgentV2.node))
 
 describe("AgentV2", () => {
-  it.effect("publishes an updated event after agent changes", () =>
-    Effect.gen(function* () {
-      const agent = yield* AgentV2.Service
-      const events = yield* EventV2.Service
-      const updated = yield* events
-        .subscribe(AgentV2.Event.Updated)
-        .pipe(Stream.take(1), Stream.runCollect, Effect.forkScoped)
-      yield* Effect.yieldNow
-
-      yield* agent.transform((editor) => editor.update(AgentV2.ID.make("reviewer"), () => {}))
-
-      expect(yield* Fiber.join(updated)).toMatchObject([{ location: { directory: testLocation.directory } }])
-    }),
-  )
-
   it.effect("starts without agents", () =>
     Effect.gen(function* () {
       const agent = yield* AgentV2.Service
 
-      expect(yield* agent.list()).toEqual([])
+      expect(yield* agent.all()).toEqual([])
       expect(yield* agent.get(AgentV2.ID.make("build"))).toBeUndefined()
     }),
   )
@@ -59,7 +33,7 @@ describe("AgentV2", () => {
       )
 
       expect(yield* agent.get(id)).toMatchObject({ id, description: "Reviews code", mode: "subagent" })
-      expect((yield* agent.list()).map((info) => info.id)).toEqual([id])
+      expect((yield* agent.all()).map((info) => info.id)).toEqual([id])
     }),
   )
 
@@ -77,9 +51,7 @@ describe("AgentV2", () => {
       )
       description = "New description"
       hidden = false
-      const reload = yield* agent.reload().pipe(Effect.forkChild({ startImmediately: true }))
-      yield* TestClock.adjust("500 millis")
-      yield* Fiber.join(reload)
+      yield* agent.reload()
 
       expect(yield* agent.get(id)).toMatchObject({ description: "New description", hidden: false })
     }),
@@ -141,7 +113,7 @@ describe("AgentV2", () => {
         ),
       )
 
-      const agents = yield* agent.list()
+      const agents = yield* agent.all()
       expect(agents.map((item) => String(item.id)).sort()).toEqual([
         "build",
         "compaction",
@@ -151,36 +123,9 @@ describe("AgentV2", () => {
         "summary",
         "title",
       ])
-      expect((yield* agent.get(AgentV2.defaultID))?.system).toBeUndefined()
       for (const item of agents) {
         expect(item.permissions.some((rule) => rule.action === "bash" && rule.effect !== "deny")).toBe(false)
       }
-    }),
-  )
-
-  it.effect("denies the subagent tool for built-in subagents", () =>
-    Effect.gen(function* () {
-      const agent = yield* AgentV2.Service
-      yield* AgentPlugin.Plugin.effect(
-        host({
-          agent: agentHost(agent),
-        }),
-      ).pipe(
-        Effect.provideService(
-          Location.Service,
-          Location.Service.of(location({ directory: AbsolutePath.make("/project") })),
-        ),
-      )
-
-      yield* Effect.forEach(["general", "explore"], (id) =>
-        Effect.gen(function* () {
-          const info = yield* agent.get(AgentV2.ID.make(id))
-          if (!info) throw new Error(`expected built-in agent: ${id}`)
-          expect(info.mode).toBe("subagent")
-          expect(info.permissions).toContainEqual({ action: "subagent", resource: "*", effect: "deny" })
-          expect(PermissionV2.evaluate("subagent", "*", info.permissions).effect).toBe("deny")
-        }),
-      )
     }),
   )
 })

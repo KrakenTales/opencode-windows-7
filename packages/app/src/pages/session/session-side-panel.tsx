@@ -23,7 +23,7 @@ import { Mark } from "@opencode-ai/ui/logo"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { KeybindV2 } from "@opencode-ai/ui/v2/keybind-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
-import type { FileDiffInfo, VcsFileDiff } from "@opencode-ai/sdk/v2"
+import type { SnapshotFileDiff, VcsFileDiff } from "@opencode-ai/sdk/v2"
 import { ConstrainDragYAxis, getDraggableId } from "@/utils/solid-dnd"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 
@@ -56,15 +56,24 @@ import { setSessionHandoff } from "@/pages/session/handoff"
 import { useSessionLayout } from "@/pages/session/session-layout"
 import { SessionFileBrowserTab, type SessionFileBrowserState } from "@/pages/session/v2/session-file-browser-tab"
 
+type RenderDiff = (SnapshotFileDiff & { file: string }) | VcsFileDiff
+
+function renderDiff(value: SnapshotFileDiff | VcsFileDiff): value is RenderDiff {
+  return typeof value.file === "string"
+}
+
 export function SessionSidePanel(props: {
   canReview: () => boolean
-  diffs: () => (FileDiffInfo | VcsFileDiff)[]
+  diffs: () => (SnapshotFileDiff | VcsFileDiff)[]
   diffsReady: () => boolean
   empty: () => string
   hasReview: () => boolean
   reviewHasFocusableContent: () => boolean
   reviewCount: () => number
   reviewPanel: () => JSX.Element
+  diffVersion?: number
+  loadDiff?: (path: string, version?: number) => Promise<RenderDiff | undefined>
+  expandUnchanged?: boolean
   reviewSidebarToggle?: (disabled: boolean) => JSX.Element
   fileBrowserState?: SessionFileBrowserState
   activeDiff?: string
@@ -82,6 +91,11 @@ export function SessionSidePanel(props: {
   const sdk = useSDK()
   const { sessionKey, tabs, view, params } = useSessionLayout()
   const projectDirectory = createMemo(() => sdk().directory)
+  const diffForTab = (tab: string) => {
+    const path = file.pathFromTab(tab)
+    if (!path) return
+    return props.diffs().find((diff): diff is RenderDiff => renderDiff(diff) && diff.file === path)
+  }
 
   const isDesktop = createMediaQuery("(min-width: 768px)")
   const shown = settings.visibility.fileTree
@@ -104,7 +118,7 @@ export function SessionSidePanel(props: {
   })
   const treeWidth = createMemo(() => (fileOpen() ? `${layout.fileTree.width()}px` : "0px"))
 
-  const diffs = createMemo(() => props.diffs())
+  const diffs = createMemo(() => props.diffs().filter(renderDiff))
   const diffFiles = createMemo(() => diffs().map((d) => d.file))
   const kinds = createMemo(() => {
     const merge = (a: "add" | "del" | "mix" | undefined, b: "add" | "del" | "mix") => {
@@ -231,6 +245,7 @@ export function SessionSidePanel(props: {
     return active !== "review" && active !== "context" && active !== "empty"
   })
   const openFileKeybind = createMemo(() => command.keybindParts("file.open"))
+  const closeTabKeybind = createMemo(() => command.keybindParts("tab.close"))
   const [store, setStore] = createStore({
     activeDraggable: undefined as string | undefined,
   })
@@ -544,7 +559,7 @@ export function SessionSidePanel(props: {
                           >
                             <Show when={props.reviewSidebarToggle}>
                               {(toggle) => (
-                                <div class="h-full shrink-0 flex items-center justify-center">
+                                <div class="session-review-v2-sidebar-toggle-slot h-full shrink-0 sticky left-0 z-10 flex items-center justify-center bg-v2-background-bg-base">
                                   {toggle()(activeTab() === SESSION_OPEN_FILE_TAB)}
                                 </div>
                               )}
@@ -564,9 +579,15 @@ export function SessionSidePanel(props: {
                               <Tabs.Trigger
                                 value="context"
                                 closeButton={
-                                  <TooltipKeybind
-                                    title={language.t("common.closeTab")}
-                                    keybind={command.keybind("tab.close")}
+                                  <TooltipV2
+                                    value={
+                                      <>
+                                        {language.t("common.closeTab")}
+                                        <Show when={closeTabKeybind().length > 0}>
+                                          <KeybindV2 keys={closeTabKeybind()} variant="neutral" />
+                                        </Show>
+                                      </>
+                                    }
                                     placement="bottom"
                                     gutter={10}
                                   >
@@ -577,7 +598,7 @@ export function SessionSidePanel(props: {
                                       onClick={() => tabs().close("context")}
                                       aria-label={language.t("common.closeTab")}
                                     />
-                                  </TooltipKeybind>
+                                  </TooltipV2>
                                 }
                                 hideCloseButton
                                 onMiddleClick={() => tabs().close("context")}
@@ -605,9 +626,15 @@ export function SessionSidePanel(props: {
                                   <Tabs.Trigger
                                     value={SESSION_OPEN_FILE_TAB}
                                     closeButton={
-                                      <TooltipKeybind
-                                        title={language.t("common.closeTab")}
-                                        keybind={command.keybind("tab.close")}
+                                      <TooltipV2
+                                        value={
+                                          <>
+                                            {language.t("common.closeTab")}
+                                            <Show when={closeTabKeybind().length > 0}>
+                                              <KeybindV2 keys={closeTabKeybind()} variant="neutral" />
+                                            </Show>
+                                          </>
+                                        }
                                         placement="bottom"
                                         gutter={10}
                                       >
@@ -618,7 +645,7 @@ export function SessionSidePanel(props: {
                                           onClick={() => tabs().close(SESSION_OPEN_FILE_TAB)}
                                           aria-label={language.t("common.closeTab")}
                                         />
-                                      </TooltipKeybind>
+                                      </TooltipV2>
                                     }
                                     hideCloseButton
                                     onMiddleClick={() => tabs().close(SESSION_OPEN_FILE_TAB)}
@@ -720,6 +747,10 @@ export function SessionSidePanel(props: {
                               active={file.pathFromTab(browserTab() ?? activeFileTab() ?? "")}
                               kinds={kinds()}
                               state={props.fileBrowserState!}
+                              diff={diffForTab(browserTab() ?? activeFileTab() ?? "")}
+                              diffVersion={props.diffVersion}
+                              loadDiff={props.loadDiff}
+                              expandUnchanged={props.expandUnchanged}
                               onSelect={(path) => previewTab(file.tab(path))}
                               onSelectPermanent={(path) => openTab(file.tab(path))}
                               filterRef={(element) => (fileFilter = element)}

@@ -1,14 +1,18 @@
 export * as ConfigExperimental from "./experimental"
 
 import { Schema } from "effect"
-import { NonNegativeInt } from "../schema"
-import { ConfigPolicy } from "./policy"
+import { Catalog } from "../catalog"
+import { Policy as PolicyV2 } from "../policy"
 
-export class Info extends Schema.Class<Info>("ConfigExperimental.Info")({
-  subagent_depth: NonNegativeInt.pipe(Schema.optional).annotate({
-    description: "Maximum subagent nesting depth. Defaults to 1.",
-  }),
-  policies: ConfigPolicy.Info.pipe(Schema.Array, Schema.optional).annotate({
-    description: "Ordered policies controlling access to configured resources",
-  }),
+// Each core domain exports the policy actions it supports. Adding an action to
+// this union makes it valid in authored config while keeping Policy generic.
+export const PolicyAction = Schema.Union([Catalog.PolicyActions])
+
+export class Policy extends Schema.Class<Policy>("ConfigV2.Experimental.Policy")({
+  ...PolicyV2.Info.fields,
+  action: PolicyAction,
+}) {}
+
+export class Experimental extends Schema.Class<Experimental>("ConfigV2.Experimental")({
+  policies: Policy.pipe(Schema.Array, Schema.optional),
 }) {}

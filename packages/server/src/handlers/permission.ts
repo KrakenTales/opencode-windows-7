@@ -17,8 +17,7 @@ export const PermissionHandler = HttpApiBuilder.group(Api, "server.permission", 
       .handle(
         "permission.request.list",
         Effect.fn(function* () {
-          const permission = yield* PermissionV2.Service
-          return yield* response(permission.list())
+          return yield* response((yield* PermissionV2.Service).list())
         }),
       )
       .handle(
@@ -60,8 +59,7 @@ export const PermissionHandler = HttpApiBuilder.group(Api, "server.permission", 
       .handle(
         "session.permission.get",
         Effect.fn(function* (ctx) {
-          const permission = yield* PermissionV2.Service
-          const request = yield* permission.get(ctx.params.requestID)
+          const request = yield* (yield* PermissionV2.Service).get(ctx.params.requestID)
           if (!request || request.sessionID !== ctx.params.sessionID) return yield* missingRequest(ctx.params.requestID)
           return { data: request }
         }),
@@ -82,9 +80,8 @@ export const PermissionHandler = HttpApiBuilder.group(Api, "server.permission", 
         "permission.saved.list",
         Effect.fn(function* (ctx) {
           const location = yield* Location.Service
-          const saved = yield* PermissionSaved.Service
           return {
-            data: yield* saved.list({
+            data: yield* (yield* PermissionSaved.Service).list({
               projectID: ctx.query.projectID ?? location.project.id,
             }),
           }
@@ -93,8 +90,7 @@ export const PermissionHandler = HttpApiBuilder.group(Api, "server.permission", 
       .handle(
         "permission.saved.remove",
         Effect.fn(function* (ctx) {
-          const saved = yield* PermissionSaved.Service
-          yield* saved.remove(ctx.params.id)
+          yield* (yield* PermissionSaved.Service).remove(ctx.params.id)
           return HttpApiSchema.NoContent.make()
         }),
       )

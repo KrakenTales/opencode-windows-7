@@ -51,7 +51,7 @@ type State = {
 type Data =
   | {
       type: "session"
-      data: SDK.SessionV1Info
+      data: SDK.Session
     }
   | {
       type: "message"

@@ -44,14 +44,6 @@ describe("ProjectDirectories", () => {
     }),
   )
 
-  it.effect("returns an empty list for missing projects", () =>
-    Effect.gen(function* () {
-      const service = yield* ProjectDirectories.Service
-
-      expect(yield* service.list(Project.ID.make("missing-project"))).toEqual([])
-    }),
-  )
-
   it.effect("replaces the strategy when requested", () =>
     Effect.gen(function* () {
       yield* setup()

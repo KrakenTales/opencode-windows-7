@@ -1,12 +1,11 @@
-import { Effect } from "effect"
-import { Service } from "@opencode-ai/client/effect/service"
+import * as Effect from "effect/Effect"
 import { Commands } from "../../commands"
 import { Runtime } from "../../../framework/runtime"
-import { ServiceConfig } from "../../../services/service-config"
+import { Daemon } from "../../../services/daemon"
 
 export default Runtime.handler(
   Commands.commands.service.commands.stop,
   Effect.fn("cli.service.stop")(function* () {
-    yield* Service.stop(yield* ServiceConfig.options())
+    yield* (yield* Daemon.Service).stop()
   }),
 )

@@ -191,6 +191,8 @@ function sameBytes(left: Uint8Array, right: Uint8Array) {
   return left.every((byte, index) => byte === right[index])
 }
 
+export const locationLayer = layer
+
 export const node = makeLocationNode({ service: Service, layer, deps: [FSUtil.node] })
 
 /**
@@ -200,6 +202,6 @@ export const node = makeLocationNode({ service: Service, layer, deps: [FSUtil.no
 // TODO: Publish watcher/file-edit events after V2 watcher integration exists.
 // TODO: Add snapshots / undo after V2 snapshot design exists.
 // TODO: Notify LSP and collect diagnostics after V2 LSP runtime exists.
-// TODO: Design multi-file transactions / rollback if patch needs atomic edits.
+// TODO: Design multi-file transactions / rollback if apply_patch needs atomic edits.
 // Until then, edits are sequential and report partial application.
 // TODO: Define crash recovery and idempotency for side effects between Tool.Called and durable settlement.

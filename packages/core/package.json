@@ -1,6 +1,6 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
-  "version": "1.18.3",
+  "version": "1.18.4",
   "name": "@opencode-ai/core",
   "type": "module",
   "license": "MIT",
@@ -19,7 +19,7 @@
     "./effect/layer-node": "./src/effect/layer-node.ts",
     "./effect/app-node": "./src/effect/app-node.ts",
     "./session/runner": "./src/session/runner/index.ts",
-    "./instructions": "./src/instructions/index.ts",
+    "./system-context": "./src/system-context/index.ts",
     "./*": "./src/*.ts"
   },
   "imports": {
@@ -37,21 +37,6 @@
       "bun": "./src/filesystem/fff.bun.ts",
       "node": "./src/filesystem/fff.node.ts",
       "default": "./src/filesystem/fff.bun.ts"
-    },
-    "#photon-wasm": {
-      "bun": "./src/image/photon-wasm.bun.ts",
-      "node": "./src/image/photon-wasm.node.ts",
-      "default": "./src/image/photon-wasm.bun.ts"
-    },
-    "#runtime-import": {
-      "bun": "./src/runtime/import.bun.ts",
-      "node": "./src/runtime/import.node.ts",
-      "default": "./src/runtime/import.bun.ts"
-    },
-    "#process-lock-ffi": {
-      "bun": "./src/util/process-lock-ffi.bun.ts",
-      "node": "./src/util/process-lock-ffi.node.ts",
-      "default": "./src/util/process-lock-ffi.bun.ts"
     }
   },
   "devDependencies": {
@@ -101,14 +86,12 @@
     "@effect/platform-node": "catalog:",
     "@effect/sql-sqlite-bun": "catalog:",
     "@lydell/node-pty": "catalog:",
-    "@modelcontextprotocol/sdk": "1.29.0",
     "@ff-labs/fff-bun": "0.9.4",
     "@npmcli/arborist": "9.4.0",
     "@npmcli/config": "10.8.1",
-    "@opencode-ai/codemode": "workspace:*",
     "@opencode-ai/effect-drizzle-sqlite": "workspace:*",
     "@opencode-ai/effect-sqlite-node": "workspace:*",
-    "@opencode-ai/ai": "workspace:*",
+    "@opencode-ai/llm": "workspace:*",
     "@opencode-ai/schema": "workspace:*",
     "@opencode-ai/plugin": "workspace:*",
     "@opentelemetry/api": "1.9.0",
@@ -136,7 +119,6 @@
     "mime-types": "3.0.2",
     "minimatch": "10.2.5",
     "npm-package-arg": "13.0.2",
-    "resolve.exports": "catalog:",
     "semver": "^7.6.3",
     "turndown": "7.2.0",
     "venice-ai-sdk-provider": "2.1.1",

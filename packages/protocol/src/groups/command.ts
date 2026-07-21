@@ -2,7 +2,7 @@ import { Command } from "@opencode-ai/schema/command"
 import { Location } from "@opencode-ai/schema/location"
 import { Schema } from "effect"
 import { HttpApiEndpoint, HttpApiGroup, OpenApi } from "effect/unstable/httpapi"
-import { LocationQuery, locationQueryOpenApi } from "./location.js"
+import { LocationQuery, locationQueryOpenApi } from "./location"
 
 export const CommandGroup = HttpApiGroup.make("server.command")
   .add(
@@ -21,7 +21,7 @@ export const CommandGroup = HttpApiGroup.make("server.command")
   )
   .annotateMerge(
     OpenApi.annotations({
-      title: "command",
+      title: "commands",
       description: "Experimental command routes.",
     }),
   )

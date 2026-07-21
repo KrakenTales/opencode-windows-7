@@ -3,7 +3,7 @@ import { Effect, Schema } from "effect"
 import { CodeMode, Tool } from "../src/index.js"
 
 // Key enumeration: Object.keys and for...in share one surface over plain objects, arrays
-// (index strings), and tool references (namespace/tool names from the supplied tools), so a
+// (index strings), and tool references (namespace/tool names from the host tool tree), so a
 // model can discover what it may call instead of guessing names from the instructions. The
 // motivating transcript: `Object.keys(tools)` failed with the generic plain-objects-only
 // message and `for (const key in tools)` was unsupported syntax, forcing blind guesses.
@@ -41,7 +41,7 @@ describe("Object.keys over tool references", () => {
       const namespaces = Object.keys(tools)
       return { namespaces, count: namespaces.length }
     `),
-    ).toEqual({ namespaces: ["github", "memory", "playwright"], count: 3 })
+    ).toEqual({ namespaces: ["github", "memory", "playwright", "$codemode"], count: 4 })
   })
 
   test("enumerates tool names at a nested namespace", async () => {
@@ -52,14 +52,15 @@ describe("Object.keys over tool references", () => {
     expect(await value(`return Object.keys(tools.github.list_issues)`)).toEqual([])
   })
 
-  test("search is a global built-in function", async () => {
-    expect(await value(`return typeof search`)).toBe("function")
+  test("the internal discovery namespace enumerates its callable surface", async () => {
+    expect(await value(`return Object.keys(tools.$codemode)`)).toEqual(["search"])
   })
 
-  test("an unknown namespace is an UnknownTool error", async () => {
+  test("an unknown namespace is an UnknownTool error pointing at the discovery idioms", async () => {
     const failure = await error(`return Object.keys(tools.nonexistent)`)
     expect(failure.kind).toBe("UnknownTool")
     expect(failure.message).toContain("Unknown tool namespace 'nonexistent'")
+    expect(failure.suggestions?.join(" ")).toContain("Object.keys(tools)")
   })
 
   test("Object.values/entries on a tool reference explain the working idioms", async () => {
@@ -67,7 +68,7 @@ describe("Object.keys over tool references", () => {
       const failure = await error(`return Object.${method}(tools)`)
       expect(failure.kind).toBe("InvalidDataValue")
       expect(failure.message).toContain(
-        `Object.${method}(...) cannot read tool references: they are not plain data. Use Object.keys(tools) for names, or search({ query }) for signatures.`,
+        `Object.${method}(...) cannot read tool references: they are not plain data. Use Object.keys(tools) for names, or tools.$codemode.search({ query }) for signatures.`,
       )
     }
     const nested = await error(`return Object.entries(tools.github)`)
@@ -136,7 +137,7 @@ describe("for...in", () => {
     ).toBe("only")
   })
 
-  test("enumerates namespaces and tools from the supplied tools", async () => {
+  test("enumerates namespaces and tools from the callable tool tree", async () => {
     expect(
       await value(`
       const names = []
@@ -145,7 +146,7 @@ describe("for...in", () => {
       }
       return names
     `),
-    ).toEqual(["github.list_issues", "github.get_issue", "memory.search", "playwright.navigate"])
+    ).toEqual(["github.list_issues", "github.get_issue", "memory.search", "playwright.navigate", "$codemode.search"])
   })
 
   test("unsupported values fail with a hint at for...of and Object.keys", async () => {

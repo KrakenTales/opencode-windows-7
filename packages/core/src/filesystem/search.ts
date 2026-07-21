@@ -56,7 +56,7 @@ export const ripgrepLayer = Layer.effect(
             .glob({
               cwd,
               pattern: input.pattern,
-              limit: input.limit ?? FileSystem.DEFAULT_SEARCH_LIMIT,
+              limit: input.limit ?? Number.MAX_SAFE_INTEGER,
             })
             .pipe(
               Effect.map((result) =>
@@ -81,7 +81,7 @@ export const ripgrepLayer = Layer.effect(
               pattern: input.pattern,
               file: info.type === "File" ? path.basename(target) : undefined,
               include: input.include,
-              limit: input.limit ?? FileSystem.DEFAULT_SEARCH_LIMIT,
+              limit: input.limit ?? Number.MAX_SAFE_INTEGER,
             })
             .pipe(
               Effect.map((result) =>
@@ -150,7 +150,7 @@ export const fffLayer = Layer.effect(
           const prefix = input.path?.replaceAll("\\", "/").replace(/\/$/, "")
           const found = result.value.glob(prefix ? `${prefix}/${input.pattern}` : input.pattern, {
             pageIndex: 0,
-            pageSize: input.limit ?? FileSystem.DEFAULT_SEARCH_LIMIT,
+            pageSize: input.limit,
           })
           if (!found.ok) throw found.error
           return found.value.items.map((item) =>
@@ -167,7 +167,7 @@ export const fffLayer = Layer.effect(
             [prefix ? `${prefix}/**` : undefined, input.include, input.pattern]
               .filter((value) => value !== undefined)
               .join(" "),
-            { mode: "regex", pageSize: input.limit ?? FileSystem.DEFAULT_SEARCH_LIMIT, timeBudgetMs: 1_500 },
+            { mode: "regex", pageSize: input.limit, timeBudgetMs: 1_500 },
           )
           if (!found.ok) throw found.error
           return found.value.items.map((match) => {
@@ -232,13 +232,8 @@ export const fffLayer = Layer.effect(
   }),
 )
 
-const layer = Layer.unwrap(
-  Effect.gen(function* () {
-    if (Flag.OPENCODE_DISABLE_FFF || !Fff.available()) return ripgrepLayer
-    const location = yield* Location.Service
-    // Non-VCS locations can contain many repositories, so avoid eagerly content-indexing the entire aggregate tree.
-    return location.vcs ? fffLayer : ripgrepLayer
-  }),
-)
+const layer = Layer.unwrap(Effect.sync(() => (Flag.OPENCODE_DISABLE_FFF || !Fff.available() ? ripgrepLayer : fffLayer)))
+
+export const locationLayer = layer
 
 export const node = makeLocationNode({ service: Service, layer, deps: [FSUtil.node, Location.node, Ripgrep.node] })

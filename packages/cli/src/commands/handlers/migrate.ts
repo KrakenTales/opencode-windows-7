@@ -1,4 +1,4 @@
-import { Effect } from "effect"
+import * as Effect from "effect/Effect"
 import { Commands } from "../commands"
 import { Runtime } from "../../framework/runtime"
 

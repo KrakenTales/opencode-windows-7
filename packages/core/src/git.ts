@@ -189,14 +189,16 @@ const layer = Layer.effect(
       if (!dotgit) return undefined
 
       const cwd = path.dirname(dotgit)
-      const result = yield* run(cwd, proc)(["rev-parse", "--git-dir", "--git-common-dir", "--show-toplevel"])
-      const [gitDir, commonDir, topLevel] = result.text.split(/\r?\n/)
-      if (!gitDir || !commonDir) return undefined
+      const git = run(cwd, proc)
+      const topLevel = yield* git(["rev-parse", "--show-toplevel"])
+      const gitDir = yield* git(["rev-parse", "--git-dir"])
+      const commonDir = yield* git(["rev-parse", "--git-common-dir"])
+      if (gitDir.exitCode !== 0 || commonDir.exitCode !== 0) return undefined
 
       return new Repository({
-        worktree: AbsolutePath.make(topLevel ? resolvePath(cwd, topLevel) : cwd),
-        gitDirectory: AbsolutePath.make(resolvePath(cwd, gitDir)),
-        commonDirectory: AbsolutePath.make(resolvePath(cwd, commonDir)),
+        worktree: AbsolutePath.make(topLevel.exitCode === 0 ? resolvePath(cwd, topLevel.text) : cwd),
+        gitDirectory: AbsolutePath.make(resolvePath(cwd, gitDir.text)),
+        commonDirectory: AbsolutePath.make(resolvePath(cwd, commonDir.text)),
       })
     })
 
@@ -604,7 +606,7 @@ const layer = Layer.effect(
                 file,
               ])).text
           return {
-            file,
+            path: file,
             status,
             additions: binary ? 0 : Number(stats[0] ?? 0),
             deletions: binary ? 0 : Number(stats[1] ?? 0),

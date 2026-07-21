@@ -12,7 +12,6 @@ import { LSP } from "@/lsp/lsp"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import DESCRIPTION from "./apply_patch.txt"
 import { FileSystem } from "@opencode-ai/core/filesystem"
-import { FileSystemV1 } from "@opencode-ai/schema/filesystem-v1"
 import { Format } from "../format"
 import * as Bom from "@/util/bom"
 
@@ -254,7 +253,7 @@ export const ApplyPatchTool = Tool.define(
           if (yield* format.file(edited)) {
             yield* Bom.syncFile(afs, edited, change.bom)
           }
-          yield* events.publish(FileSystemV1.Event.Edited, { file: edited })
+          yield* events.publish(FileSystem.Event.Edited, { file: edited })
         }
       }
 

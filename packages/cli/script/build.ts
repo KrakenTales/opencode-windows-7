@@ -9,19 +9,15 @@ import pkg from "../package.json"
 import { modelsData } from "./generate"
 
 const dir = path.resolve(import.meta.dirname, "..")
-const binary = "opencode2"
-const outdir = path.resolve(
-  dir,
-  process.argv.find((arg) => arg.startsWith("--outdir="))?.slice("--outdir=".length) ?? "dist",
-)
-if (outdir === dir) throw new Error("--outdir must not be the package directory")
+const binary = "lildax"
 process.chdir(dir)
 
-await rm(outdir, { recursive: true, force: true })
+await rm("dist", { recursive: true, force: true })
 
 const singleFlag = process.argv.includes("--single")
 const baselineFlag = process.argv.includes("--baseline")
 const skipInstall = process.argv.includes("--skip-install")
+const sourcemapsFlag = process.argv.includes("--sourcemaps")
 const plugin = createSolidTransformPlugin()
 
 const allTargets: {
@@ -73,7 +69,7 @@ for (const item of targets) {
     external: ["node-gyp"],
     format: "esm",
     minify: true,
-    sourcemap: "inline",
+    sourcemap: sourcemapsFlag ? "linked" : "none",
     splitting: true,
     compile: {
       autoloadBunfig: false,
@@ -81,7 +77,7 @@ for (const item of targets) {
       autoloadTsconfig: true,
       autoloadPackageJson: true,
       target: target.replace(binary, "bun") as Bun.Build.CompileTarget,
-      outfile: path.join(outdir, name, "bin", binary),
+      outfile: `./dist/${name}/bin/${binary}`,
       execArgv: [`--user-agent=${binary}/${Script.version}`, "--use-system-ca", "--"],
       windows: {},
     },
@@ -103,7 +99,7 @@ for (const item of targets) {
   }
 
   await Bun.write(
-    path.join(outdir, name, "package.json"),
+    `./dist/${name}/package.json`,
     JSON.stringify(
       {
         name: `@opencode-ai/${name}`,

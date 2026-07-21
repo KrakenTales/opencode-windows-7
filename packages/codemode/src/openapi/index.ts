@@ -3,7 +3,6 @@ import { make, type Definition } from "../tool.js"
 import { invoke } from "./runtime.js"
 import {
   componentDefinitions,
-  hasDirectionalSchemas,
   inputSchema,
   isRecord,
   methods,
@@ -32,17 +31,16 @@ export type {
 } from "./types.js"
 
 /**
- * Builds one CodeMode tool per representable OpenAPI 3.x operation. Auth remains host-side,
- * tools require `HttpClient.HttpClient`, and unrepresentable operations land in `skipped`.
+ * Builds a CodeMode tool subtree from an OpenAPI 3.x document, one tool per
+ * operation. Auth is resolved host-side via `auth.resolve` and never
+ * model-visible. Tools require `HttpClient.HttpClient`; unrepresentable
+ * operations land in `skipped`.
  */
 export const fromSpec = (options: Options): Result => {
   const document = options.spec
   const schemes = securitySchemes(document)
   const defaultSecurity = securityRequirements(document.security)
-  const requestDefinitions = componentDefinitions(document, "request")
-  const responseDefinitions = hasDirectionalSchemas(document)
-    ? componentDefinitions(document, "response")
-    : requestDefinitions
+  const definitions = componentDefinitions(document)
   const paths = isRecord(document.paths) ? document.paths : {}
   const used = new Set<string>()
   const namespaces = new Set<string>()
@@ -61,7 +59,7 @@ export const fromSpec = (options: Options): Result => {
         summary: nonEmptyString(operationValue.summary),
         description: nonEmptyString(operationValue.description),
       }
-      const output = operationOutput(document, operationValue, responseDefinitions)
+      const output = operationOutput(document, operationValue, definitions)
       if (!output.ok) {
         skipped.push({ method: operation.method, path, reason: output.reason })
         continue
@@ -106,7 +104,7 @@ export const fromSpec = (options: Options): Result => {
         segments,
         make({
           description: operation.description ?? operation.summary ?? `${operation.method} ${path}`,
-          input: inputSchema(input.fields, requestDefinitions),
+          input: inputSchema(input.fields, definitions),
           output: output.value,
           run: (input) => invoke(plan, input),
         }),

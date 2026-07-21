@@ -1,4 +1,5 @@
-import photonWasm from "#photon-wasm"
+// @ts-ignore Bun's static file import is embedded by `bun build --compile`; some consumers also declare *.wasm.
+import photonWasm from "@silvia-odwyer/photon-node/photon_rs_bg.wasm" with { type: "file" }
 import { Effect } from "effect"
 import path from "node:path"
 import { fileURLToPath } from "node:url"

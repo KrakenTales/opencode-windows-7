@@ -1,50 +1,28 @@
 import { describe, expect } from "bun:test"
-import { Cause, Effect, Exit, Fiber, Layer } from "effect"
+import { Effect, Exit, Fiber, Layer } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Form } from "@opencode-ai/core/form"
 import { PermissionV2 } from "@opencode-ai/core/permission"
+import { QuestionV2 } from "@opencode-ai/core/question"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { ToolRegistry } from "@opencode-ai/core/tool/registry"
 import { QuestionTool } from "@opencode-ai/core/tool/question"
 import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
-import { Image } from "@opencode-ai/core/image"
 import { testEffect } from "./lib/effect"
-import { imagePassthrough } from "./lib/image"
-import { makeLocationNode } from "@opencode-ai/core/effect/app-node"
-import { toolIdentity, executeTool, registerToolPlugin, settleTool, toolDefinitions } from "./lib/tool"
+import { toolIdentity, executeTool, settleTool, toolDefinitions } from "./lib/tool"
 
 const sessionID = SessionV2.ID.make("ses_question_tool_test")
 const assertions: PermissionV2.AssertInput[] = []
-let captured: Form.CreateInput | undefined
+let captured: QuestionV2.AskInput | undefined
 let reject = false
 let deny = false
 const capturedInput = () => captured
-const questionInput = {
-  questions: [
-    {
-      question: "Continue?",
-      header: "Continue",
-      options: [{ label: "Yes", description: "Continue" }],
-    },
-  ],
-}
 const permission = Layer.succeed(
   PermissionV2.Service,
   PermissionV2.Service.of({
     assert: (input) =>
       Effect.sync(() => assertions.push(input)).pipe(
-        Effect.andThen(
-          deny
-            ? Effect.fail(
-                new PermissionV2.BlockedError({
-                  rules: [],
-                  permission: input.action,
-                  resources: input.resources,
-                }),
-              )
-            : Effect.void,
-        ),
+        Effect.andThen(deny ? Effect.fail(new PermissionV2.BlockedError({ rules: [] })) : Effect.void),
       ),
     ask: () => Effect.die("unused"),
     reply: () => Effect.die("unused"),
@@ -53,45 +31,28 @@ const permission = Layer.succeed(
     list: () => Effect.die("unused"),
   }),
 )
-const form = Layer.succeed(
-  Form.Service,
-  Form.Service.of({
-    ask: (input: Form.CreateInput) =>
+const question = Layer.succeed(
+  QuestionV2.Service,
+  QuestionV2.Service.of({
+    ask: (input: QuestionV2.AskInput) =>
       Effect.sync(() => {
         captured = input
-      }).pipe(
-        Effect.andThen(
-          Effect.sync(
-            (): Form.TerminalState =>
-              reject ? { status: "cancelled" } : { status: "answered", answer: { q0: "Build", q1: ["Dev"] } },
-          ),
-        ),
-      ),
-    create: () => Effect.die("unused"),
-    get: () => Effect.die("unused"),
-    list: () => Effect.die("unused"),
-    state: () => Effect.die("unused"),
+      }).pipe(Effect.andThen(reject ? Effect.fail(new QuestionV2.RejectedError()) : Effect.succeed([["Build"], []]))),
     reply: () => Effect.die("unused"),
-    cancel: () => Effect.die("unused"),
+    reject: () => Effect.die("unused"),
+    list: () => Effect.die("unused"),
   }),
 )
-const questionToolNode = makeLocationNode({
-  name: "test/question-tool-plugin",
-  layer: Layer.effectDiscard(registerToolPlugin(QuestionTool.Plugin)),
-  deps: [ToolRegistry.toolsNode, PermissionV2.node, Form.node],
-})
-
 const it = testEffect(
-  AppNodeBuilder.build(LayerNode.group([ToolRegistry.node, ToolRegistry.toolsNode, questionToolNode]), [
+  AppNodeBuilder.build(LayerNode.group([ToolRegistry.node, ToolRegistry.toolsNode, QuestionTool.node]), [
     [PermissionV2.node, permission],
-    [Form.node, form],
+    [QuestionV2.node, question],
     [ToolOutputStore.node, ToolOutputStore.nodeWithoutConfig],
-    [Image.node, imagePassthrough],
   ]),
 )
 
 describe("QuestionTool", () => {
-  it.effect("omits a catalog-denied question and enforces its leaf permission", () =>
+  it.effect("omits a denied built-in question and terminally settles a stale call", () =>
     Effect.gen(function* () {
       captured = undefined
       deny = true
@@ -102,15 +63,9 @@ describe("QuestionTool", () => {
         yield* settleTool(registry, {
           sessionID,
           ...toolIdentity,
-          call: { type: "tool-call", id: "call-question-denied", name: "question", input: questionInput },
+          call: { type: "tool-call", id: "call-question-denied", name: "question", input: { questions: [] } },
         }),
-      ).toEqual({
-        result: { type: "error", value: "Permission denied: question" },
-        error: {
-          type: "permission.rejected",
-          message: "Permission denied: question",
-        },
-      })
+      ).toEqual({ result: { type: "error", value: "Permission denied: question" } })
       expect(capturedInput()).toBeUndefined()
       deny = false
     }),
@@ -133,12 +88,6 @@ describe("QuestionTool", () => {
           question: "Which environment?",
           header: "Environment",
           options: [{ label: "Dev", description: "Development" }],
-          multiple: true,
-        },
-        {
-          question: "Anything else?",
-          header: "Optional",
-          options: [],
         },
       ]
 
@@ -153,14 +102,14 @@ describe("QuestionTool", () => {
         result: {
           type: "text",
           value:
-            'User has answered your questions: "What should happen?"="Build", "Which environment?"="Dev", "Anything else?"="Unanswered". You can now continue with the user\'s answers in mind.',
+            'User has answered your questions: "What should happen?"="Build", "Which environment?"="Unanswered". You can now continue with the user\'s answers in mind.',
         },
         output: {
-          structured: { answers: [["Build"], ["Dev"], []] },
+          structured: { answers: [["Build"], []] },
           content: [
             {
               type: "text",
-              text: 'User has answered your questions: "What should happen?"="Build", "Which environment?"="Dev", "Anything else?"="Unanswered". You can now continue with the user\'s answers in mind.',
+              text: 'User has answered your questions: "What should happen?"="Build", "Which environment?"="Unanswered". You can now continue with the user\'s answers in mind.',
             },
           ],
         },
@@ -168,34 +117,8 @@ describe("QuestionTool", () => {
       expect(assertions).toMatchObject([{ sessionID, action: "question", resources: ["*"] }])
       expect(capturedInput()).toEqual({
         sessionID,
-        title: "Questions",
-        metadata: { kind: "question", tool: { messageID: toolIdentity.messageID, callID: "call-question" } },
-        fields: [
-          {
-            key: "q0",
-            title: "Action",
-            description: "What should happen?",
-            options: [{ value: "Build", label: "Build", description: "Build it" }],
-            custom: true,
-            type: "string",
-          },
-          {
-            key: "q1",
-            title: "Environment",
-            description: "Which environment?",
-            options: [{ value: "Dev", label: "Dev", description: "Development" }],
-            custom: true,
-            type: "multiselect",
-          },
-          {
-            key: "q2",
-            title: "Optional",
-            description: "Anything else?",
-            options: [],
-            custom: true,
-            type: "string",
-          },
-        ],
+        questions,
+        tool: { messageID: toolIdentity.assistantMessageID, callID: "call-question" },
       })
     }),
   )
@@ -210,22 +133,12 @@ describe("QuestionTool", () => {
       yield* executeTool(registryService, {
         sessionID,
         ...toolIdentity,
-        call: { type: "tool-call", id: "call-question", name: "question", input: questionInput },
+        call: { type: "tool-call", id: "call-question", name: "question", input: { questions: [] } },
       })
       expect(capturedInput()).toEqual({
         sessionID,
-        title: "Questions",
-        metadata: { kind: "question", tool: { messageID: toolIdentity.messageID, callID: "call-question" } },
-        fields: [
-          {
-            key: "q0",
-            title: "Continue",
-            description: "Continue?",
-            options: [{ value: "Yes", label: "Yes", description: "Continue" }],
-            custom: true,
-            type: "string",
-          },
-        ],
+        questions: [],
+        tool: { messageID: toolIdentity.assistantMessageID, callID: "call-question" },
       })
     }),
   )
@@ -239,16 +152,11 @@ describe("QuestionTool", () => {
       const fiber = yield* executeTool(registryService, {
         sessionID,
         ...toolIdentity,
-        call: { type: "tool-call", id: "call-question", name: "question", input: questionInput },
+        call: { type: "tool-call", id: "call-question", name: "question", input: { questions: [] } },
       }).pipe(Effect.forkScoped)
 
       const exit = yield* Fiber.await(fiber)
       expect(Exit.isFailure(exit)).toBe(true)
-      if (Exit.isFailure(exit)) {
-        const error = Cause.squash(exit.cause)
-        expect(error).toBeInstanceOf(QuestionTool.CancelledError)
-        expect(error).toHaveProperty("message", "The user dismissed this question")
-      }
     }),
   )
 })

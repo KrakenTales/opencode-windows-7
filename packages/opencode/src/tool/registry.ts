@@ -11,6 +11,7 @@ import { GrepTool } from "./grep"
 import { ReadTool } from "./read"
 import { TaskTool } from "./task"
 import { Database } from "@opencode-ai/core/database/database"
+import { TodoWriteTool } from "./todo"
 import { WebFetchTool } from "./webfetch"
 import { WriteTool } from "./write"
 import { InvalidTool } from "./invalid"
@@ -38,6 +39,7 @@ import { Format } from "../format"
 import { InstanceState } from "@/effect/instance-state"
 import { EffectBridge } from "@/effect/bridge"
 import { Question } from "../question"
+import { Todo } from "../session/todo"
 import { LSP } from "@/lsp/lsp"
 import { Instruction } from "../session/instruction"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -45,7 +47,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { Agent } from "../agent/agent"
 import { Skill } from "../skill"
 import { Permission } from "@/permission"
-import { Job } from "@/job"
+import { BackgroundJob } from "@/background/job"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -95,6 +97,7 @@ const layer = Layer.effect(
     const task = yield* TaskTool
     const read = yield* ReadTool
     const question = yield* QuestionTool
+    const todo = yield* TodoWriteTool
     const lsptool = yield* LspTool
     const plan = yield* PlanExitTool
     const webfetch = yield* WebFetchTool
@@ -208,6 +211,7 @@ const layer = Layer.effect(
           write: Tool.init(writetool),
           task: Tool.init(task),
           fetch: Tool.init(webfetch),
+          todo: Tool.init(todo),
           search: Tool.init(websearch),
           skill: Tool.init(skilltool),
           patch: Tool.init(patchtool),
@@ -230,6 +234,7 @@ const layer = Layer.effect(
             tool.write,
             tool.task,
             tool.fetch,
+            tool.todo,
             tool.search,
             tool.skill,
             tool.patch,
@@ -421,10 +426,11 @@ export const node = LayerNode.make({
     Config.node,
     Plugin.node,
     Question.node,
+    Todo.node,
     Agent.node,
     Skill.node,
     Session.node,
-    Job.node,
+    BackgroundJob.node,
     Provider.node,
     LSP.node,
     Instruction.node,

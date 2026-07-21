@@ -5,7 +5,6 @@ import { Database } from "@opencode-ai/core/database/database"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2 } from "@opencode-ai/core/event"
-import { Job } from "@opencode-ai/core/job"
 import { Location } from "@opencode-ai/core/location"
 import { PermissionV2 } from "@opencode-ai/core/permission"
 import { PermissionTable } from "@opencode-ai/core/permission/sql"
@@ -182,12 +181,12 @@ describe("PermissionV2", () => {
       const agents = yield* AgentV2.Service
       yield* agents.transform((editor) =>
         editor.update(AgentV2.ID.make("build"), (agent) => {
-          agent.permissions = [{ action: "custom", resource: "*", effect: "allow" }]
+          agent.permissions = [{ action: "todowrite", resource: "*", effect: "allow" }]
         }),
       )
 
       const service = yield* PermissionV2.Service
-      expect(yield* service.ask(assertion({ action: "custom", resources: ["*"] }))).toEqual({
+      expect(yield* service.ask(assertion({ action: "todowrite", resources: ["*"] }))).toEqual({
         id: PermissionV2.ID.create("per_test"),
         effect: "allow",
       })

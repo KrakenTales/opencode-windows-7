@@ -35,7 +35,7 @@ import { Tool } from "@/tool/tool"
 import { Permission } from "@/permission"
 import { SessionStatus } from "./status"
 import { LLM } from "./llm"
-import { ShellSelect } from "@opencode-ai/core/shell/select"
+import { Shell } from "@opencode-ai/core/shell"
 import { ShellID } from "@/tool/shell/id"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Truncate } from "@/tool/truncate"
@@ -55,7 +55,7 @@ import { eq } from "drizzle-orm"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
-import { LLMEvent } from "@opencode-ai/ai"
+import { LLMEvent } from "@opencode-ai/llm"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -520,8 +520,8 @@ const layer = Layer.effect(
           }).pipe(Effect.ensuring(markReady))
 
           const cfg = yield* config.get()
-          const sh = ShellSelect.preferred(cfg.shell)
-          const args = ShellSelect.args(sh, input.command)
+          const sh = Shell.preferred(cfg.shell)
+          const args = Shell.args(sh, input.command, cwd)
           let output = ""
           let aborted = false
 
@@ -1397,7 +1397,7 @@ const layer = Layer.effect(
       const shellMatches = ConfigMarkdown.shell(template)
       if (shellMatches.length > 0) {
         const cfg = yield* config.get()
-        const sh = ShellSelect.preferred(cfg.shell)
+        const sh = Shell.preferred(cfg.shell)
         const results = yield* Effect.promise(() =>
           Promise.all(
             shellMatches.map(async ([, cmd]) => (await Process.text([cmd], { shell: sh, nothrow: true })).text),

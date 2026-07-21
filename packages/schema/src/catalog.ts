@@ -1,6 +1,6 @@
-export * as Catalog from "./catalog.js"
+export * as Catalog from "./catalog"
 
-import { ephemeral, inventory } from "./event.js"
+import { define, inventory } from "./event"
 
-const Updated = ephemeral({ type: "catalog.updated", schema: {} })
+const Updated = define({ type: "catalog.updated", schema: {} })
 export const Event = { Updated, Definitions: inventory(Updated) }

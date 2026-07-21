@@ -4,7 +4,6 @@ import { HttpApiBuilder, HttpApiSchema } from "effect/unstable/httpapi"
 import { Api } from "../api"
 import { InvalidRequestError } from "@opencode-ai/protocol/errors"
 import { response } from "../location"
-import { WellKnown } from "@opencode-ai/core/wellknown"
 
 const authorize = <A, R>(effect: Effect.Effect<A, Integration.AuthorizationError, R>) =>
   effect.pipe(
@@ -35,22 +34,6 @@ export const IntegrationHandler = HttpApiBuilder.group(Api, "server.integration"
         }),
       )
       .handle(
-        "integration.wellknown.add",
-        Effect.fn(function* (ctx) {
-          const wellknown = yield* WellKnown.Service
-          const integration = yield* Integration.Service
-          yield* wellknown
-            .add(ctx.payload.url)
-            .pipe(
-              Effect.mapError(
-                (error) => new InvalidRequestError({ message: error.message, kind: "well_known_discovery" }),
-              ),
-            )
-          yield* integration.reload()
-          return HttpApiSchema.NoContent.make()
-        }),
-      )
-      .handle(
         "integration.connect.key",
         Effect.fn(function* (ctx) {
           const service = yield* Integration.Service
@@ -65,12 +48,12 @@ export const IntegrationHandler = HttpApiBuilder.group(Api, "server.integration"
         }),
       )
       .handle(
-        "integration.oauth.connect",
+        "integration.connect.oauth",
         Effect.fn(function* (ctx) {
           const service = yield* Integration.Service
           return yield* response(
             authorize(
-              service.oauth.connect({
+              service.connection.oauth({
                 integrationID: ctx.params.integrationID,
                 methodID: ctx.payload.methodID,
                 inputs: ctx.payload.inputs,
@@ -81,91 +64,39 @@ export const IntegrationHandler = HttpApiBuilder.group(Api, "server.integration"
         }),
       )
       .handle(
-        "integration.oauth.status",
+        "integration.attempt.status",
         Effect.fn(function* (ctx) {
           const service = yield* Integration.Service
-          return yield* response(
-            service.oauth.status({
-              integrationID: ctx.params.integrationID,
-              attemptID: ctx.params.attemptID,
-            }),
-          )
+          return yield* response(service.attempt.status(ctx.params.attemptID))
         }),
       )
       .handle(
-        "integration.oauth.complete",
+        "integration.attempt.complete",
         Effect.fn(function* (ctx) {
           const service = yield* Integration.Service
-          yield* service.oauth
-            .complete({
-              integrationID: ctx.params.integrationID,
-              attemptID: ctx.params.attemptID,
-              code: ctx.payload.code,
-            })
-            .pipe(
-              Effect.mapError(
-                (error) =>
-                  new InvalidRequestError({
-                    message:
-                      error._tag === "Integration.CodeRequired"
-                        ? "Authorization code is required"
-                        : "Authentication failed",
-                    kind:
-                      error._tag === "Integration.CodeRequired"
-                        ? "integration_code_required"
-                        : "integration_authorization",
-                  }),
-              ),
-            )
-          return HttpApiSchema.NoContent.make()
-        }),
-      )
-      .handle(
-        "integration.oauth.cancel",
-        Effect.fn(function* (ctx) {
-          const service = yield* Integration.Service
-          yield* service.oauth.cancel({
-            integrationID: ctx.params.integrationID,
-            attemptID: ctx.params.attemptID,
-          })
-          return HttpApiSchema.NoContent.make()
-        }),
-      )
-      .handle(
-        "integration.command.connect",
-        Effect.fn(function* (ctx) {
-          const service = yield* Integration.Service
-          return yield* response(
-            authorize(
-              service.command.connect({
-                integrationID: ctx.params.integrationID,
-                methodID: ctx.payload.methodID,
-                label: ctx.payload.label,
-              }),
+          yield* service.attempt.complete({ attemptID: ctx.params.attemptID, code: ctx.payload.code }).pipe(
+            Effect.mapError(
+              (error) =>
+                new InvalidRequestError({
+                  message:
+                    error._tag === "Integration.CodeRequired"
+                      ? "Authorization code is required"
+                      : "Authentication failed",
+                  kind:
+                    error._tag === "Integration.CodeRequired"
+                      ? "integration_code_required"
+                      : "integration_authorization",
+                }),
             ),
           )
+          return HttpApiSchema.NoContent.make()
         }),
       )
       .handle(
-        "integration.command.status",
+        "integration.attempt.cancel",
         Effect.fn(function* (ctx) {
           const service = yield* Integration.Service
-          return yield* response(
-            service.command.status({
-              integrationID: ctx.params.integrationID,
-              attemptID: ctx.params.attemptID,
-            }),
-          )
-        }),
-      )
-      .handle(
-        "integration.command.cancel",
-        Effect.fn(function* (ctx) {
-          const service = yield* Integration.Service
-          yield* service.command.cancel({
-            integrationID: ctx.params.integrationID,
-            attemptID: ctx.params.attemptID,
-          })
+          yield* service.attempt.cancel(ctx.params.attemptID)
           return HttpApiSchema.NoContent.make()
         }),
       )

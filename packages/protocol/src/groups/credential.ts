@@ -1,7 +1,7 @@
 import { Credential } from "@opencode-ai/schema/credential"
 import { Schema } from "effect"
 import { HttpApiEndpoint, HttpApiGroup, HttpApiSchema, OpenApi } from "effect/unstable/httpapi"
-import { LocationQuery, locationQueryOpenApi } from "./location.js"
+import { LocationQuery, locationQueryOpenApi } from "./location"
 
 export const CredentialGroup = HttpApiGroup.make("server.credential")
   .add(
@@ -20,7 +20,6 @@ export const CredentialGroup = HttpApiGroup.make("server.credential")
         }),
       ),
   )
-  .annotateMerge(OpenApi.annotations({ title: "credential" }))
   .add(
     HttpApiEndpoint.delete("credential.remove", "/api/credential/:credentialID", {
       params: { credentialID: Credential.ID },

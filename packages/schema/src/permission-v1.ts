@@ -1,1 +1,1 @@
-export * from "./v1/permission.js"
+export * from "./v1/permission"

@@ -1,9 +1,9 @@
-export * as PermissionSaved from "./permission-saved.js"
+export * as PermissionSaved from "./permission-saved"
 
 import { Schema } from "effect"
-import { ascending } from "./identifier.js"
-import { ProjectID } from "./project-id.js"
-import { statics } from "./schema.js"
+import { ascending } from "./identifier"
+import { ProjectID } from "./project-id"
+import { statics } from "./schema"
 
 export const ID = Schema.String.pipe(
   Schema.brand("PermissionSaved.ID"),

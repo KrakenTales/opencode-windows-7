@@ -1,11 +1,11 @@
-export * as Reference from "./reference.js"
+export * as Reference from "./reference"
 
 import { Schema } from "effect"
-import { optional } from "./schema.js"
-import { ephemeral, inventory } from "./event.js"
-import { AbsolutePath } from "./schema.js"
+import { optional } from "./schema"
+import { define, inventory } from "./event"
+import { AbsolutePath } from "./schema"
 
-const Updated = ephemeral({ type: "reference.updated", schema: {} })
+const Updated = define({ type: "reference.updated", schema: {} })
 export const Event = { Updated, Definitions: inventory(Updated) }
 
 export interface LocalSource extends Schema.Schema.Type<typeof LocalSource> {}
@@ -30,11 +30,10 @@ export const Source = Schema.Union([LocalSource, GitSource])
   .annotate({ identifier: "Reference.Source" })
 export type Source = typeof Source.Type
 
-export const Info = Schema.Struct({
+export class Info extends Schema.Class<Info>("Reference.Info")({
   name: Schema.String,
   path: AbsolutePath,
   description: Schema.String.pipe(optional),
   hidden: Schema.Boolean.pipe(optional),
   source: Source,
-}).annotate({ identifier: "Reference.Info" })
-export interface Info extends Schema.Schema.Type<typeof Info> {}
+}) {}

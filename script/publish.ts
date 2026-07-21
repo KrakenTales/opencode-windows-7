@@ -35,19 +35,10 @@ if (Script.release && !Script.preview) {
 
 await prepareReleaseFiles()
 
-console.log("\n=== schema ===\n")
-await $`bun ./packages/schema/script/publish.ts`
-
-console.log("\n=== ai ===\n")
-await $`bun ./packages/ai/script/publish.ts`
-
-console.log("\n=== protocol ===\n")
-await $`bun ./packages/protocol/script/publish.ts`
-
-console.log("\n=== client ===\n")
-await $`bun ./packages/client/script/publish.ts`
-
 console.log("\n=== cli ===\n")
+await $`bun ./packages/opencode/script/publish.ts`
+
+console.log("\n=== preview cli ===\n")
 await $`bun ./packages/cli/script/publish.ts`
 
 console.log("\n=== sdk ===\n")

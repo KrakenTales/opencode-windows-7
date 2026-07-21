@@ -49,7 +49,6 @@ const layer = Layer.effect(
     const scope = yield* Scope.Scope
     const materialized = new Map<string, Info>()
     const state = State.create<Data, Draft>({
-      name: "reference",
       initial: () => ({ sources: new Map() }),
       draft: (draft) => ({
         add: (name, source) => draft.sources.set(name, source as Types.DeepMutable<Source>),
@@ -64,7 +63,7 @@ const layer = Layer.effect(
             if (source.type === "local") {
               materialized.set(
                 name,
-                Info.make({
+                new Info({
                   name,
                   path: source.path,
                   ...(source.description === undefined ? {} : { description: source.description }),
@@ -88,7 +87,7 @@ const layer = Layer.effect(
             seen.set(target, source.branch)
             materialized.set(
               name,
-              Info.make({
+              new Info({
                 name,
                 path: AbsolutePath.make(target),
                 ...(source.description === undefined ? {} : { description: source.description }),
@@ -120,6 +119,8 @@ const layer = Layer.effect(
     })
   }),
 )
+
+export const locationLayer = layer
 
 export const node = makeLocationNode({
   service: Service,

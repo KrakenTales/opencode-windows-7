@@ -1,13 +1,17 @@
 import { createMemo } from "solid-js"
-import { useData } from "./data"
+import { useProject } from "./project"
+import { useSync } from "./sync"
 import { abbreviateHome } from "../runtime"
 import { useTuiPaths } from "./runtime"
 
 export function useDirectory() {
-  const data = useData()
+  const project = useProject()
+  const sync = useSync()
   const paths = useTuiPaths()
   return createMemo(() => {
-    const directory = data.location.info()?.directory ?? data.location.default().directory ?? paths.cwd
-    return abbreviateHome(directory, paths.home)
+    const directory = project.instance.path().directory || paths.cwd
+    const result = abbreviateHome(directory, paths.home)
+    if (sync.data.vcs?.branch) return result + ":" + sync.data.vcs.branch
+    return result
   })
 }

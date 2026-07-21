@@ -56,7 +56,7 @@ const buildRequest = (
   input: Readonly<Record<string, unknown>>,
 ): Effect.Effect<HttpClientRequest.HttpClientRequest, ToolError> =>
   Effect.gen(function* () {
-    // Validate model input before auth resolution can refresh credentials.
+    // Validate every model-controlled value before auth resolution, which may refresh tokens.
     const url = buildUrl(plan, input)
     if (url instanceof ToolError) return yield* Effect.fail(url)
     const missing = plan.fields.find(
@@ -68,17 +68,16 @@ const buildRequest = (
     }
 
     let request = HttpClientRequest.make(plan.operation.method as HttpMethod.HttpMethod)(url)
-    const query: Array<readonly [string, string]> = []
     for (const field of plan.fields) {
       if (field.location !== "query") continue
       const item = own(input, field.inputName)
       if (item === undefined) continue
-      const serialized = serializeQuery(field, item)
+      const serialized = serializeQuery(request, field, item)
       if (serialized instanceof ToolError) return yield* Effect.fail(serialized)
-      for (const parameter of serialized) query.push(parameter)
+      request = serialized
     }
-    if (query.length > 0) request = HttpClientRequest.appendUrlParams(request, query)
 
+    // Host headers first, then declared header parameters.
     request = HttpClientRequest.setHeaders(request, plan.headers)
     for (const field of plan.fields) {
       if (field.location !== "header") continue
@@ -170,7 +169,7 @@ const applyCredentials = (
       continue
     }
     if (credential.type === "basic") {
-      // Basic auth credentials are UTF-8; btoa rejects non-Latin-1 input.
+      // Buffer instead of btoa: btoa throws on non-Latin-1 credentials.
       const duplicate = add(
         "header",
         "authorization",
@@ -184,6 +183,7 @@ const applyCredentials = (
       if (duplicate !== undefined) return duplicate
       continue
     }
+    // apiKey: the carrier comes from the scheme declaration.
     if (definition.type !== "apiKey") {
       return toolError(
         `Security scheme '${name}' is not an apiKey scheme; resolve a bearer, basic, or header credential for it.`,
@@ -212,7 +212,8 @@ const buildUrl = (plan: Plan, input: Readonly<Record<string, unknown>>): string 
       ),
     )
     if (fieldValue instanceof ToolError) return fieldValue
-    // URL normalization collapses encoded `.` and `..`, which could retarget the request.
+    // '.'/'..' survive encoding and URL normalization collapses them, letting a
+    // model-supplied value retarget the request to a different endpoint.
     if (fieldValue === "" || fieldValue === "." || fieldValue === "..") {
       return toolError(`Invalid path parameter '${field.inputName}'.`)
     }
@@ -248,46 +249,40 @@ const serializeSimple = (
 }
 
 const serializeQuery = (
+  request: HttpClientRequest.HttpClientRequest,
   field: Plan["fields"][number],
   value: unknown,
-): ReadonlyArray<readonly [string, string]> | ToolError => {
+): HttpClientRequest.HttpClientRequest | ToolError => {
   if (field.style === "deepObject") {
     if (!isRecord(value)) return toolError(`Deep-object parameter '${field.inputName}' must be an object.`)
-    const parameters: Array<readonly [string, string]> = []
-    for (const [name, item] of Object.entries(value)) {
+    return Object.entries(value).reduce<HttpClientRequest.HttpClientRequest | ToolError>((current, [name, item]) => {
+      if (current instanceof ToolError) return current
       if (item === undefined || (item !== null && typeof item === "object")) {
         return toolError(`Deep-object parameter '${field.inputName}' contains an unsupported nested value.`)
       }
-      parameters.push([`${field.name}[${name}]`, String(item)])
-    }
-    return parameters
+      return HttpClientRequest.appendUrlParam(current, `${field.name}[${name}]`, String(item))
+    }, request)
   }
   if (Array.isArray(value)) {
-    if (!field.explode) {
-      const rendered = serializeSimple(field, value, String)
-      return rendered instanceof ToolError ? rendered : [[field.name, rendered]]
+    const rendered = serializeSimple(field, value, String)
+    if (rendered instanceof ToolError) return rendered
+    if (!field.explode) return HttpClientRequest.appendUrlParam(request, field.name, rendered)
+    if (value.some((item) => item === undefined || (item !== null && typeof item === "object"))) {
+      return toolError(`Query parameter '${field.inputName}' contains an unsupported nested value.`)
     }
-    const parameters: Array<readonly [string, string]> = []
-    for (const item of value) {
-      if (item !== null && typeof item !== "string" && typeof item !== "number" && typeof item !== "boolean") {
-        return toolError(`Parameter '${field.inputName}' contains an unsupported nested value.`)
-      }
-      parameters.push([field.name, String(item)])
-    }
-    return parameters
+    return value.reduce((current, item) => HttpClientRequest.appendUrlParam(current, field.name, String(item)), request)
   }
   if (isRecord(value) && field.explode) {
-    const parameters: Array<readonly [string, string]> = []
-    for (const [name, item] of Object.entries(value)) {
+    return Object.entries(value).reduce<HttpClientRequest.HttpClientRequest | ToolError>((current, [name, item]) => {
+      if (current instanceof ToolError) return current
       if (item === undefined || (item !== null && typeof item === "object")) {
         return toolError(`Query parameter '${field.inputName}' contains an unsupported nested value.`)
       }
-      parameters.push([name, String(item)])
-    }
-    return parameters
+      return HttpClientRequest.appendUrlParam(current, name, String(item))
+    }, request)
   }
   const rendered = serializeSimple(field, value, String)
-  return rendered instanceof ToolError ? rendered : [[field.name, rendered]]
+  return rendered instanceof ToolError ? rendered : HttpClientRequest.appendUrlParam(request, field.name, rendered)
 }
 
 const readResponseBody = (

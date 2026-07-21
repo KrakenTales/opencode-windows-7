@@ -1,10 +1,10 @@
-import { spawn } from "bun-pty"
+import { spawn as create } from "bun-pty"
 import type { Opts, Proc } from "./pty"
 
 export type { Disp, Exit, Opts, Proc } from "./pty"
 
-function spawnPty(file: string, args: string[], opts: Opts): Proc {
-  const pty = spawn(file, args, opts)
+export function spawn(file: string, args: string[], opts: Opts): Proc {
+  const pty = create(file, args, opts)
   return {
     pid: pty.pid,
     onData(listener) {
@@ -24,5 +24,3 @@ function spawnPty(file: string, args: string[], opts: Opts): Proc {
     },
   }
 }
-
-export { spawnPty as spawn }

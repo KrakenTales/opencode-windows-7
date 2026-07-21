@@ -1,6 +1,6 @@
 import { Schema } from "effect"
-import { descending } from "./identifier.js"
-import { statics } from "./schema.js"
+import { descending } from "./identifier"
+import { statics } from "./schema"
 
 export const SessionID = Schema.String.check(Schema.isStartsWith("ses")).pipe(
   Schema.brand("SessionID"),

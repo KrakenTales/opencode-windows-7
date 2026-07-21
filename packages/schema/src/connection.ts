@@ -1,7 +1,7 @@
-export * as Connection from "./connection.js"
+export * as Connection from "./connection"
 
 import { Schema } from "effect"
-import { Credential } from "./credential.js"
+import { Credential } from "./credential"
 
 export interface CredentialInfo extends Schema.Schema.Type<typeof CredentialInfo> {}
 export const CredentialInfo = Schema.Struct({

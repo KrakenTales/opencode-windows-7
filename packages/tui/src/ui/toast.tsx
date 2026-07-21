@@ -14,7 +14,7 @@ type ToastInput = Omit<ToastOptions, "duration"> & { duration?: number }
 
 export function Toast() {
   const toast = useToast()
-  const { themeV2 } = useTheme().contextual("overlay")
+  const { theme } = useTheme()
   const dimensions = useTerminalDimensions()
 
   return (
@@ -24,24 +24,24 @@ export function Toast() {
           position="absolute"
           justifyContent="center"
           alignItems="flex-start"
-          top={1}
+          top={2}
           right={2}
           maxWidth={Math.min(60, dimensions().width - 6)}
           paddingLeft={2}
           paddingRight={2}
           paddingTop={1}
           paddingBottom={1}
-          backgroundColor={themeV2.background()}
-          borderColor={themeV2.text.feedback[current().variant]()}
+          backgroundColor={theme.backgroundPanel}
+          borderColor={theme[current().variant]}
           border={["left", "right"]}
           customBorderChars={SplitBorder.customBorderChars}
         >
           <Show when={current().title}>
-            <text attributes={TextAttributes.BOLD} marginBottom={1} fg={themeV2.text()}>
+            <text attributes={TextAttributes.BOLD} marginBottom={1} fg={theme.text}>
               {current().title}
             </text>
           </Show>
-          <text fg={themeV2.text()} wrapMode="word" width="100%">
+          <text fg={theme.text} wrapMode="word" width="100%">
             {current().message}
           </text>
         </box>

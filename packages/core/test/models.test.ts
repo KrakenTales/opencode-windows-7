@@ -1,5 +1,4 @@
 import { describe, expect, beforeAll, beforeEach, afterAll } from "bun:test"
-import { Money } from "@opencode-ai/schema/money"
 import { Effect, Layer, Ref } from "effect"
 import { HttpClient, HttpClientResponse } from "effect/unstable/http"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -7,9 +6,7 @@ import { LayerNodePlatform } from "@opencode-ai/core/effect/app-node-platform"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { Global } from "@opencode-ai/core/global"
-import { ModelV2 } from "@opencode-ai/core/model"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
-import { ProviderV2 } from "@opencode-ai/core/provider"
 import { it } from "./lib/effect"
 import { readFile, rm, writeFile, utimes, mkdir } from "fs/promises"
 import path from "path"
@@ -32,12 +29,11 @@ afterAll(() => {
 
 const cacheFile = path.join(Global.Path.cache, "models.json")
 
-const fixture = {
+const fixture: Record<string, ModelsDev.Provider> = {
   acme: {
     id: "acme",
     name: "Acme",
     env: ["ACME_API_KEY"],
-    npm: "@ai-sdk/openai-compatible",
     models: {
       "acme-1": {
         id: "acme-1",
@@ -53,52 +49,11 @@ const fixture = {
   },
 }
 
-const fixtureSnapshot = [
-  {
-    info: {
-      id: ProviderV2.ID.make("acme"),
-      name: "Acme",
-      package: ProviderV2.aisdk("@ai-sdk/openai-compatible"),
-    },
-    models: [
-      {
-        id: ModelV2.ID.make("acme-1"),
-        modelID: ModelV2.ID.make("acme-1"),
-        providerID: ProviderV2.ID.make("acme"),
-        name: "Acme One",
-        family: undefined,
-        package: undefined,
-        settings: undefined,
-        capabilities: { tools: true, input: [], output: [] },
-        variants: [],
-        time: { released: Date.parse("2026-01-01") },
-        cost: [
-          {
-            input: Money.USDPerMillionTokens.zero,
-            output: Money.USDPerMillionTokens.zero,
-            cache: {
-              read: Money.USDPerMillionTokens.zero,
-              write: Money.USDPerMillionTokens.zero,
-            },
-          },
-        ],
-        status: "active",
-        enabled: true,
-        limit: { context: 128000, input: undefined, output: 8192 },
-        headers: undefined,
-        body: undefined,
-      },
-    ],
-    environment: ["ACME_API_KEY"],
-  },
-] satisfies readonly ModelsDev.Snapshot[]
-
-const fixture2 = {
+const fixture2: Record<string, ModelsDev.Provider> = {
   beta: {
     id: "beta",
     name: "Beta",
     env: ["BETA_API_KEY"],
-    npm: "@ai-sdk/openai-compatible",
     models: {
       "beta-1": {
         id: "beta-1",
@@ -113,46 +68,6 @@ const fixture2 = {
     },
   },
 }
-
-const fixture2Snapshot = [
-  {
-    info: {
-      id: ProviderV2.ID.make("beta"),
-      name: "Beta",
-      package: ProviderV2.aisdk("@ai-sdk/openai-compatible"),
-    },
-    models: [
-      {
-        id: ModelV2.ID.make("beta-1"),
-        modelID: ModelV2.ID.make("beta-1"),
-        providerID: ProviderV2.ID.make("beta"),
-        name: "Beta One",
-        family: undefined,
-        package: undefined,
-        settings: undefined,
-        capabilities: { tools: false, input: [], output: [] },
-        variants: [],
-        time: { released: Date.parse("2026-02-01") },
-        cost: [
-          {
-            input: Money.USDPerMillionTokens.zero,
-            output: Money.USDPerMillionTokens.zero,
-            cache: {
-              read: Money.USDPerMillionTokens.zero,
-              write: Money.USDPerMillionTokens.zero,
-            },
-          },
-        ],
-        status: "active",
-        enabled: true,
-        limit: { context: 64000, input: undefined, output: 4096 },
-        headers: undefined,
-        body: undefined,
-      },
-    ],
-    environment: ["BETA_API_KEY"],
-  },
-] satisfies readonly ModelsDev.Snapshot[]
 
 interface MockState {
   body: string
@@ -212,7 +127,7 @@ const initialState: MockState = {
 }
 
 describe("ModelsDev Service", () => {
-  it.live("get() returns normalized snapshots from disk when cache file exists", () =>
+  it.live("get() returns providers from disk when cache file exists", () =>
     Effect.gen(function* () {
       yield* writeCache(fixture)
       const state = yield* Ref.make(initialState)
@@ -220,7 +135,7 @@ describe("ModelsDev Service", () => {
         state,
         ModelsDev.Service.use((s) => s.get()),
       )
-      expect(result).toEqual(fixtureSnapshot)
+      expect(result).toEqual(fixture)
       const final = yield* Ref.get(state)
       expect(final.calls).toEqual([])
     }),
@@ -233,7 +148,7 @@ describe("ModelsDev Service", () => {
         state,
         ModelsDev.Service.use((s) => s.get()),
       )
-      expect(result).toEqual([])
+      expect(result).toEqual({})
       const final = yield* Ref.get(state)
       expect(final.calls).toEqual([])
     }),
@@ -254,7 +169,7 @@ describe("ModelsDev Service", () => {
             Flag.OPENCODE_DISABLE_MODELS_FETCH = true
           }),
       )
-      expect(result).toEqual(fixture2Snapshot)
+      expect(result).toEqual(fixture2)
       expect(yield* Effect.promise(() => readFile(cacheFile, "utf8"))).toBe(JSON.stringify(fixture2))
       const final = yield* Ref.get(state)
       expect(final.calls.length).toBe(1)
@@ -274,7 +189,7 @@ describe("ModelsDev Service", () => {
           })
         }),
       )
-      for (const result of results) expect(result).toEqual(fixtureSnapshot)
+      for (const result of results) expect(result).toEqual(fixture)
     }),
   )
 
@@ -293,8 +208,8 @@ describe("ModelsDev Service", () => {
           return { a, b }
         }),
       )
-      expect(first.a).toEqual(fixtureSnapshot)
-      expect(first.b).toEqual(fixtureSnapshot)
+      expect(first.a).toEqual(fixture)
+      expect(first.b).toEqual(fixture)
     }),
   )
 
@@ -312,8 +227,8 @@ describe("ModelsDev Service", () => {
           return { before, after }
         }),
       )
-      expect(result.before).toEqual(fixtureSnapshot)
-      expect(result.after).toEqual(fixture2Snapshot)
+      expect(result.before).toEqual(fixture)
+      expect(result.after).toEqual(fixture2)
       const final = yield* Ref.get(state)
       expect(final.calls.length).toBe(1)
       expect(final.calls[0].url).toContain("/api.json")
@@ -350,7 +265,7 @@ describe("ModelsDev Service", () => {
       )
       const final = yield* Ref.get(state)
       expect(final.calls.length).toBe(1)
-      expect(after).toEqual(fixture2Snapshot)
+      expect(after).toEqual(fixture2)
     }),
   )
 
@@ -366,7 +281,7 @@ describe("ModelsDev Service", () => {
           return yield* svc.get()
         }),
       )
-      expect(result).toEqual(fixtureSnapshot)
+      expect(result).toEqual(fixture)
       // retryTransient retries 5xx, so calls may be > 1.
       const final = yield* Ref.get(state)
       expect(final.calls.length).toBeGreaterThanOrEqual(1)

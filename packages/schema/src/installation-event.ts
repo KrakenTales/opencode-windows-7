@@ -1,16 +1,16 @@
-export * as InstallationEvent from "./installation-event.js"
+export * as InstallationEvent from "./installation-event"
 
 import { Schema } from "effect"
-import { Event } from "./event.js"
+import { Event } from "./event"
 
-export const Updated = Event.ephemeral({
+export const Updated = Event.define({
   type: "installation.updated",
   schema: {
     version: Schema.String,
   },
 })
 
-export const UpdateAvailable = Event.ephemeral({
+export const UpdateAvailable = Event.define({
   type: "installation.update-available",
   schema: {
     version: Schema.String,

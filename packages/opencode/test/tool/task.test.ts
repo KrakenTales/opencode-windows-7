@@ -5,7 +5,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { Agent } from "../../src/agent/agent"
-import { Job } from "@/job"
+import { BackgroundJob } from "@/background/job"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Config } from "@/config/config"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -21,7 +21,7 @@ import { Truncate } from "@/tool/truncate"
 import { ToolRegistry } from "@/tool/registry"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { disposeAllInstances } from "../fixture/fixture"
-import { pollWithTimeout, testEffect } from "../lib/effect"
+import { testEffect } from "../lib/effect"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 
@@ -34,11 +34,11 @@ const ref = {
   modelID: ModelV2.ID.make("test-model"),
 }
 
-const layer = () =>
+const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
   LayerNode.compile(
     LayerNode.group([
       Agent.node,
-      Job.node,
+      BackgroundJob.node,
       EventV2Bridge.node,
       Config.node,
       CrossSpawnSpawner.node,
@@ -52,10 +52,11 @@ const layer = () =>
       RuntimeFlags.node,
       Ripgrep.node,
     ]),
-    [[RuntimeFlags.node, RuntimeFlags.layer()]],
+    [[RuntimeFlags.node, RuntimeFlags.layer(flags)]],
   )
 
 const it = testEffect(layer())
+const background = testEffect(layer({ experimentalBackgroundSubagents: true }))
 
 function defer<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
@@ -468,7 +469,7 @@ describe("tool.task", () => {
   )
 
   it.instance(
-    "execute shapes child permissions for task and primary tools",
+    "execute shapes child permissions for task, todowrite, and primary tools",
     () =>
       Effect.gen(function* () {
         const sessions = yield* Session.Service
@@ -501,6 +502,11 @@ describe("tool.task", () => {
         expect(child.agent).toBe("reviewer")
         expect(child.permission).toEqual([
           {
+            permission: "todowrite",
+            pattern: "*",
+            action: "deny",
+          },
+          {
             permission: "bash",
             pattern: "*",
             action: "deny",
@@ -530,9 +536,40 @@ describe("tool.task", () => {
     },
   )
 
-  it.instance("backgrounds a running foreground task without restarting it", () =>
+  it.instance("rejects background execution when the experiment is disabled", () =>
     Effect.gen(function* () {
-      const jobs = yield* Job.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+            background: true,
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps() },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+    }),
+  )
+
+  it.instance("promotes a running foreground task without restarting it", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
@@ -581,12 +618,7 @@ describe("tool.task", () => {
       expect(job).toBeDefined()
       if (!job) throw new Error("task job not found")
       expect(job.metadata?.parentSessionId).toBe(chat.id)
-      yield* pollWithTimeout(
-        jobs
-          .backgroundAll({ sessionID: chat.id, type: "task" })
-          .pipe(Effect.map((backgrounded) => (backgrounded.length > 0 ? backgrounded : undefined))),
-        "task never blocked the parent session",
-      )
+      yield* jobs.promote(job.id)
 
       const result = yield* Fiber.join(fiber)
       expect(result.metadata.background).toBe(true)
@@ -601,9 +633,9 @@ describe("tool.task", () => {
     }),
   )
 
-  it.instance("execute launches background tasks without waiting for completion", () =>
+  background.instance("execute launches background tasks without waiting for completion", () =>
     Effect.gen(function* () {
-      const jobs = yield* Job.Service
+      const jobs = yield* BackgroundJob.Service
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
@@ -639,13 +671,15 @@ describe("tool.task", () => {
     }),
   )
 
-  it.instance("running task_id reports the existing background task", () =>
+  background.instance("background task completion waits for running updates", () =>
     Effect.gen(function* () {
-      const jobs = yield* Job.Service
+      const jobs = yield* BackgroundJob.Service
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
       const first = defer<void>()
+      const second = defer<void>()
+      const updated = defer<SessionPrompt.PromptInput>()
       const injected = defer<SessionPrompt.PromptInput>()
       let prompts = 0
       const promptOps: TaskPromptOps = {
@@ -656,7 +690,9 @@ describe("tool.task", () => {
             return Effect.succeed(reply(input, "done"))
           }
           prompts++
-          return Effect.promise(() => first.promise).pipe(Effect.as(reply(input, "first done")))
+          if (prompts === 1) return Effect.promise(() => first.promise).pipe(Effect.as(reply(input, "first done")))
+          updated.resolve(input)
+          return Effect.promise(() => second.promise).pipe(Effect.as(reply(input, "second done")))
         },
       }
       const context = {
@@ -691,22 +727,27 @@ describe("tool.task", () => {
 
       expect(result.metadata.sessionId).toBe(started.metadata.sessionId)
       expect(result.metadata.background).toBe(true)
-      expect(result.output).toContain("Background task already running")
-      expect(prompts).toBe(1)
+      expect(result.output).toContain("Background task updated")
       first.resolve()
+      expect((yield* jobs.get(started.metadata.sessionId))?.status).toBe("running")
+      expect((yield* Effect.promise(() => updated.promise)).parts).toEqual([
+        { type: "text", text: "also inspect cancellation" },
+      ])
+
+      second.resolve()
       const waited = yield* jobs.wait({ id: started.metadata.sessionId, timeout: 1_000 })
       expect(waited.info?.status).toBe("completed")
-      expect(waited.info?.output).toBe("first done")
+      expect(waited.info?.output).toBe("second done")
       const notification = yield* Effect.promise(() => injected.promise)
       expect(notification.variant).toBe("xhigh")
       expect(notification.parts[0]?.type).toBe("text")
-      if (notification.parts[0]?.type === "text") expect(notification.parts[0].text).toContain("first done")
+      if (notification.parts[0]?.type === "text") expect(notification.parts[0].text).toContain("second done")
     }),
   )
 
-  it.instance("background tasks complete through the job service", () =>
+  background.instance("background tasks complete through the background job service", () =>
     Effect.gen(function* () {
-      const jobs = yield* Job.Service
+      const jobs = yield* BackgroundJob.Service
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
@@ -737,9 +778,9 @@ describe("tool.task", () => {
     }),
   )
 
-  it.instance("background task completion does not wait for the parent async prompt", () =>
+  background.instance("background task completion does not wait for the parent async prompt", () =>
     Effect.gen(function* () {
-      const jobs = yield* Job.Service
+      const jobs = yield* BackgroundJob.Service
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
@@ -775,9 +816,9 @@ describe("tool.task", () => {
     }),
   )
 
-  it.instance("removing the parent session cancels running background tasks", () =>
+  background.instance("removing the parent session cancels running background tasks", () =>
     Effect.gen(function* () {
-      const jobs = yield* Job.Service
+      const jobs = yield* BackgroundJob.Service
       const sessions = yield* Session.Service
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
@@ -814,9 +855,9 @@ describe("tool.task", () => {
     }),
   )
 
-  it.instance("removing the child task session cancels its running background task", () =>
+  background.instance("removing the child task session cancels its running background task", () =>
     Effect.gen(function* () {
-      const jobs = yield* Job.Service
+      const jobs = yield* BackgroundJob.Service
       const sessions = yield* Session.Service
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
@@ -853,9 +894,9 @@ describe("tool.task", () => {
     }),
   )
 
-  it.instance("cancelling the parent run cancels running background tasks", () =>
+  background.instance("cancelling the parent run cancels running background tasks", () =>
     Effect.gen(function* () {
-      const jobs = yield* Job.Service
+      const jobs = yield* BackgroundJob.Service
       const runState = yield* SessionRunState.Service
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
@@ -894,7 +935,7 @@ describe("tool.task", () => {
 
   it.instance("cancelling a child run cancels its own pre-runner task job", () =>
     Effect.gen(function* () {
-      const jobs = yield* Job.Service
+      const jobs = yield* BackgroundJob.Service
       const runState = yield* SessionRunState.Service
       const sessions = yield* Session.Service
       const { chat } = yield* seed()
@@ -915,7 +956,7 @@ describe("tool.task", () => {
 
   it.instance("cancelling a parent run recursively cancels descendant background tasks", () =>
     Effect.gen(function* () {
-      const jobs = yield* Job.Service
+      const jobs = yield* BackgroundJob.Service
       const runState = yield* SessionRunState.Service
       const sessions = yield* Session.Service
       const { chat } = yield* seed()

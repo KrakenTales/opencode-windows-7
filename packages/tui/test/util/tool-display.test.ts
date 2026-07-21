@@ -1,23 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import {
-  canonicalToolName,
-  finiteNumber,
-  primitiveInputSummary,
-  toolDisplayMetadata,
-  webSearchProviderLabel,
-} from "../../src/util/tool-display"
-
-test("normalizes shared tool primitives", () => {
-  expect(["bash", "task", "apply_patch", "plugin_tool"].map(canonicalToolName)).toEqual([
-    "shell",
-    "subagent",
-    "patch",
-    "plugin_tool",
-  ])
-  expect([finiteNumber(-1.5), finiteNumber(Number.NaN), finiteNumber("1")]).toEqual([-1.5, undefined, undefined])
-  expect(primitiveInputSummary({ command: "pwd", count: 2, nested: {} })).toBe("[command=pwd, count=2]")
-  expect(primitiveInputSummary({ path: "src/a.ts", line: 2 }, ["path"])).toBe("[line=2]")
-})
+import { toolDisplayMetadata, webSearchProviderLabel } from "../../src/util/tool-display"
 
 describe("webSearchProviderLabel", () => {
   test("labels known providers", () => {
@@ -49,7 +31,7 @@ describe("toolDisplayMetadata", () => {
   })
 
   test("does not expose pending or malformed metadata", () => {
-    expect(toolDisplayMetadata({ status: "streaming", structured: { provider: "exa" } })).toEqual({})
+    expect(toolDisplayMetadata({ status: "pending", structured: { provider: "exa" } })).toEqual({})
     expect(toolDisplayMetadata({ status: "completed" })).toEqual({})
     expect(toolDisplayMetadata({ status: "completed", structured: null })).toEqual({})
     expect(toolDisplayMetadata({ status: "completed", structured: [] })).toEqual({})

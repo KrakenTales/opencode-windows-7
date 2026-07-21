@@ -1,48 +1,10 @@
-import type { LocationGetOutput, LocationRef } from "@opencode-ai/client"
-import { createContext, createMemo, createSignal, onCleanup, useContext, type ParentProps } from "solid-js"
-import { useClient } from "./client"
-import { useData } from "./data"
+import type { LocationRef } from "@opencode-ai/sdk/v2"
+import { createContext, useContext, type Accessor, type ParentProps } from "solid-js"
 
-const context = createContext<{
-  readonly current: LocationGetOutput | undefined
-  set: (location?: LocationRef) => void
-}>()
+const context = createContext<Accessor<LocationRef | undefined>>()
 
-export function LocationProvider(props: ParentProps) {
-  const client = useClient()
-  const data = useData()
-  const [ref, setRef] = createSignal<LocationRef>()
-  const current = createMemo(() => data.location.info(ref()))
-
-  function sync(location?: LocationRef) {
-    if (!location) return
-    const defaultLocation = data.location.default()
-    const target =
-      location.directory === defaultLocation.directory && location.workspaceID === defaultLocation.workspaceID
-        ? undefined
-        : location
-    void data.location.sync(target).catch(() => undefined)
-  }
-
-  function set(location?: LocationRef) {
-    setRef(location)
-    if (client.connection.status() === "connected") sync(location)
-  }
-
-  onCleanup(client.event.on("server.connected", () => sync(ref())))
-
-  return (
-    <context.Provider
-      value={{
-        get current() {
-          return current()
-        },
-        set,
-      }}
-    >
-      {props.children}
-    </context.Provider>
-  )
+export function LocationProvider(props: ParentProps<{ location?: LocationRef }>) {
+  return <context.Provider value={() => props.location}>{props.children}</context.Provider>
 }
 
 export function useLocation() {

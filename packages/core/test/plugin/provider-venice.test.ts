@@ -41,8 +41,7 @@ describe("VenicePlugin", () => {
       const result = yield* aisdk.runSDK({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.make("venice"), ModelV2.ID.make("model")),
-          modelID: ModelV2.ID.make("model"),
-          package: "aisdk:test-provider",
+          api: { id: ModelV2.ID.make("model"), type: "aisdk", package: "test-provider" },
         }),
         package: "venice-ai-sdk-provider",
         options: { name: "venice" },
@@ -59,8 +58,7 @@ describe("VenicePlugin", () => {
       const result = yield* aisdk.runSDK({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.make("custom-venice"), ModelV2.ID.make("model")),
-          modelID: ModelV2.ID.make("model"),
-          package: "aisdk:test-provider",
+          api: { id: ModelV2.ID.make("model"), type: "aisdk", package: "test-provider" },
         }),
         package: "venice-ai-sdk-provider",
         options: { name: "custom-venice", apiKey: "test" },
@@ -78,8 +76,7 @@ describe("VenicePlugin", () => {
       const similar = yield* aisdk.runSDK({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.make("venice"), ModelV2.ID.make("model")),
-          modelID: ModelV2.ID.make("model"),
-          package: "aisdk:test-provider",
+          api: { id: ModelV2.ID.make("model"), type: "aisdk", package: "test-provider" },
         }),
         package: "file:///tmp/venice-ai-sdk-provider.js",
         options: { name: "venice" },
@@ -87,8 +84,7 @@ describe("VenicePlugin", () => {
       const other = yield* aisdk.runSDK({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.make("venice"), ModelV2.ID.make("model")),
-          modelID: ModelV2.ID.make("model"),
-          package: "aisdk:test-provider",
+          api: { id: ModelV2.ID.make("model"), type: "aisdk", package: "test-provider" },
         }),
         package: "@ai-sdk/openai-compatible",
         options: { name: "venice" },
@@ -107,8 +103,7 @@ describe("VenicePlugin", () => {
       const result = yield* aisdk.runLanguage({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.make("venice"), ModelV2.ID.make("alias")),
-          modelID: ModelV2.ID.make("alias"),
-          package: "aisdk:test-provider",
+          api: { id: ModelV2.ID.make("alias"), type: "aisdk", package: "test-provider" },
         }),
         sdk: fakeSelectorSdk(calls),
         options: {},

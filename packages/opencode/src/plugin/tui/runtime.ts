@@ -42,7 +42,7 @@ import { ConfigPluginV1 } from "@opencode-ai/core/v1/config/plugin"
 import { createCommandShim } from "@opencode-ai/tui/plugin/command-shim"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Effect } from "effect"
-import { createPluginRuntime, type PluginRuntime } from "@opencode-ai/tui/plugin/runtime"
+import { createPluginRuntime, type PluginRuntime, type TuiPluginHost } from "@opencode-ai/tui/plugin/runtime"
 
 ensureRuntimePluginSupport({ additional: keymapRuntimeModules })
 
@@ -1090,7 +1090,7 @@ async function load(input: {
     if (Flag.OPENCODE_PURE && pluginOrigins.length) {
     }
 
-    for (const item of internalTuiPlugins()) {
+    for (const item of internalTuiPlugins(flags)) {
       const entry = loadInternalPlugin(item)
       const meta = createMeta(entry.source, entry.spec, entry.target, undefined, entry.id)
       addPluginEntry(next, {
@@ -1118,6 +1118,13 @@ async function load(input: {
     next.view.update({ status: listPluginStatus(next) })
   } catch (error) {
     fail("failed to load tui plugins", { directory: cwd, error })
+  }
+}
+
+export function createLegacyTuiPluginHost(): TuiPluginHost {
+  return {
+    start: init,
+    dispose,
   }
 }
 

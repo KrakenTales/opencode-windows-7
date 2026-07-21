@@ -3,21 +3,16 @@ export * as AgentV2 from "./agent"
 import { makeLocationNode } from "./effect/app-node"
 import { Array, Context, Effect, Layer, Types } from "effect"
 import { Agent } from "@opencode-ai/schema/agent"
-import { EventV2 } from "./event"
 import { State } from "./state"
 
 export const ID = Agent.ID
 export type ID = typeof ID.Type
-export const Name = Agent.Name
-export type Name = Agent.Name
 export const defaultID = ID.make("build")
 
 export const Color = Agent.Color
 
 export const Info = Agent.Info
 export type Info = Agent.Info
-
-export const Event = Agent.Event
 
 export interface Selection {
   readonly id: ID
@@ -42,7 +37,7 @@ export interface Interface extends State.Transformable<Draft> {
   readonly default: () => Effect.Effect<Info | undefined>
   readonly resolve: (id?: ID | string) => Effect.Effect<Info | undefined>
   readonly select: (id?: ID | string) => Effect.Effect<Selection>
-  readonly list: () => Effect.Effect<Info[]>
+  readonly all: () => Effect.Effect<Info[]>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/Agent") {}
@@ -50,9 +45,7 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/v2
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const events = yield* EventV2.Service
     const state = State.create<Data, Draft>({
-      name: "agent",
       initial: () => ({ agents: new Map() }),
       draft: (draft) => ({
         list: () => Array.fromIterable(draft.agents.values()) as Info[],
@@ -70,7 +63,6 @@ const layer = Layer.effect(
           draft.agents.delete(id)
         },
       }),
-      finalize: () => events.publish(Event.Updated, {}).pipe(Effect.asVoid),
     })
     const selectable = (agent: Info | undefined) =>
       agent && agent.mode !== "subagent" && !agent.hidden ? agent : undefined
@@ -107,11 +99,13 @@ const layer = Layer.effect(
         const info = selectedDefault()
         return { id: info?.id ?? defaultID, info }
       }),
-      list: Effect.fn("AgentV2.list")(function* () {
+      all: Effect.fn("AgentV2.all")(function* () {
         return Array.fromIterable(state.get().agents.values())
       }),
     })
   }),
 )
 
-export const node = makeLocationNode({ service: Service, layer, deps: [EventV2.node] })
+export const locationLayer = layer
+
+export const node = makeLocationNode({ service: Service, layer, deps: [] })

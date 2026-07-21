@@ -1,23 +1,21 @@
 import { sqliteTable, text, integer, index, primaryKey, real, uniqueIndex } from "drizzle-orm/sqlite-core"
-import { sql } from "drizzle-orm"
-import { directoryColumn, pathColumn } from "../database/path"
+import * as DatabasePath from "../database/path"
 import { ProjectTable } from "../project/sql"
 import type { SessionMessage } from "./message"
-import type { SessionPending } from "./pending"
-import type { FileDiff } from "@opencode-ai/schema/file-diff"
+import type { Prompt } from "./prompt"
+import type { SessionInput } from "./input"
+import type { Snapshot } from "../snapshot"
 import { PermissionV1 } from "../v1/permission"
 import { ProjectV2 } from "../project"
 import type { SessionSchema } from "./schema"
 import type { MessageID, PartID, SessionV1 } from "../v1/session"
 import { WorkspaceV2 } from "../workspace"
 import { Timestamps } from "../database/schema.sql"
-import type { Instruction } from "@opencode-ai/schema/instruction"
-import type { Session } from "@opencode-ai/schema/session"
-import type { SyntheticData, UserData } from "@opencode-ai/schema/session-pending"
-import type { RevertV1 } from "@opencode-ai/schema/session-revert"
-import type { Schema } from "effect"
+import type { SystemContext } from "../system-context/index"
+import { AgentV2 } from "../agent"
+import type { Revert } from "@opencode-ai/schema/revert"
 
-type SessionMessageData = Omit<(typeof SessionMessage.Info)["Encoded"], "type" | "id">
+type SessionMessageData = Omit<(typeof SessionMessage.Message)["Encoded"], "type" | "id">
 type V1MessageData = Omit<SessionV1.Info, "id" | "sessionID">
 type V1PartData = Omit<SessionV1.Part, "id" | "sessionID" | "messageID">
 
@@ -31,19 +29,16 @@ export const SessionTable = sqliteTable(
       .references(() => ProjectTable.id, { onDelete: "cascade" }),
     workspace_id: text().$type<WorkspaceV2.ID>(),
     parent_id: text().$type<SessionSchema.ID>(),
-    fork_session_id: text().$type<SessionSchema.ID>(),
-    fork_message_id: text().$type<SessionMessage.ID>(),
-    fork_seq: integer(),
     slug: text().notNull(),
-    directory: directoryColumn().notNull(),
-    path: pathColumn(),
+    directory: DatabasePath.directoryColumn().notNull(),
+    path: DatabasePath.pathColumn(),
     title: text().notNull(),
     version: text().notNull(),
     share_url: text(),
     summary_additions: integer(),
     summary_deletions: integer(),
     summary_files: integer(),
-    summary_diffs: text({ mode: "json" }).$type<FileDiff.LegacyInfo[]>(),
+    summary_diffs: text({ mode: "json" }).$type<Snapshot.LegacyFileDiff[]>(),
     metadata: text({ mode: "json" }).$type<Record<string, unknown>>(),
     cost: real().notNull().default(0),
     tokens_input: integer().notNull().default(0),
@@ -51,7 +46,7 @@ export const SessionTable = sqliteTable(
     tokens_reasoning: integer().notNull().default(0),
     tokens_cache_read: integer().notNull().default(0),
     tokens_cache_write: integer().notNull().default(0),
-    revert: text({ mode: "json" }).$type<Session.Revert | RevertV1>(),
+    revert: text({ mode: "json" }).$type<Revert.State>(),
     permission: text({ mode: "json" }).$type<PermissionV1.Ruleset>(),
     agent: text(),
     model: text({ mode: "json" }).$type<{
@@ -62,15 +57,11 @@ export const SessionTable = sqliteTable(
     ...Timestamps,
     time_compacting: integer(),
     time_archived: integer(),
-    time_suspended: integer(),
   },
   (table) => [
     index("session_project_idx").on(table.project_id),
     index("session_workspace_idx").on(table.workspace_id),
     index("session_parent_idx").on(table.parent_id),
-    index("session_time_suspended_idx")
-      .on(table.time_suspended)
-      .where(sql`${table.time_suspended} is not null`),
   ],
 )
 
@@ -106,6 +97,25 @@ export const PartTable = sqliteTable(
   ],
 )
 
+export const TodoTable = sqliteTable(
+  "todo",
+  {
+    session_id: text()
+      .$type<SessionSchema.ID>()
+      .notNull()
+      .references(() => SessionTable.id, { onDelete: "cascade" }),
+    content: text().notNull(),
+    status: text().notNull(),
+    priority: text().notNull(),
+    position: integer().notNull(),
+    ...Timestamps,
+  },
+  (table) => [
+    primaryKey({ columns: [table.session_id, table.position] }),
+    index("todo_session_idx").on(table.session_id),
+  ],
+)
+
 export const SessionMessageTable = sqliteTable(
   "session_message",
   {
@@ -127,58 +137,40 @@ export const SessionMessageTable = sqliteTable(
   ],
 )
 
-export const SessionPendingTable = sqliteTable(
-  "session_pending",
+export const SessionInputTable = sqliteTable(
+  "session_input",
   {
     id: text().$type<SessionMessage.ID>().primaryKey(),
     session_id: text()
       .$type<SessionSchema.ID>()
       .notNull()
       .references(() => SessionTable.id, { onDelete: "cascade" }),
-    type: text().$type<SessionPending.Info["type"]>().notNull(),
-    data: text({ mode: "json" }).$type<UserData | SyntheticData | Record<string, never>>().notNull(),
-    delivery: text().$type<SessionPending.Delivery>(),
+    prompt: text({ mode: "json" }).notNull().$type<Prompt>(),
+    delivery: text().$type<SessionInput.Delivery>().notNull(),
     admitted_seq: integer().notNull(),
+    promoted_seq: integer(),
     time_created: integer()
       .notNull()
       .$default(() => Date.now()),
   },
   (table) => [
-    index("session_pending_session_delivery_seq_idx").on(table.session_id, table.delivery, table.admitted_seq),
-    uniqueIndex("session_pending_session_compaction_idx")
-      .on(table.session_id)
-      .where(sql`${table.type} = 'compaction'`),
-    uniqueIndex("session_pending_session_admitted_seq_idx").on(table.session_id, table.admitted_seq),
+    index("session_input_session_pending_delivery_seq_idx").on(
+      table.session_id,
+      table.promoted_seq,
+      table.delivery,
+      table.admitted_seq,
+    ),
+    uniqueIndex("session_input_session_admitted_seq_idx").on(table.session_id, table.admitted_seq),
+    uniqueIndex("session_input_session_promoted_seq_idx").on(table.session_id, table.promoted_seq),
   ],
 )
 
-export const InstructionEntryTable = sqliteTable(
-  "instruction_entry",
-  {
-    session_id: text()
-      .$type<SessionSchema.ID>()
-      .notNull()
-      .references(() => SessionTable.id, { onDelete: "cascade" }),
-    key: text().notNull(),
-    value: text({ mode: "json" }).$type<Schema.Json>(),
-    removed: integer({ mode: "boolean" }).notNull().default(false),
-    ...Timestamps,
-  },
-  (table) => [primaryKey({ columns: [table.session_id, table.key] })],
-)
-
-export const InstructionBlobTable = sqliteTable("instruction_blob", {
-  hash: text().$type<Instruction.Hash>().primaryKey(),
-  value: text({ mode: "json" }).$type<Schema.Json>(),
-})
-
-export const InstructionStateTable = sqliteTable("instruction_state", {
+export const SessionContextEpochTable = sqliteTable("session_context_epoch", {
   session_id: text()
     .$type<SessionSchema.ID>()
     .primaryKey()
     .references(() => SessionTable.id, { onDelete: "cascade" }),
-  epoch_start: integer().notNull(),
-  through_seq: integer().notNull(),
-  initial_values: text({ mode: "json" }).notNull().$type<Instruction.Values>(),
-  current_values: text({ mode: "json" }).notNull().$type<Instruction.Values>(),
+  baseline: text().notNull(),
+  snapshot: text({ mode: "json" }).notNull().$type<SystemContext.Snapshot>(),
+  baseline_seq: integer().notNull(),
 })

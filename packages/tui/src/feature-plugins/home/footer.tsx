@@ -1,65 +1,67 @@
-import { Plugin } from "@opencode-ai/plugin/v2/tui"
-import { InstallationVersion } from "@opencode-ai/core/installation/version"
+import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui"
+import type { BuiltinTuiPlugin } from "../builtins"
 import { createMemo, Match, Show, Switch } from "solid-js"
-import { useTerminalDimensions } from "@opentui/solid"
-import { useTuiPaths } from "../../context/runtime"
-import { useTheme } from "../../context/theme"
 import { abbreviateHome } from "../../runtime"
-import { FilePath } from "../../ui/file-path"
-import { stringWidth } from "../../util/string-width"
+import { useTuiPaths } from "../../context/runtime"
+import { useHomeSessionDestination } from "../../routes/home/session-destination"
 
-function Directory(props: { context: Plugin.Context; maxWidth: number }) {
-  const { themeV2 } = useTheme()
+const id = "internal:home-footer"
+
+function Directory(props: { api: TuiPluginApi }) {
+  const theme = () => props.api.theme.current
+  const destination = useHomeSessionDestination()
   const paths = useTuiPaths()
-  const directory = createMemo(() =>
-    props.context.location ? abbreviateHome(props.context.location.directory, paths.home) : undefined,
-  )
+  const dir = createMemo(() => {
+    const selected = destination?.destination()
+    if (!selected || selected.type === "new") return
+    const out = abbreviateHome(selected.directory, paths.home)
+    const branch =
+      selected.directory === (props.api.state.path.directory || paths.cwd) ? props.api.state.vcs?.branch : undefined
+    if (branch) return out + ":" + branch
+    return out
+  })
 
-  return (
-    <Show when={directory()}>
-      {(value) => <FilePath value={value()} maxWidth={props.maxWidth} fg={themeV2.text.subdued()} />}
-    </Show>
-  )
+  return <Show when={dir()}>{(value) => <text fg={theme().textMuted}>{value()}</text>}</Show>
 }
 
-function Mcp(props: { context: Plugin.Context }) {
-  const { themeV2 } = useTheme()
-  const list = createMemo(() => props.context.data.location.mcp.server.list(props.context.location) ?? [])
-  const failed = createMemo(() => list().some((item) => item.status.status === "failed"))
-  const count = createMemo(() => list().filter((item) => item.status.status === "connected").length)
+function Mcp(props: { api: TuiPluginApi }) {
+  const theme = () => props.api.theme.current
+  const list = createMemo(() => props.api.state.mcp())
+  const has = createMemo(() => list().length > 0)
+  const err = createMemo(() => list().some((item) => item.status === "failed"))
+  const count = createMemo(() => list().filter((item) => item.status === "connected").length)
 
   return (
-    <Show when={list().length}>
+    <Show when={has()}>
       <box gap={1} flexDirection="row" flexShrink={0}>
-        <text fg={themeV2.text()}>
+        <text fg={theme().text}>
           <Switch>
-            <Match when={failed()}>
-              <span style={{ fg: themeV2.text.feedback.error() }}>⊙ </span>
+            <Match when={err()}>
+              <span style={{ fg: theme().error }}>⊙ </span>
             </Match>
             <Match when={true}>
-              <span style={{ fg: count() > 0 ? themeV2.text.feedback.success() : themeV2.text.subdued() }}>
-                ⊙{" "}
-              </span>
+              <span style={{ fg: count() > 0 ? theme().success : theme().textMuted }}>⊙ </span>
             </Match>
           </Switch>
           {count()} MCP
         </text>
-        <text fg={themeV2.text.subdued()}>/status</text>
+        <text fg={theme().textMuted}>/status</text>
       </box>
     </Show>
   )
 }
 
-function View(props: { context: Plugin.Context }) {
-  const { themeV2 } = useTheme()
-  const dimensions = useTerminalDimensions()
-  const mcpWidth = createMemo(() => {
-    const list = props.context.data.location.mcp.server.list(props.context.location) ?? []
-    if (list.length === 0) return 0
-    const count = list.filter((item) => item.status.status === "connected").length
-    return stringWidth(`⊙ ${count} MCP /status`) + 2
-  })
+function Version(props: { api: TuiPluginApi }) {
+  const theme = () => props.api.theme.current
 
+  return (
+    <box flexShrink={0}>
+      <text fg={theme().textMuted}>{props.api.app.version}</text>
+    </box>
+  )
+}
+
+function View(props: { api: TuiPluginApi }) {
   return (
     <box
       width="100%"
@@ -71,22 +73,28 @@ function View(props: { context: Plugin.Context }) {
       flexShrink={0}
       gap={2}
     >
-      <Directory
-        context={props.context}
-        maxWidth={Math.max(2, dimensions().width - 8 - stringWidth(InstallationVersion) - mcpWidth())}
-      />
-      <Mcp context={props.context} />
+      <Directory api={props.api} />
+      <Mcp api={props.api} />
       <box flexGrow={1} />
-      <box flexShrink={0}>
-        <text fg={themeV2.text.subdued()}>{InstallationVersion}</text>
-      </box>
+      <Version api={props.api} />
     </box>
   )
 }
 
-export default Plugin.define({
-  id: "opencode.home-footer",
-  setup(context) {
-    context.ui.slot("home.footer", () => <View context={context} />)
-  },
-})
+const tui: TuiPlugin = async (api) => {
+  api.slots.register({
+    order: 100,
+    slots: {
+      home_footer() {
+        return <View api={api} />
+      },
+    },
+  })
+}
+
+const plugin: BuiltinTuiPlugin = {
+  id,
+  tui,
+}
+
+export default plugin

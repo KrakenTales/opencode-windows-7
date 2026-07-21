@@ -202,8 +202,7 @@ const layer = Layer.effect(
       const copyDirectory = yield* canonical(input.directory)
       const stored = yield* directories.get({ projectID: input.projectID, directory: copyDirectory })
       if (!stored?.strategy) return yield* new InvalidDirectoryError({ directory: copyDirectory })
-      const strategy = yield* getStrategy(StrategyID.make(stored.strategy))
-      yield* strategy.remove({
+      yield* (yield* getStrategy(StrategyID.make(stored.strategy))).remove({
         directory: copyDirectory,
         force: input.force,
       })
@@ -279,6 +278,7 @@ const layer = Layer.effect(
   }),
 )
 
+export const locationLayer = layer
 export const node = makeLocationNode({
   service: Service,
   layer: layer,

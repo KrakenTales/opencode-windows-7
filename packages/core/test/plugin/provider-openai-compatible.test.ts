@@ -27,8 +27,7 @@ describe("OpenAICompatiblePlugin", () => {
       const defaulted = yield* aisdk.runSDK({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.make("custom"), ModelV2.ID.make("model")),
-          modelID: ModelV2.ID.make("model"),
-          package: "aisdk:test-provider",
+          api: { id: ModelV2.ID.make("model"), type: "aisdk", package: "test-provider" },
         }),
         package: "@ai-sdk/openai-compatible",
         options: { name: "custom" },
@@ -36,8 +35,7 @@ describe("OpenAICompatiblePlugin", () => {
       const disabled = yield* aisdk.runSDK({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.make("custom"), ModelV2.ID.make("model")),
-          modelID: ModelV2.ID.make("model"),
-          package: "aisdk:test-provider",
+          api: { id: ModelV2.ID.make("model"), type: "aisdk", package: "test-provider" },
         }),
         package: "@ai-sdk/openai-compatible",
         options: { name: "custom", includeUsage: false },
@@ -55,8 +53,7 @@ describe("OpenAICompatiblePlugin", () => {
       const result = yield* aisdk.runSDK({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.make("custom"), ModelV2.ID.make("model")),
-          modelID: ModelV2.ID.make("model"),
-          package: "aisdk:test-provider",
+          api: { id: ModelV2.ID.make("model"), type: "aisdk", package: "test-provider" },
         }),
         package: "file:///tmp/@ai-sdk/openai-compatible-provider.js",
         options: { name: "custom" },
@@ -79,8 +76,7 @@ describe("OpenAICompatiblePlugin", () => {
       yield* aisdk.runSDK({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.make("custom-provider"), ModelV2.ID.make("model")),
-          modelID: ModelV2.ID.make("model"),
-          package: "aisdk:test-provider",
+          api: { id: ModelV2.ID.make("model"), type: "aisdk", package: "test-provider" },
         }),
         package: "@ai-sdk/openai-compatible",
         options: { name: "custom-provider", baseURL: "https://example.com/v1" },
@@ -100,8 +96,7 @@ describe("OpenAICompatiblePlugin", () => {
       const result = yield* aisdk.runSDK({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.make("cloudflare-workers-ai"), ModelV2.ID.make("model")),
-          modelID: ModelV2.ID.make("model"),
-          package: "aisdk:test-provider",
+          api: { id: ModelV2.ID.make("model"), type: "aisdk", package: "test-provider" },
         }),
         package: "@ai-sdk/openai-compatible",
         options: { name: "cloudflare-workers-ai" },

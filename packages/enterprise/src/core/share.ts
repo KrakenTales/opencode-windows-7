@@ -1,4 +1,4 @@
-import { FileDiffInfo, Message, Model, Part, Session } from "@opencode-ai/sdk/v2"
+import { Message, Model, Part, Session, SnapshotFileDiff } from "@opencode-ai/sdk/v2"
 import { iife } from "@opencode-ai/core/util/iife"
 import z from "zod"
 import { Storage } from "./storage"
@@ -30,7 +30,7 @@ export namespace Share {
     }),
     z.object({
       type: z.literal("session_diff"),
-      data: z.custom<FileDiffInfo[]>(),
+      data: z.custom<SnapshotFileDiff[]>(),
     }),
     z.object({
       type: z.literal("model"),

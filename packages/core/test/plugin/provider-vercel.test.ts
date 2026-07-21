@@ -25,12 +25,12 @@ describe("VercelPlugin", () => {
       const catalog = yield* Catalog.Service
       yield* catalog.transform((catalog) => {
         catalog.provider.update(ProviderV2.ID.make("vercel"), (provider) => {
-          provider.package = ProviderV2.aisdk("@ai-sdk/vercel")
-          provider.headers = { ...provider.headers, Existing: "1" }
+          provider.api = { type: "aisdk", package: "@ai-sdk/vercel" }
+          provider.request.headers.Existing = "1"
         })
       })
       yield* addPlugin()
-      expect((yield* catalog.provider.get(ProviderV2.ID.make("vercel")))?.headers).toEqual({
+      expect((yield* catalog.provider.get(ProviderV2.ID.make("vercel")))?.request.headers).toEqual({
         Existing: "1",
         "http-referer": "https://opencode.ai/",
         "x-title": "opencode",
@@ -43,12 +43,14 @@ describe("VercelPlugin", () => {
       const catalog = yield* Catalog.Service
       yield* catalog.transform((catalog) =>
         catalog.provider.update(ProviderV2.ID.make("vercel"), (provider) => {
-          provider.package = ProviderV2.aisdk("@ai-sdk/vercel")
+          provider.api = { type: "aisdk", package: "@ai-sdk/vercel" }
         }),
       )
       yield* addPlugin()
-      expect((yield* catalog.provider.get(ProviderV2.ID.make("vercel")))?.headers).not.toHaveProperty("HTTP-Referer")
-      expect((yield* catalog.provider.get(ProviderV2.ID.make("vercel")))?.headers).not.toHaveProperty("X-Title")
+      expect((yield* catalog.provider.get(ProviderV2.ID.make("vercel")))?.request.headers).not.toHaveProperty(
+        "HTTP-Referer",
+      )
+      expect((yield* catalog.provider.get(ProviderV2.ID.make("vercel")))?.request.headers).not.toHaveProperty("X-Title")
     }),
   )
 
@@ -60,8 +62,7 @@ describe("VercelPlugin", () => {
       const event = yield* aisdk.runSDK({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.make("custom-vercel"), ModelV2.ID.make("v0-1.0-md")),
-          modelID: ModelV2.ID.make("v0-1.0-md"),
-          package: "aisdk:@ai-sdk/vercel",
+          api: { id: ModelV2.ID.make("v0-1.0-md"), type: "aisdk", package: "@ai-sdk/vercel" },
         }),
         package: "@ai-sdk/vercel",
         options: { name: "custom-vercel" },
@@ -76,7 +77,7 @@ describe("VercelPlugin", () => {
       const catalog = yield* Catalog.Service
       yield* catalog.transform((catalog) => catalog.provider.update(ProviderV2.ID.make("gateway"), () => {}))
       yield* addPlugin()
-      expect((yield* catalog.provider.get(ProviderV2.ID.make("gateway")))?.headers).toBeUndefined()
+      expect((yield* catalog.provider.get(ProviderV2.ID.make("gateway")))?.request.headers).toEqual({})
     }),
   )
 })

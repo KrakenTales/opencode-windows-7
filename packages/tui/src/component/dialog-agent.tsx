@@ -10,9 +10,9 @@ export function DialogAgent() {
   const options = createMemo(() =>
     local.agent.list().map((item) => {
       return {
-        value: item.id,
-        title: item.id,
-        description: item.description,
+        value: item.name,
+        title: item.name,
+        description: item.native ? "native" : item.description,
       }
     }),
   )
@@ -20,7 +20,7 @@ export function DialogAgent() {
   return (
     <DialogSelect
       title="Select agent"
-      current={local.agent.current()?.id}
+      current={local.agent.current()?.name}
       options={options()}
       onSelect={(option) => {
         local.agent.set(option.value)

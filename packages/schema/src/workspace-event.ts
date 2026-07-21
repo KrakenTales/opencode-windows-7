@@ -1,8 +1,8 @@
-export * as WorkspaceEvent from "./workspace-event.js"
+export * as WorkspaceEvent from "./workspace-event"
 
 import { Schema } from "effect"
-import { Event } from "./event.js"
-import { WorkspaceID } from "./workspace-id.js"
+import { Event } from "./event"
+import { WorkspaceID } from "./workspace-id"
 
 export const ConnectionStatus = Schema.Struct({
   workspaceID: WorkspaceID,
@@ -10,21 +10,21 @@ export const ConnectionStatus = Schema.Struct({
 }).annotate({ identifier: "WorkspaceEvent.ConnectionStatus" })
 export interface ConnectionStatus extends Schema.Schema.Type<typeof ConnectionStatus> {}
 
-export const Ready = Event.ephemeral({
+export const Ready = Event.define({
   type: "workspace.ready",
   schema: {
     name: Schema.String,
   },
 })
 
-export const Failed = Event.ephemeral({
+export const Failed = Event.define({
   type: "workspace.failed",
   schema: {
     message: Schema.String,
   },
 })
 
-export const Status = Event.ephemeral({
+export const Status = Event.define({
   type: "workspace.status",
   schema: ConnectionStatus.fields,
 })

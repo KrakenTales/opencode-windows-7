@@ -65,8 +65,8 @@ export const dict = {
   "command.message.next.description": "Go to the next user message",
   "command.model.choose": "Choose model",
   "command.model.choose.description": "Select a different model",
-  "command.mcp.toggle": "Manage MCP servers",
-  "command.mcp.toggle.description": "Enable or disable MCP servers",
+  "command.mcp.toggle": "Toggle MCPs",
+  "command.mcp.toggle.description": "Toggle MCPs",
   "command.agent.cycle": "Cycle agent",
   "command.agent.cycle.description": "Switch to the next agent",
   "command.agent.cycle.reverse": "Cycle agent backwards",
@@ -102,6 +102,7 @@ export const dict = {
   "dialog.provider.empty": "No providers found",
   "dialog.provider.group.popular": "Popular",
   "dialog.provider.group.other": "Other",
+  "dialog.provider.custom.label": "Custom OpenAI-compatible provider",
   "dialog.provider.tag.recommended": "Recommended",
   "dialog.provider.opencode.note": "Curated models including Claude, GPT, Gemini and more",
   "dialog.provider.opencode.tagline": "Reliable optimized models",
@@ -122,6 +123,7 @@ export const dict = {
 
   "dialog.model.unpaid.freeModels.title": "Free models provided by OpenCode",
   "dialog.model.unpaid.addMore.title": "Add more models from popular providers",
+  "dialog.model.unpaid.viewMoreProviders": "See 70+ more providers",
 
   "dialog.provider.viewAll": "Show more providers",
 
@@ -308,9 +310,9 @@ export const dict = {
   "prompt.toast.promptSendFailed.title": "Failed to send prompt",
   "prompt.toast.promptSendFailed.description": "Unable to retrieve session",
 
-  "dialog.mcp.title": "MCP servers",
+  "dialog.mcp.title": "MCPs",
   "dialog.mcp.description": "{{enabled}} of {{total}} enabled",
-  "dialog.mcp.empty": "No MCP servers configured",
+  "dialog.mcp.empty": "No MCPs configured",
 
   "dialog.lsp.empty": "LSPs auto-detected from file types",
   "dialog.plugins.empty": "Plugins configured in opencode.json",
@@ -666,6 +668,10 @@ export const dict = {
   "session.messages.jumpToLatest": "Jump to latest",
 
   "session.context.addToContext": "Add {{selection}} to context",
+  "session.todo.title": "Todos",
+  "session.todo.collapse": "Collapse",
+  "session.todo.expand": "Expand",
+  "session.todo.progress": "{{done}} of {{total}} todos completed",
   "session.question.progress": "{{current}} of {{total}} questions",
   "session.question.minimize": "Minimize question",
   "session.question.restore": "Restore question",
@@ -694,6 +700,7 @@ export const dict = {
   "session.new.workspace.triggerLocal": "Local",
   "session.new.workspace.local": "Local repository",
   "session.new.workspace.existing": "Workspace…",
+  "session.new.git.none": "No Git",
   "session.new.lastModified": "Last modified",
 
   "session.header.search.placeholder": "Search {{project}}",
@@ -1051,6 +1058,8 @@ export const dict = {
   "settings.permissions.tool.skill.description": "Load a skill by name",
   "settings.permissions.tool.lsp.title": "LSP",
   "settings.permissions.tool.lsp.description": "Run language server queries",
+  "settings.permissions.tool.todowrite.title": "Todo Write",
+  "settings.permissions.tool.todowrite.description": "Update the todo list",
   "settings.permissions.tool.webfetch.title": "Web Fetch",
   "settings.permissions.tool.webfetch.description": "Fetch content from a URL",
   "settings.permissions.tool.websearch.title": "Web Search",

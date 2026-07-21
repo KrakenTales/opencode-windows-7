@@ -1,13 +1,14 @@
 export * as ConfigAgentPlugin from "./agent"
 
-import { define } from "@opencode-ai/plugin/v2/effect/plugin"
+import { define } from "../../plugin/internal"
 import path from "path"
-import { Effect, Option, Schema, Stream } from "effect"
+import { Effect, Option, Schema } from "effect"
 import { AgentV2 } from "../../agent"
 import { Config } from "../../config"
 import { ConfigAgent } from "../agent"
 import { ConfigMarkdown } from "../markdown"
 import { FSUtil } from "../../fs-util"
+import { ModelV2 } from "../../model"
 import { ConfigAgentV1 } from "../../v1/config/agent"
 import { ConfigMigrateV1 } from "../../v1/config/migrate"
 import { Global } from "../../global"
@@ -43,85 +44,74 @@ const agentKeys = new Set([
 ])
 
 export const Plugin = define({
-  id: "opencode.config.agent",
+  id: "config-agent",
   effect: Effect.fn(function* (ctx) {
     const config = yield* Config.Service
     const fs = yield* FSUtil.Service
     const global = yield* Global.Service
-    const load = Effect.fn("ConfigAgentPlugin.load")(function* () {
-      return yield* Effect.forEach(yield* config.entries(), (entry) => {
-        if (entry.type === "document") return Effect.succeed([entry])
-        if (entry.type !== "directory") return Effect.succeed([])
-        return Effect.gen(function* () {
-          const files = yield* discover(fs, entry.path)
-          return yield* Effect.forEach(files, (file) =>
-            fs.readFileStringSafe(file.filepath).pipe(
-              Effect.map((content) => content && decode(file, content)),
-              Effect.catch(() => Effect.succeed(undefined)),
-            ),
-          ).pipe(
-            Effect.map((documents) =>
-              documents.filter((document): document is Config.Document => document !== undefined),
-            ),
-          )
-        })
-      }).pipe(Effect.map((documents) => documents.flat()))
-    })
-    const loaded = { documents: yield* load() }
-    yield* ctx.agent.transform((draft) => {
-      const permissions = expandPermissions(
-        loaded.documents.flatMap((document) => document.info.permissions ?? []),
-        global.home,
-      )
-      const configuredDefault = Config.latest(loaded.documents, "default_agent")
-      if (configuredDefault !== undefined) draft.default(AgentV2.ID.make(configuredDefault))
-      for (const current of draft.list()) {
-        draft.update(current.id, (agent) => agent.permissions.push(...permissions))
-      }
-
-      for (const document of loaded.documents) {
-        for (const [id, item] of Object.entries(document.info.agents ?? {})) {
-          const agentID = AgentV2.ID.make(id)
-          if (item.disabled) {
-            draft.remove(agentID)
-            continue
-          }
-
-          const exists = draft.get(agentID) !== undefined
-          draft.update(agentID, (agent) => {
-            if (!exists) agent.permissions.push(...permissions)
-            if (item.model !== undefined)
-              agent.model = {
-                id: item.model.model,
-                providerID: item.model.providerID,
-                ...(item.model.variant === undefined ? {} : { variant: item.model.variant }),
-              }
-            if (item.request !== undefined) {
-              Object.assign(agent.request.headers, item.request.headers ?? {})
-              Object.assign(agent.request.body, item.request.body ?? {})
-            }
-            if (item.system !== undefined) agent.system = item.system
-            if (item.description !== undefined) agent.description = item.description
-            if (item.mode !== undefined) agent.mode = item.mode
-            if (item.hidden !== undefined) agent.hidden = item.hidden
-            if (item.color !== undefined) agent.color = item.color
-            if (item.steps !== undefined) agent.steps = item.steps
-            if (item.permissions !== undefined) {
-              agent.permissions.push(...expandPermissions(item.permissions, global.home))
-            }
+    yield* ctx.agent.transform(
+      Effect.fn(function* (draft) {
+        const documents = yield* Effect.forEach(yield* config.entries(), (entry) => {
+          if (entry.type === "document") return Effect.succeed([entry])
+          return Effect.gen(function* () {
+            const files = yield* discover(fs, entry.path)
+            return yield* Effect.forEach(files, (file) =>
+              fs.readFileStringSafe(file.filepath).pipe(
+                Effect.map((content) => content && decode(file, content)),
+                Effect.catch(() => Effect.succeed(undefined)),
+              ),
+            ).pipe(
+              Effect.map((documents) =>
+                documents.filter((document): document is Config.Document => document !== undefined),
+              ),
+            )
           })
+        }).pipe(Effect.map((documents) => documents.flat()))
+        const permissions = expandPermissions(
+          documents.flatMap((document) => document.info.permissions ?? []),
+          global.home,
+        )
+        const configuredDefault = Config.latest(documents, "default_agent")
+        if (configuredDefault !== undefined) draft.default(AgentV2.ID.make(configuredDefault))
+        for (const current of draft.list()) {
+          draft.update(current.id, (agent) => agent.permissions.push(...permissions))
         }
-      }
-    })
-    yield* ctx.event.subscribe().pipe(
-      Stream.filter((event) => event.type === "config.updated"),
-      Stream.runForEach(() =>
-        load().pipe(
-          Effect.tap((documents) => Effect.sync(() => (loaded.documents = documents))),
-          Effect.andThen(ctx.agent.reload()),
-        ),
-      ),
-      Effect.forkScoped({ startImmediately: true }),
+
+        for (const document of documents) {
+          for (const [id, item] of Object.entries(document.info.agents ?? {})) {
+            const agentID = AgentV2.ID.make(id)
+            if (item.disabled) {
+              draft.remove(agentID)
+              continue
+            }
+
+            const exists = draft.get(agentID) !== undefined
+            draft.update(agentID, (agent) => {
+              if (!exists) agent.permissions.push(...permissions)
+              if (item.model !== undefined) {
+                const model = ModelV2.parse(item.model)
+                agent.model = { id: model.modelID, providerID: model.providerID, variant: agent.model?.variant }
+              }
+              if (item.variant !== undefined && agent.model !== undefined) {
+                agent.model.variant = ModelV2.VariantID.make(item.variant)
+              }
+              if (item.request !== undefined) {
+                Object.assign(agent.request.headers, item.request.headers ?? {})
+                Object.assign(agent.request.body, item.request.body ?? {})
+              }
+              if (item.system !== undefined) agent.system = item.system
+              if (item.description !== undefined) agent.description = item.description
+              if (item.mode !== undefined) agent.mode = item.mode
+              if (item.hidden !== undefined) agent.hidden = item.hidden
+              if (item.color !== undefined) agent.color = item.color
+              if (item.steps !== undefined) agent.steps = item.steps
+              if (item.permissions !== undefined) {
+                agent.permissions.push(...expandPermissions(item.permissions, global.home))
+              }
+            })
+          }
+        }
+      }),
     )
   }),
 })
@@ -150,7 +140,7 @@ function expandHome(resource: string, home: string) {
 function discover(fs: FSUtil.Interface, directory: string) {
   return Effect.forEach(legacySources, (source) =>
     fs
-      .scan(source.pattern, { cwd: directory, absolute: true, dot: true, symlink: true })
+      .glob(source.pattern, { cwd: directory, absolute: true, dot: true, symlink: true })
       .pipe(
         Effect.map((files) => files.toSorted().map((filepath) => ({ directory, filepath, primary: source.primary }))),
       ),
@@ -170,16 +160,14 @@ function decode(file: { directory: string; filepath: string; primary: boolean },
     .replace(/\.md$/, "")
   const body = markdown.content.trim()
   const legacy = Object.keys(markdown.data).some((key) => !agentKeys.has(key))
-  const agent = legacy
-    ? Option.getOrUndefined(
-        Option.map(
+  const agent = Option.getOrUndefined(
+    legacy
+      ? Option.map(
           decodeLegacyAgent({ name, ...markdown.data, prompt: body }, { errors: "all", propertyOrder: "original" }),
           ConfigMigrateV1.migrateAgent,
-        ),
-      )
-    : Option.getOrUndefined(
-        decodeAgent({ ...markdown.data, system: body }, { errors: "all", propertyOrder: "original" }),
-      )
+        )
+      : decodeAgent({ ...markdown.data, system: body }, { errors: "all", propertyOrder: "original" }),
+  )
   if (!agent) return
   const info = Option.getOrUndefined(
     decodeConfig({

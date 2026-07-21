@@ -1,11 +1,9 @@
-import type { ModelInfo, ProviderV2Info } from "@opencode-ai/sdk/v2/types"
-import type { CatalogApi } from "@opencode-ai/client/effect/api"
-import type { Effect } from "effect"
-import type { Transform } from "./registration.js"
+import type { ModelV2Info, ProviderV2Info } from "@opencode-ai/sdk/v2/types"
+import type { Hooks } from "./registration.js"
 
 export interface CatalogProviderRecord {
   readonly provider: ProviderV2Info
-  readonly models: ReadonlyMap<string, ModelInfo>
+  readonly models: ReadonlyMap<string, ModelV2Info>
 }
 
 export interface CatalogDraft {
@@ -16,8 +14,8 @@ export interface CatalogDraft {
     remove(providerID: string): void
   }
   readonly model: {
-    get(providerID: string, modelID: string): ModelInfo | undefined
-    update(providerID: string, modelID: string, update: (model: ModelInfo) => void): void
+    get(providerID: string, modelID: string): ModelV2Info | undefined
+    update(providerID: string, modelID: string, update: (model: ModelV2Info) => void): void
     remove(providerID: string, modelID: string): void
     readonly default: {
       get(): { providerID: string; modelID: string } | undefined
@@ -26,12 +24,6 @@ export interface CatalogDraft {
   }
 }
 
-export interface CatalogDomain extends CatalogApi<unknown> {
-  readonly model: CatalogApi<unknown>["model"] & {
-    readonly get: (providerID: string, modelID: string) => Effect.Effect<ModelGetOutput | undefined>
-  }
-  readonly transform: Transform<CatalogDraft>
-  readonly reload: () => Effect.Effect<void>
-}
-
-type ModelGetOutput = Effect.Success<ReturnType<CatalogApi<unknown>["model"]["list"]>>["data"][number]
+export type CatalogHooks = Hooks<{
+  transform: CatalogDraft
+}>

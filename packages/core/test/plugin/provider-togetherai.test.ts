@@ -41,8 +41,7 @@ describe("TogetherAIPlugin", () => {
       const result = yield* aisdk.runSDK({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.make("togetherai"), ModelV2.ID.make("model")),
-          modelID: ModelV2.ID.make("model"),
-          package: "aisdk:test-provider",
+          api: { id: ModelV2.ID.make("model"), type: "aisdk", package: "test-provider" },
         }),
         package: "@ai-sdk/togetherai",
         options: { name: "togetherai" },
@@ -60,8 +59,7 @@ describe("TogetherAIPlugin", () => {
       const ignored = yield* aisdk.runSDK({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.make("togetherai"), ModelV2.ID.make("model")),
-          modelID: ModelV2.ID.make("model"),
-          package: "aisdk:test-provider",
+          api: { id: ModelV2.ID.make("model"), type: "aisdk", package: "test-provider" },
         }),
         package: "file:///tmp/@ai-sdk/togetherai-provider.js",
         options: { name: "togetherai" },
@@ -71,8 +69,7 @@ describe("TogetherAIPlugin", () => {
       const result = yield* aisdk.runSDK({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.make("togetherai"), ModelV2.ID.make("model")),
-          modelID: ModelV2.ID.make("model"),
-          package: "aisdk:test-provider",
+          api: { id: ModelV2.ID.make("model"), type: "aisdk", package: "test-provider" },
         }),
         package: "@ai-sdk/togetherai",
         options: { name: "togetherai" },
@@ -90,8 +87,7 @@ describe("TogetherAIPlugin", () => {
       const result = yield* aisdk.runSDK({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.make("custom-togetherai"), ModelV2.ID.make("model")),
-          modelID: ModelV2.ID.make("model"),
-          package: "aisdk:test-provider",
+          api: { id: ModelV2.ID.make("model"), type: "aisdk", package: "test-provider" },
         }),
         package: "@ai-sdk/togetherai",
         options: { name: "custom-togetherai" },
@@ -114,8 +110,11 @@ describe("TogetherAIPlugin", () => {
             ProviderV2.ID.make("togetherai"),
             ModelV2.ID.make("meta-llama/Llama-3.3-70B-Instruct-Turbo"),
           ),
-          modelID: ModelV2.ID.make("meta-llama/Llama-3.3-70B-Instruct-Turbo"),
-          package: "aisdk:test-provider",
+          api: {
+            id: ModelV2.ID.make("meta-llama/Llama-3.3-70B-Instruct-Turbo"),
+            type: "aisdk",
+            package: "test-provider",
+          },
         }),
         sdk: { languageModel: fakeSelectorSdk(calls).languageModel },
         options: {},
@@ -123,9 +122,7 @@ describe("TogetherAIPlugin", () => {
 
       expect(result.language).toBeUndefined()
       expect(calls).toEqual([])
-      expect(
-        result.language ?? fakeSelectorSdk(calls).languageModel(result.model.modelID ?? result.model.id),
-      ).toBeDefined()
+      expect(result.language ?? fakeSelectorSdk(calls).languageModel(result.model.api.id)).toBeDefined()
       expect(calls).toEqual(["languageModel:meta-llama/Llama-3.3-70B-Instruct-Turbo"])
     }),
   )

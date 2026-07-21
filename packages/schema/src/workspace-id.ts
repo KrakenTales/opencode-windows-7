@@ -1,6 +1,6 @@
 import { Schema } from "effect"
-import { ascending } from "./identifier.js"
-import { statics } from "./schema.js"
+import { ascending } from "./identifier"
+import { statics } from "./schema"
 
 export const WorkspaceID = Schema.String.check(Schema.isStartsWith("wrk")).pipe(
   Schema.brand("WorkspaceV2.ID"),

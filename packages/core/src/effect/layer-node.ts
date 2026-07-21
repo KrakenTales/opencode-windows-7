@@ -227,7 +227,7 @@ export function hoist<A, E, T extends Tag, const Items extends Replacements = re
       }
       if (node.tag === tag) {
         const existing = hoisted.get(node.name)
-        if (existing && existing.implementation !== node.implementation) {
+        if (existing && existing !== node) {
           throw new Error(`Tag ${tag} has conflicting implementations for ${node.name}`)
         }
         hoisted.set(node.name, rewriteReplacementDependencies(node, replacementMap))

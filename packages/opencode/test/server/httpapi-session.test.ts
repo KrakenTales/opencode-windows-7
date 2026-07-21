@@ -26,9 +26,8 @@ import { SessionPaths } from "../../src/server/routes/instance/httpapi/groups/se
 import { Session } from "@/session/session"
 import { MessageID, PartID, SessionID, type SessionID as SessionIDType } from "../../src/session/schema"
 import { Database } from "@opencode-ai/core/database/database"
-import { SessionPendingTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionMessage } from "@opencode-ai/core/session/message"
-import { Agent } from "@opencode-ai/schema/agent"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import * as DateTime from "effect/DateTime"
@@ -77,7 +76,7 @@ function createTextMessage(sessionID: SessionIDType, text: string) {
       id: MessageID.ascending(),
       role: "user",
       sessionID,
-      agent: Agent.ID.make("build"),
+      agent: "build",
       model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test") },
       time: { created: Date.now() },
     })
@@ -124,7 +123,7 @@ const insertLegacyAssistantMessage = (sessionID: SessionIDType, seq = 1, time = 
     const message = SessionMessage.Assistant.make({
       id: SessionMessage.ID.create(),
       type: "assistant",
-      agent: Agent.ID.make("build"),
+      agent: "build",
       model: {
         id: ModelV2.ID.make("model"),
         providerID: ProviderV2.ID.make("provider"),
@@ -272,6 +271,10 @@ describe("session HttpApi", () => {
         expect(children.status).toBe(404)
         expect(yield* responseJson(children)).toEqual(missingSessionBody)
 
+        const todo = yield* request(pathFor(SessionPaths.todo, { sessionID: missingSession }), { headers })
+        expect(todo.status).toBe(404)
+        expect(yield* responseJson(todo)).toEqual(missingSessionBody)
+
         const messages = yield* request(pathFor(SessionPaths.messages, { sessionID: missingSession }), { headers })
         expect(messages.status).toBe(404)
         expect(yield* responseJson(messages)).toEqual(missingSessionBody)
@@ -341,6 +344,10 @@ describe("session HttpApi", () => {
         ).toEqual([child.id])
 
         expect(
+          yield* requestJson<unknown[]>(pathFor(SessionPaths.todo, { sessionID: parent.id }), { headers }),
+        ).toEqual([])
+
+        expect(
           yield* requestJson<unknown[]>(pathFor(SessionPaths.diff, { sessionID: parent.id }), { headers }),
         ).toEqual([])
 
@@ -373,7 +380,7 @@ describe("session HttpApi", () => {
         yield* insertLegacyAssistantMessage(parent.id)
 
         expect(
-          (yield* requestJson<{ data: SessionMessage.Info[] }>(`/api/session/${parent.id}/message`, {
+          (yield* requestJson<{ data: SessionMessage.Message[] }>(`/api/session/${parent.id}/message`, {
             headers,
           })).data,
         ).toMatchObject([{ type: "assistant" }])
@@ -467,7 +474,7 @@ describe("session HttpApi", () => {
         })
 
         const messagePage = yield* request(`/api/session/${session.id}/message?limit=1`, { headers })
-        const messageBody = yield* json<{ data: SessionMessage.Info[]; cursor: { next?: string } }>(messagePage)
+        const messageBody = yield* json<{ data: SessionMessage.Message[]; cursor: { next?: string } }>(messagePage)
         const messageCursor = messageBody.cursor.next
         expect(messageCursor).toBeTruthy()
         expect(messageBody.data.map((message) => message.id)).toEqual([secondMessage.id])
@@ -481,7 +488,7 @@ describe("session HttpApi", () => {
           headers,
         })
         expect(
-          (yield* json<{ data: SessionMessage.Info[] }>(nextMessagePage)).data.map((message) => message.id),
+          (yield* json<{ data: SessionMessage.Message[] }>(nextMessagePage)).data.map((message) => message.id),
         ).toEqual([firstMessage.id])
 
         const legacyMessageCursor = Buffer.from(
@@ -491,7 +498,7 @@ describe("session HttpApi", () => {
           headers,
         })
         expect(
-          (yield* json<{ data: SessionMessage.Info[] }>(legacyMessagePage)).data.map((message) => message.id),
+          (yield* json<{ data: SessionMessage.Message[] }>(legacyMessagePage)).data.map((message) => message.id),
         ).toEqual([firstMessage.id])
 
         const messageCursorWithOrder = yield* request(
@@ -566,18 +573,18 @@ describe("session HttpApi", () => {
           request(`/api/session/${session.id}/prompt`, {
             method: "POST",
             headers: { ...headers, "content-type": "application/json" },
-            body: JSON.stringify({ id: "msg_http_prompt", text: "hello", resume: false }),
+            body: JSON.stringify({ id: "msg_http_prompt", prompt: { text: "hello" }, resume: false }),
           })
         const first = yield* recordPrompt()
         const retried = yield* recordPrompt()
-        type PromptBody = { id: string; data: { text: string }; delivery: string }
+        type PromptBody = { id: string; prompt: { text: string }; delivery: string; promotedSeq?: number }
         const firstBody = yield* json<{ data: PromptBody }>(first)
         const retriedBody = yield* json<{ data: PromptBody }>(retried)
         expect(first.status).toBe(200)
         expect(retried.status).toBe(200)
         expect(retriedBody).toEqual(firstBody)
         expect(firstBody).toMatchObject({
-          data: { id: "msg_http_prompt", data: { text: "hello" }, delivery: "steer" },
+          data: { id: "msg_http_prompt", prompt: { text: "hello" }, delivery: "steer" },
         })
 
         const messages = yield* requestJson<{ data: PromptBody[] }>(`/api/session/${session.id}/message`, {
@@ -587,8 +594,8 @@ describe("session HttpApi", () => {
         const admitted = yield* Database.Service.use(({ db }) =>
           db
             .select()
-            .from(SessionPendingTable)
-            .where(eq(SessionPendingTable.id, SessionMessage.ID.make("msg_http_prompt")))
+            .from(SessionInputTable)
+            .where(eq(SessionInputTable.id, SessionMessage.ID.make("msg_http_prompt")))
             .get()
             .pipe(Effect.orDie),
         )
@@ -596,11 +603,12 @@ describe("session HttpApi", () => {
           id: "msg_http_prompt",
           session_id: session.id,
           delivery: "steer",
+          promoted_seq: null,
         })
         const conflict = yield* request(`/api/session/${session.id}/prompt`, {
           method: "POST",
           headers: { ...headers, "content-type": "application/json" },
-          body: JSON.stringify({ id: "msg_http_prompt", text: "goodbye" }),
+          body: JSON.stringify({ id: "msg_http_prompt", prompt: { text: "goodbye" } }),
         })
         expect(conflict.status).toBe(409)
         expect(yield* responseJson(conflict)).toEqual({
@@ -613,11 +621,11 @@ describe("session HttpApi", () => {
         const wake = yield* request(`/api/session/${session.id}/prompt`, {
           method: "POST",
           headers: { ...headers, "content-type": "application/json" },
-          body: JSON.stringify({ id: wakeID, text: "hello again" }),
+          body: JSON.stringify({ id: wakeID, prompt: { text: "hello again" } }),
         })
         expect(wake.status).toBe(200)
         const message = yield* pollWithTimeout(
-          requestJson<{ data: SessionMessage.Info[] }>(`/api/session/${session.id}/message`, { headers }).pipe(
+          requestJson<{ data: SessionMessage.Message[] }>(`/api/session/${session.id}/message`, { headers }).pipe(
             Effect.map(({ data }) => data.find((message) => message.id === wakeID)),
           ),
           "V2 prompt was not promoted after wake",
@@ -629,25 +637,28 @@ describe("session HttpApi", () => {
   )
 
   it.instance(
-    "supports current session compact and wait endpoints",
+    "returns v2 public unavailable errors for unfinished session mutations",
     () =>
       Effect.gen(function* () {
         const test = yield* TestInstance
         const headers = { "x-opencode-directory": test.directory }
         const session = yield* createSession({ title: "v2 unavailable" })
 
-        const compact = yield* request(`/api/session/${session.id}/compact`, {
-          method: "POST",
-          headers: { ...headers, "content-type": "application/json" },
-          body: JSON.stringify({}),
-        })
-        expect(compact.status).toBe(200)
-        expect(yield* responseJson(compact)).toMatchObject({
-          data: { type: "compaction", sessionID: session.id },
+        const compact = yield* request(`/api/session/${session.id}/compact`, { method: "POST", headers })
+        expect(compact.status).toBe(503)
+        expect(yield* responseJson(compact)).toEqual({
+          _tag: "ServiceUnavailableError",
+          message: "Session compact is not available yet",
+          service: "session.compact",
         })
 
         const wait = yield* request(`/api/session/${session.id}/wait`, { method: "POST", headers })
-        expect(wait.status).toBe(204)
+        expect(wait.status).toBe(503)
+        expect(yield* responseJson(wait)).toEqual({
+          _tag: "ServiceUnavailableError",
+          message: "Session wait is not available yet",
+          service: "session.wait",
+        })
       }),
     { git: true, config: { formatter: false, lsp: false } },
   )

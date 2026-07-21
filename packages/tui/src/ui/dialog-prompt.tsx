@@ -1,9 +1,10 @@
 import { TextareaRenderable, TextAttributes } from "@opentui/core"
-import { Keymap } from "../context/keymap"
 import { useTheme } from "../context/theme"
 import { useDialog, type DialogContext } from "./dialog"
 import { Show, createEffect, createSignal, onMount, type JSX } from "solid-js"
 import { Spinner } from "../component/spinner"
+import { useTuiConfig } from "../config"
+import { useBindings, useCommandShortcut } from "../keymap"
 
 export type DialogPromptProps = {
   title: string
@@ -18,8 +19,9 @@ export type DialogPromptProps = {
 
 export function DialogPrompt(props: DialogPromptProps) {
   const dialog = useDialog()
-  const { themeV2 } = useTheme().contextual("elevated")
-  const shortcuts = Keymap.useShortcuts()
+  const { theme } = useTheme()
+  const tuiConfig = useTuiConfig()
+  const submitShortcut = useCommandShortcut("dialog.prompt.submit")
   const [textareaTarget, setTextareaTarget] = createSignal<TextareaRenderable>()
   let textarea: TextareaRenderable
 
@@ -28,21 +30,20 @@ export function DialogPrompt(props: DialogPromptProps) {
     props.onConfirm?.(textarea.plainText)
   }
 
-  Keymap.createLayer(() => ({
-    mode: "modal",
+  useBindings(() => ({
     target: textareaTarget,
     enabled: textareaTarget() !== undefined && !props.busy,
     // Dialog form semantics must win over the global managed textarea input layer.
     priority: 1,
     commands: [
       {
-        id: "dialog.prompt.submit",
+        name: "dialog.prompt.submit",
         title: "Submit dialog prompt",
-        bind: "return",
-        group: "Dialog",
+        category: "Dialog",
         run: confirm,
       },
     ],
+    bindings: tuiConfig.keybinds.gather("dialog.prompt", ["dialog.prompt.submit"]),
   }))
 
   onMount(() => {
@@ -74,10 +75,10 @@ export function DialogPrompt(props: DialogPromptProps) {
   return (
     <box paddingLeft={2} paddingRight={2} gap={1}>
       <box flexDirection="row" justifyContent="space-between">
-        <text attributes={TextAttributes.BOLD} fg={themeV2.text()}>
+        <text attributes={TextAttributes.BOLD} fg={theme.text}>
           {props.title}
         </text>
-        <text fg={themeV2.text.subdued()} onMouseUp={() => dialog.clear()}>
+        <text fg={theme.textMuted} onMouseUp={() => dialog.clear()}>
           esc
         </text>
       </box>
@@ -91,20 +92,20 @@ export function DialogPrompt(props: DialogPromptProps) {
           }}
           initialValue={props.value}
           placeholder={props.placeholder ?? "Enter text"}
-          placeholderColor={themeV2.text.subdued()}
-          textColor={themeV2.text.formfield({ disabled: props.busy })}
-          focusedTextColor={themeV2.text.formfield({ disabled: props.busy })}
-          cursorColor={props.busy ? themeV2.background.formfield("disabled") : themeV2.text()}
+          placeholderColor={theme.textMuted}
+          textColor={props.busy ? theme.textMuted : theme.text}
+          focusedTextColor={props.busy ? theme.textMuted : theme.text}
+          cursorColor={props.busy ? theme.backgroundElement : theme.text}
         />
         <Show when={props.busy}>
-          <Spinner color={themeV2.text.subdued()}>{props.busyText ?? "Working..."}</Spinner>
+          <Spinner color={theme.textMuted}>{props.busyText ?? "Working..."}</Spinner>
         </Show>
       </box>
       <box paddingBottom={1} gap={1} flexDirection="row">
-        <Show when={!props.busy} fallback={<text fg={themeV2.text.subdued()}>processing...</text>}>
-          <Show when={shortcuts.get("dialog.prompt.submit")}>
-            <text fg={themeV2.text()}>
-              {shortcuts.get("dialog.prompt.submit")} <span style={{ fg: themeV2.text.subdued() }}>submit</span>
+        <Show when={!props.busy} fallback={<text fg={theme.textMuted}>processing...</text>}>
+          <Show when={submitShortcut()}>
+            <text fg={theme.text}>
+              {submitShortcut()} <span style={{ fg: theme.textMuted }}>submit</span>
             </text>
           </Show>
         </Show>

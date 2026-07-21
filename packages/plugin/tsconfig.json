@@ -1,12 +1,13 @@
 {
   "$schema": "https://json.schemastore.org/tsconfig.json",
-  "extends": "@tsconfig/bun/tsconfig.json",
+  "extends": "@tsconfig/node22/tsconfig.json",
   "compilerOptions": {
     "rootDir": "src",
     "outDir": "dist",
+    "module": "nodenext",
     "declaration": true,
-    "lib": ["ESNext", "DOM", "DOM.Iterable"],
-    "noUncheckedIndexedAccess": false
+    "moduleResolution": "nodenext",
+    "lib": ["es2022", "dom", "dom.iterable"]
   },
   "include": ["src"]
 }

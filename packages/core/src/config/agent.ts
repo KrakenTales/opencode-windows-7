@@ -3,7 +3,6 @@ export * as ConfigAgent from "./agent"
 import { Schema } from "effect"
 import { Permission } from "@opencode-ai/schema/permission"
 import { ConfigProvider } from "./provider"
-import { ConfigModel } from "./model"
 import { PositiveInt } from "../schema"
 
 export const Color = Schema.Union([
@@ -12,7 +11,8 @@ export const Color = Schema.Union([
 ])
 
 export class Info extends Schema.Class<Info>("ConfigV2.Agent")({
-  model: ConfigModel.Selection.pipe(Schema.optional),
+  model: Schema.String.pipe(Schema.optional),
+  variant: Schema.String.pipe(Schema.optional),
   request: ConfigProvider.Request.pipe(Schema.optional),
   system: Schema.String.pipe(Schema.optional),
   description: Schema.String.pipe(Schema.optional),

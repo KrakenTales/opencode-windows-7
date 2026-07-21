@@ -1,7 +1,7 @@
-import type { FileDiffInfo } from "@opencode-ai/sdk/v2"
+import type { SnapshotFileDiff, VcsFileDiff } from "@opencode-ai/sdk/v2"
 import type { Message } from "@opencode-ai/sdk/v2/client"
 
-type Diff = FileDiffInfo
+type Diff = SnapshotFileDiff | VcsFileDiff
 
 function diff(value: unknown): value is Diff {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false

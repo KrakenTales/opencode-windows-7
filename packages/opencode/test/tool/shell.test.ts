@@ -6,7 +6,7 @@ import type * as Scope from "effect/Scope"
 import os from "os"
 import path from "path"
 import { Config } from "@/config/config"
-import { ShellSelect } from "@opencode-ai/core/shell/select"
+import { Shell } from "@opencode-ai/core/shell"
 import { ShellTool } from "../../src/tool/shell"
 import { Filesystem } from "@/util/filesystem"
 import { provideInstance, testInstanceStoreLayer, tmpdirScoped } from "../fixture/fixture"
@@ -82,25 +82,25 @@ const ctx = {
   ask: () => Effect.void,
 }
 
-ShellSelect.acceptable.reset()
+Shell.acceptable.reset()
 const quote = (text: string) => `"${text}"`
 const squote = (text: string) => `'${text}'`
 const projectRoot = path.join(__dirname, "../..")
 const bin = quote(process.execPath.replaceAll("\\", "/"))
 const bash = (() => {
-  const shell = ShellSelect.acceptable()
-  if (ShellSelect.name(shell) === "bash") return shell
-  return ShellSelect.gitbash()
+  const shell = Shell.acceptable()
+  if (Shell.name(shell) === "bash") return shell
+  return Shell.gitbash()
 })()
 const shells = (() => {
   if (process.platform !== "win32") {
-    const shell = ShellSelect.acceptable()
-    return [{ label: ShellSelect.name(shell), shell }]
+    const shell = Shell.acceptable()
+    return [{ label: Shell.name(shell), shell }]
   }
 
   const list = [bash, Bun.which("pwsh"), Bun.which("powershell"), process.env.COMSPEC || Bun.which("cmd.exe")]
     .filter((shell): shell is string => Boolean(shell))
-    .map((shell) => ({ label: ShellSelect.name(shell), shell }))
+    .map((shell) => ({ label: Shell.name(shell), shell }))
 
   return list.filter(
     (item, i) => list.findIndex((other) => other.shell.toLowerCase() === item.shell.toLowerCase()) === i,
@@ -110,7 +110,7 @@ const PS = new Set(["pwsh", "powershell"])
 const ps = shells.filter((item) => PS.has(item.label))
 const cmdShell = shells.find((item) => item.label === "cmd")
 
-const sh = () => ShellSelect.name(ShellSelect.acceptable())
+const sh = () => Shell.name(Shell.acceptable())
 const evalarg = (text: string) => (sh() === "cmd" ? quote(text) : squote(text))
 
 const fill = (mode: "lines" | "bytes", n: number) => {
@@ -138,8 +138,8 @@ const withShell = <A, E, R>(item: { label: string; shell: string }, self: Effect
     Effect.sync(() => {
       const prev = process.env.SHELL
       process.env.SHELL = item.shell
-      ShellSelect.acceptable.reset()
-      ShellSelect.preferred.reset()
+      Shell.acceptable.reset()
+      Shell.preferred.reset()
       return prev
     }),
     () => self,
@@ -147,8 +147,8 @@ const withShell = <A, E, R>(item: { label: string; shell: string }, self: Effect
       Effect.sync(() => {
         if (prev === undefined) delete process.env.SHELL
         else process.env.SHELL = prev
-        ShellSelect.acceptable.reset()
-        ShellSelect.preferred.reset()
+        Shell.acceptable.reset()
+        Shell.preferred.reset()
       }),
   )
 
@@ -201,7 +201,7 @@ describe("tool.shell", () => {
         tmp,
         Effect.gen(function* () {
           const bash = yield* initBash()
-          const fallback = ShellSelect.name(ShellSelect.acceptable("fish"))
+          const fallback = Shell.name(Shell.acceptable("fish"))
           expect(fallback).not.toBe("fish")
           expect(bash.description).toContain(fallback)
 

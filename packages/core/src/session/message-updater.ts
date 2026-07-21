@@ -1,48 +1,30 @@
 import { castDraft, produce, type WritableDraft } from "immer"
-import { DateTime, Effect } from "effect"
+import { Effect } from "effect"
 import { SessionEvent } from "./event"
 import { SessionMessage } from "./message"
 
 export type MemoryState = {
-  messages: SessionMessage.Info[]
+  messages: SessionMessage.Message[]
 }
 
 export interface Adapter {
-  readonly getModel: () => Effect.Effect<SessionMessage.ModelSelected["model"] | undefined, never, never>
-  readonly getCurrentAssistant: () => Effect.Effect<SessionMessage.Assistant | undefined, never, never>
-  readonly getAssistant: (
-    messageID: SessionMessage.ID,
-  ) => Effect.Effect<SessionMessage.Assistant | undefined, never, never>
-  readonly getShell: (
-    shellID: SessionMessage.Shell["shellID"],
-  ) => Effect.Effect<SessionMessage.Shell | undefined, never, never>
-  readonly getCompaction: () => Effect.Effect<SessionMessage.Compaction | undefined, never, never>
-  readonly updateAssistant: (assistant: SessionMessage.Assistant) => Effect.Effect<void, never, never>
-  readonly updateShell: (shell: SessionMessage.Shell) => Effect.Effect<void, never, never>
-  readonly updateCompaction: (compaction: SessionMessage.Compaction) => Effect.Effect<void, never, never>
-  readonly appendMessage: (message: SessionMessage.Info) => Effect.Effect<void, never, never>
+  readonly getCurrentAssistant: () => Effect.Effect<SessionMessage.Assistant | undefined>
+  readonly getAssistant: (messageID: SessionMessage.ID) => Effect.Effect<SessionMessage.Assistant | undefined>
+  readonly getCurrentShell: (callID: string) => Effect.Effect<SessionMessage.Shell | undefined>
+  readonly updateAssistant: (assistant: SessionMessage.Assistant) => Effect.Effect<void>
+  readonly updateShell: (shell: SessionMessage.Shell) => Effect.Effect<void>
+  readonly appendMessage: (message: SessionMessage.Message) => Effect.Effect<void>
 }
 
 export function memory(state: MemoryState): Adapter {
   const assistantIndex = (messageID: SessionMessage.ID) =>
     state.messages.findLastIndex((message) => message.id === messageID)
-  const shellIndex = (messageID: SessionMessage.ID) =>
-    state.messages.findLastIndex((message) => message.id === messageID)
-  const compactionIndex = () =>
-    state.messages.findLastIndex((message) => message.type === "compaction" && message.status === "running")
-  // A newer step supersedes stale incomplete rows; never resume an older assistant projection.
+  // A newer turn supersedes stale incomplete rows; never resume an older assistant projection.
   const latestAssistantIndex = () => state.messages.findLastIndex((message) => message.type === "assistant")
+  const activeShellIndex = (callID: string) =>
+    state.messages.findLastIndex((message) => message.type === "shell" && message.callID === callID)
 
   return {
-    getModel() {
-      return Effect.sync(
-        () =>
-          state.messages.findLast(
-            (message): message is SessionMessage.ModelSelected | SessionMessage.Assistant =>
-              message.type === "model-switched" || message.type === "assistant",
-          )?.model,
-      )
-    },
     getCurrentAssistant() {
       return Effect.sync(() => {
         const index = latestAssistantIndex()
@@ -59,18 +41,12 @@ export function memory(state: MemoryState): Adapter {
         return assistant?.type === "assistant" ? assistant : undefined
       })
     },
-    getShell(shellID) {
+    getCurrentShell(callID) {
       return Effect.sync(() => {
-        return state.messages.find((message): message is SessionMessage.Shell => {
-          return message.type === "shell" && message.shellID === shellID
-        })
-      })
-    },
-    getCompaction() {
-      return Effect.sync(() => {
-        const index = compactionIndex()
-        const message = state.messages[index]
-        return message?.type === "compaction" ? message : undefined
+        const index = activeShellIndex(callID)
+        if (index < 0) return
+        const shell = state.messages[index]
+        return shell?.type === "shell" ? shell : undefined
       })
     },
     updateAssistant(assistant) {
@@ -84,17 +60,11 @@ export function memory(state: MemoryState): Adapter {
     },
     updateShell(shell) {
       return Effect.sync(() => {
-        const index = shellIndex(shell.id)
+        const index = activeShellIndex(shell.callID)
         if (index < 0) return
         const current = state.messages[index]
         if (current?.type !== "shell") return
         state.messages[index] = shell
-      })
-    },
-    updateCompaction(compaction) {
-      return Effect.sync(() => {
-        const index = state.messages.findLastIndex((message) => message.id === compaction.id)
-        if (index >= 0) state.messages[index] = compaction
       })
     },
     appendMessage(message) {
@@ -116,11 +86,11 @@ export function update(adapter: Adapter, event: SessionEvent.Event) {
       (item): item is DraftTool => item.type === "tool" && (callID === undefined || item.id === callID),
     )
 
-  const latestText = (assistant: DraftAssistant | undefined) =>
-    assistant?.content.findLast((item): item is DraftText => item.type === "text")
+  const latestText = (assistant: DraftAssistant | undefined, textID: string) =>
+    assistant?.content.findLast((item): item is DraftText => item.type === "text" && item.id === textID)
 
-  const latestReasoning = (assistant: DraftAssistant | undefined) =>
-    assistant?.content.findLast((item): item is DraftReasoning => item.type === "reasoning" && !item.time?.completed)
+  const latestReasoning = (assistant: DraftAssistant | undefined, reasoningID: string) =>
+    assistant?.content.findLast((item): item is DraftReasoning => item.type === "reasoning" && item.id === reasoningID)
 
   const updateOwnedAssistant = (messageID: SessionMessage.ID, recipe: (draft: DraftAssistant) => void) =>
     Effect.gen(function* () {
@@ -128,134 +98,98 @@ export function update(adapter: Adapter, event: SessionEvent.Event) {
       if (assistant) yield* adapter.updateAssistant(produce(assistant, recipe))
     })
 
-  const clearCurrentRetry = Effect.gen(function* () {
-    const assistant = yield* adapter.getCurrentAssistant()
-    if (assistant?.retry) {
-      yield* adapter.updateAssistant(
-        produce(assistant, (draft) => {
-          draft.retry = undefined
-        }),
-      )
-    }
-  })
-
   return Effect.gen(function* () {
     yield* SessionEvent.All.match(event, {
-      "session.usage.updated": () => Effect.void,
-      "session.usage.recorded": () => Effect.void,
-      "session.agent.selected": (event) => {
+      "session.next.agent.switched": (event) => {
         return adapter.appendMessage(
-          SessionMessage.AgentSelected.make({
-            id: SessionMessage.ID.fromEvent(event.id),
+          SessionMessage.AgentSwitched.make({
+            id: event.data.messageID,
             type: "agent-switched",
             metadata: event.metadata,
             agent: event.data.agent,
-            time: { created: event.created },
+            time: { created: event.data.timestamp },
           }),
         )
       },
-      "session.model.selected": (event) => {
-        return Effect.gen(function* () {
-          const previous = yield* adapter.getModel()
-          yield* adapter.appendMessage(
-            SessionMessage.ModelSelected.make({
-              id: SessionMessage.ID.fromEvent(event.id),
-              type: "model-switched",
-              metadata: event.metadata,
-              model: event.data.model,
-              previous,
-              time: { created: event.created },
-            }),
-          )
-        })
+      "session.next.model.switched": (event) => {
+        return adapter.appendMessage(
+          SessionMessage.ModelSwitched.make({
+            id: event.data.messageID,
+            type: "model-switched",
+            metadata: event.metadata,
+            model: event.data.model,
+            time: { created: event.data.timestamp },
+          }),
+        )
       },
-      "session.moved": () => Effect.void,
-      "session.renamed": () => Effect.void,
-      "session.deleted": () => Effect.void,
-      "session.forked": () => Effect.void,
-      "session.input.promoted": () => Effect.void,
-      "session.input.admitted": () => Effect.void,
-      "session.execution.started": () => Effect.void,
-      "session.execution.succeeded": () => clearCurrentRetry,
-      "session.execution.failed": () => clearCurrentRetry,
-      "session.execution.interrupted": () => clearCurrentRetry,
-      "session.instructions.updated": () => Effect.void,
-      "session.synthetic": (event) => {
+      "session.next.moved": () => Effect.void,
+      "session.next.prompted": (event) => {
+        return adapter.appendMessage(
+          SessionMessage.User.make({
+            id: event.data.messageID,
+            type: "user",
+            metadata: event.metadata,
+            text: event.data.prompt.text,
+            files: event.data.prompt.files,
+            agents: event.data.prompt.agents,
+            time: { created: event.data.timestamp },
+          }),
+        )
+      },
+      "session.next.prompt.admitted": () => Effect.void,
+      "session.next.context.updated": (event) =>
+        adapter.appendMessage(
+          SessionMessage.System.make({
+            id: event.data.messageID,
+            type: "system",
+            text: event.data.text,
+            time: { created: event.data.timestamp },
+          }),
+        ),
+      "session.next.synthetic": (event) => {
         return adapter.appendMessage(
           SessionMessage.Synthetic.make({
+            sessionID: event.data.sessionID,
             text: event.data.text,
-            description: event.data.description,
-            metadata: event.data.metadata,
-            id: SessionMessage.ID.fromEvent(event.id),
+            id: event.data.messageID,
             type: "synthetic",
-            time: { created: event.created },
+            time: { created: event.data.timestamp },
           }),
         )
       },
-      "session.skill.activated": (event) => {
-        return adapter.appendMessage(
-          SessionMessage.Skill.make({
-            id: SessionMessage.ID.fromEvent(event.id),
-            type: "skill",
-            skill: event.data.id,
-            name: event.data.name,
-            text: event.data.text,
-            metadata: event.metadata,
-            time: { created: event.created },
-          }),
-        )
-      },
-      "session.shell.started": (event) => {
+      "session.next.shell.started": (event) => {
         return adapter.appendMessage(
           SessionMessage.Shell.make({
-            id: SessionMessage.ID.fromEvent(event.id),
+            id: event.data.messageID,
             type: "shell",
             metadata: event.metadata,
-            shellID: event.data.shell.id,
-            command: event.data.shell.command,
-            status: event.data.shell.status,
-            time: { created: event.created },
+            callID: event.data.callID,
+            command: event.data.command,
+            output: "",
+            time: { created: event.data.timestamp },
           }),
         )
       },
-      "session.shell.ended": (event) => {
+      "session.next.shell.ended": (event) => {
         return Effect.gen(function* () {
-          const currentShell = yield* adapter.getShell(event.data.shell.id)
+          const currentShell = yield* adapter.getCurrentShell(event.data.callID)
           if (currentShell) {
             yield* adapter.updateShell(
               produce(currentShell, (draft) => {
-                draft.status = event.data.shell.status
-                draft.exit = event.data.shell.exit
                 draft.output = event.data.output
-                draft.time.completed = event.created
+                draft.time.completed = event.data.timestamp
               }),
             )
           }
         })
       },
-      "session.step.started": (event) => {
+      "session.next.step.started": (event) => {
         return Effect.gen(function* () {
-          const existing = yield* adapter.getAssistant(event.data.assistantMessageID)
-          if (existing) {
-            yield* adapter.updateAssistant(
-              produce(existing, (draft) => {
-                draft.agent = event.data.agent
-                draft.model = castDraft(event.data.model)
-                draft.retry = undefined
-                draft.error = undefined
-                draft.finish = undefined
-                draft.time.completed = undefined
-                if (event.data.snapshot) draft.snapshot = { ...draft.snapshot, start: event.data.snapshot }
-              }),
-            )
-            return
-          }
           const currentAssistant = yield* adapter.getCurrentAssistant()
           if (currentAssistant) {
             yield* adapter.updateAssistant(
               produce(currentAssistant, (draft) => {
-                draft.retry = undefined
-                draft.time.completed = event.created
+                draft.time.completed = event.data.timestamp
               }),
             )
           }
@@ -265,17 +199,16 @@ export function update(adapter: Adapter, event: SessionEvent.Event) {
               type: "assistant",
               agent: event.data.agent,
               model: event.data.model,
-              metadata: event.metadata,
-              time: { created: event.created },
+              time: { created: event.data.timestamp },
               content: [],
               snapshot: event.data.snapshot ? { start: event.data.snapshot } : undefined,
             }),
           )
         })
       },
-      "session.step.ended": (event) => {
+      "session.next.step.ended": (event) => {
         return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
-          draft.time.completed = event.created
+          draft.time.completed = event.data.timestamp
           draft.finish = event.data.finish
           draft.cost = event.data.cost
           draft.tokens = event.data.tokens
@@ -287,42 +220,33 @@ export function update(adapter: Adapter, event: SessionEvent.Event) {
             }
         })
       },
-      "session.step.failed": (event) => {
+      "session.next.step.failed": (event) => {
         return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
-          draft.time.completed = event.created
+          draft.time.completed = event.data.timestamp
           draft.finish = "error"
-          draft.error = castDraft(event.data.error)
-          draft.retry = undefined
-          if (event.data.cost !== undefined && event.data.tokens !== undefined) {
-            draft.cost = event.data.cost
-            draft.tokens = castDraft(event.data.tokens)
-          }
-          if (event.data.snapshot || event.data.files)
-            draft.snapshot = {
-              ...draft.snapshot,
-              end: event.data.snapshot,
-              files: event.data.files ? Array.from(event.data.files) : undefined,
-            }
+          draft.error = event.data.error
         })
       },
-      "session.text.started": (event) => {
+      "session.next.text.started": (event) => {
         return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
-          draft.content.push(castDraft(SessionMessage.AssistantText.make({ type: "text", text: "" })))
+          draft.content.push(
+            castDraft(SessionMessage.AssistantText.make({ type: "text", id: event.data.textID, text: "" })),
+          )
         })
       },
-      "session.text.delta": (event) => {
+      "session.next.text.delta": (event) => {
         return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
-          const match = latestText(draft)
+          const match = latestText(draft, event.data.textID)
           if (match) match.text += event.data.delta
         })
       },
-      "session.text.ended": (event) => {
+      "session.next.text.ended": (event) => {
         return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
-          const match = latestText(draft)
+          const match = latestText(draft, event.data.textID)
           if (match) match.text = event.data.text
         })
       },
-      "session.tool.input.started": (event) => {
+      "session.next.tool.input.started": (event) => {
         return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
           draft.content.push(
             castDraft(
@@ -330,27 +254,26 @@ export function update(adapter: Adapter, event: SessionEvent.Event) {
                 type: "tool",
                 id: event.data.callID,
                 name: event.data.name,
-                time: { created: event.created },
-                state: SessionMessage.ToolStateStreaming.make({ status: "streaming", input: "" }),
+                time: { created: event.data.timestamp },
+                state: SessionMessage.ToolStatePending.make({ status: "pending", input: "" }),
               }),
             ),
           )
         })
       },
-      "session.tool.input.delta": () => Effect.void,
-      "session.tool.input.ended": (event) => {
+      "session.next.tool.input.delta": () => Effect.void,
+      "session.next.tool.input.ended": (event) => {
         return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
           const match = latestTool(draft, event.data.callID)
-          if (match && match.state.status === "streaming") match.state.input = event.data.text
+          if (match && match.state.status === "pending") match.state.input = event.data.text
         })
       },
-      "session.tool.called": (event) => {
+      "session.next.tool.called": (event) => {
         return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
           const match = latestTool(draft, event.data.callID)
           if (match) {
-            match.executed = event.data.executed
-            match.providerState = event.data.state
-            match.time.ran = event.created
+            match.provider = event.data.provider
+            match.time.ran = event.data.timestamp
             match.state = castDraft(
               SessionMessage.ToolStateRunning.make({
                 status: "running",
@@ -362,7 +285,7 @@ export function update(adapter: Adapter, event: SessionEvent.Event) {
           }
         })
       },
-      "session.tool.progress": (event) => {
+      "session.next.tool.progress": (event) => {
         return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
           const match = latestTool(draft, event.data.callID)
           if (match && match.state.status === "running") {
@@ -371,32 +294,39 @@ export function update(adapter: Adapter, event: SessionEvent.Event) {
           }
         })
       },
-      "session.tool.success": (event) => {
+      "session.next.tool.success": (event) => {
         return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
           const match = latestTool(draft, event.data.callID)
           if (match && match.state.status === "running") {
-            match.executed = event.data.executed || match.executed === true
-            match.providerResultState = event.data.resultState
-            match.time.completed = event.created
+            match.provider = {
+              executed: event.data.provider.executed || match.provider?.executed === true,
+              metadata: match.provider?.metadata,
+              resultMetadata: event.data.provider.metadata,
+            }
+            match.time.completed = event.data.timestamp
             match.state = castDraft(
               SessionMessage.ToolStateCompleted.make({
                 status: "completed",
                 input: match.state.input,
                 structured: event.data.structured,
                 content: [...event.data.content],
+                outputPaths: event.data.outputPaths ? [...event.data.outputPaths] : [],
                 result: event.data.result,
               }),
             )
           }
         })
       },
-      "session.tool.failed": (event) => {
+      "session.next.tool.failed": (event) => {
         return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
           const match = latestTool(draft, event.data.callID)
-          if (match && (match.state.status === "streaming" || match.state.status === "running")) {
-            match.executed = event.data.executed || match.executed === true
-            match.providerResultState = event.data.resultState
-            match.time.completed = event.created
+          if (match && (match.state.status === "pending" || match.state.status === "running")) {
+            match.provider = {
+              executed: event.data.provider.executed || match.provider?.executed === true,
+              metadata: match.provider?.metadata,
+              resultMetadata: event.data.provider.metadata,
+            }
+            match.time.completed = event.data.timestamp
             match.state = castDraft(
               SessionMessage.ToolStateError.make({
                 status: "error",
@@ -410,110 +340,56 @@ export function update(adapter: Adapter, event: SessionEvent.Event) {
           }
         })
       },
-      "session.reasoning.started": (event) => {
+      "session.next.reasoning.started": (event) => {
         return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
           draft.content.push(
             castDraft(
               SessionMessage.AssistantReasoning.make({
                 type: "reasoning",
+                id: event.data.reasoningID,
                 text: "",
-                state: event.data.state,
-                time: { created: event.created },
+                providerMetadata: event.data.providerMetadata,
+                time: { created: event.data.timestamp },
               }),
             ),
           )
         })
       },
-      "session.reasoning.delta": (event) => {
+      "session.next.reasoning.delta": (event) => {
         return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
-          const match = latestReasoning(draft)
+          const match = latestReasoning(draft, event.data.reasoningID)
           if (match) match.text += event.data.delta
         })
       },
-      "session.reasoning.ended": (event) => {
+      "session.next.reasoning.ended": (event) => {
         return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
-          const match = latestReasoning(draft)
+          const match = latestReasoning(draft, event.data.reasoningID)
           if (match) {
             match.text = event.data.text
-            match.time = { created: match.time?.created ?? event.created, completed: event.created }
-            if (event.data.state !== undefined) match.state = event.data.state
+            match.time = { created: match.time?.created ?? event.data.timestamp, completed: event.data.timestamp }
+            if (event.data.providerMetadata !== undefined) match.providerMetadata = event.data.providerMetadata
           }
         })
       },
-      "session.retry.scheduled": (event) => {
-        return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
-          draft.retry = {
-            attempt: event.data.attempt,
-            at: DateTime.makeUnsafe(event.data.at),
-            error: castDraft(event.data.error),
-          }
-        })
-      },
-      "session.compaction.admitted": () => Effect.void,
-      "session.compaction.started": (event) =>
-        adapter.appendMessage(
-          SessionMessage.CompactionRunning.make({
-            id: event.data.inputID ?? SessionMessage.ID.fromEvent(event.id),
+      "session.next.retried": () => Effect.void,
+      "session.next.compaction.started": () => Effect.void,
+      "session.next.compaction.delta": () => Effect.void,
+      "session.next.compaction.ended": (event) => {
+        return adapter.appendMessage(
+          SessionMessage.Compaction.make({
+            id: event.data.messageID,
             type: "compaction",
-            status: "running",
             metadata: event.metadata,
             reason: event.data.reason,
-            summary: "",
-            recent: event.data.recent ?? "",
-            time: { created: event.created },
+            summary: event.data.text,
+            recent: event.data.recent,
+            time: { created: event.data.timestamp },
           }),
-        ),
-      "session.compaction.delta": (event) =>
-        Effect.gen(function* () {
-          const current = yield* adapter.getCompaction()
-          if (current?.status !== "running") return
-          yield* adapter.updateCompaction({ ...current, summary: current.summary + event.data.text })
-        }),
-      "session.compaction.ended": (event) => {
-        return Effect.gen(function* () {
-          const current = yield* adapter.getCompaction()
-          if (current?.status === "running") {
-            yield* adapter.updateCompaction({
-              ...current,
-              status: "completed",
-              reason: event.data.reason,
-              summary: event.data.text,
-              recent: event.data.recent,
-            })
-            return
-          }
-          yield* adapter.appendMessage(
-            SessionMessage.Compaction.make({
-              id: SessionMessage.ID.fromEvent(event.id),
-              type: "compaction",
-              status: "completed",
-              metadata: event.metadata,
-              reason: event.data.reason,
-              summary: event.data.text,
-              recent: event.data.recent,
-              time: { created: event.created },
-            }),
-          )
-        })
+        )
       },
-      "session.compaction.failed": (event) =>
-        Effect.gen(function* () {
-          const current = yield* adapter.getCompaction()
-          const failed = SessionMessage.CompactionFailed.make({
-            id: current?.id ?? event.data.inputID ?? SessionMessage.ID.fromEvent(event.id),
-            type: "compaction",
-            status: "failed",
-            metadata: current?.metadata ?? event.metadata,
-            reason: event.data.reason,
-            error: event.data.error,
-            time: current?.time ?? { created: event.created },
-          })
-          if (current?.status === "running") return yield* adapter.updateCompaction(failed)
-          yield* adapter.appendMessage(failed)
-        }),
-      "session.revert.staged": () => Effect.void,
-      "session.revert.cleared": () => Effect.void,
-      "session.revert.committed": () => Effect.void,
+      "session.next.revert.staged": () => Effect.void,
+      "session.next.revert.cleared": () => Effect.void,
+      "session.next.revert.committed": () => Effect.void,
     })
   })
 }

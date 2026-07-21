@@ -222,6 +222,8 @@ export function createPromptSubmit(input: PromptSubmitInput) {
     const sessionID = params.id
     if (!sessionID) return Promise.resolve()
 
+    serverSync().session.set("todo", sessionID, [])
+
     input.onAbort?.()
 
     const key = pendingKey(sessionID)

@@ -1,32 +1,28 @@
 import path from "path"
 import { onMount } from "solid-js"
 import { createStore, produce, unwrap } from "solid-js/store"
-import type { SessionPromptInput } from "@opencode-ai/client"
-import type { Types } from "effect"
+import type { AgentPart, FilePart, TextPart } from "@opencode-ai/sdk/v2"
 import { createSimpleContext } from "../context/helper"
 import { useTuiPaths } from "../context/runtime"
 import { appendText, readText, writeText } from "../util/persistence"
 
-export type PastedText = {
-  text: string
-  source: {
-    start: number
-    end: number
-    text: string
-  }
-}
-
-export type PromptInfo = Types.DeepMutable<Pick<SessionPromptInput, "text" | "files" | "agents">> & {
-  pasted: PastedText[]
+export type PromptInfo = {
+  input: string
   mode?: "normal" | "shell"
+  parts: (
+    | Omit<FilePart, "id" | "messageID" | "sessionID">
+    | Omit<AgentPart, "id" | "messageID" | "sessionID">
+    | (Omit<TextPart, "id" | "messageID" | "sessionID"> & {
+        source?: {
+          text: {
+            start: number
+            end: number
+            value: string
+          }
+        }
+      })
+  )[]
 }
-
-export type PromptPartRef = {
-  type: "file" | "agent" | "pasted"
-  index: number
-}
-
-export const emptyPrompt = (): PromptInfo => ({ text: "", files: [], agents: [], pasted: [] })
 
 export const MAX_HISTORY_ENTRIES = 50
 
@@ -36,7 +32,7 @@ export function parsePromptHistory(text: string) {
     .filter(Boolean)
     .map((line) => {
       try {
-        return parsePromptInfo(JSON.parse(line))
+        return JSON.parse(line) as PromptInfo
       } catch {
         return undefined
       }
@@ -48,13 +44,6 @@ export function parsePromptHistory(text: string) {
 export function isDuplicateEntry(previous: PromptInfo | undefined, next: PromptInfo): boolean {
   if (!previous) return false
   return JSON.stringify(previous) === JSON.stringify(next)
-}
-
-export function parsePromptInfo(value: unknown): PromptInfo | undefined {
-  if (!value || typeof value !== "object") return
-  const input = value as Record<string, unknown>
-  if (typeof input.text !== "string" || !Array.isArray(input.pasted)) return
-  return input as PromptInfo
 }
 
 export const { use: usePromptHistory, provider: PromptHistoryProvider } = createSimpleContext({
@@ -81,12 +70,17 @@ export const { use: usePromptHistory, provider: PromptHistoryProvider } = create
         if (!store.history.length) return undefined
         const current = store.history.at(store.index)
         if (!current) return undefined
-        if (current.text !== input && input.length) return
-        const next = store.index + direction
-        if (Math.abs(next) > store.history.length || next > 0) return
-        setStore("index", next)
-        if (next === 0) return emptyPrompt()
-        return store.history.at(next)
+        if (current.input !== input && input.length) return
+        setStore(
+          produce((draft) => {
+            const next = store.index + direction
+            if (Math.abs(next) > store.history.length) return
+            if (next > 0) return
+            draft.index = next
+          }),
+        )
+        if (store.index === 0) return { input: "", parts: [] }
+        return store.history.at(store.index)
       },
       append(item: PromptInfo) {
         const entry = structuredClone(unwrap(item))

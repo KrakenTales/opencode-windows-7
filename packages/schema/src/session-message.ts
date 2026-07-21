@@ -1,30 +1,25 @@
-export * as SessionMessage from "./session-message.js"
+export * as SessionMessage from "./session-message"
 
 import { Schema } from "effect"
-import { optional } from "./schema.js"
-import { ToolContent } from "./llm.js"
-import { Model } from "./model.js"
-import { Prompt } from "./prompt.js"
-import { DateTimeUtcFromMillis, PositiveInt, RelativePath, statics } from "./schema.js"
-import { ascending } from "./identifier.js"
-import { Event } from "./event.js"
-import { Shell as ShellSchema } from "./shell.js"
-import { FinishReason } from "./llm.js"
-import { SessionError } from "./session-error.js"
-import { Agent } from "./agent.js"
-import { Skill as SkillSchema } from "./skill.js"
-import { Money } from "./money.js"
-import { Snapshot } from "./snapshot.js"
-import { TokenUsage } from "./token-usage.js"
+import { optional } from "./schema"
+import { ProviderMetadata, ToolContent } from "./llm"
+import { Model } from "./model"
+import { FileAttachment, Prompt } from "./prompt"
+import { DateTimeUtcFromMillis, RelativePath, statics } from "./schema"
+import { SessionID } from "./session-id"
+import { ascending } from "./identifier"
 
 export const ID = Schema.String.check(Schema.isStartsWith("msg_")).pipe(
   Schema.brand("Session.Message.ID"),
-  statics((schema) => ({
-    create: () => schema.make("msg_" + ascending()),
-    fromEvent: (eventID: Event.ID) => schema.make(eventID.replace(/^evt_/, "msg_")),
-  })),
+  statics((schema) => ({ create: () => schema.make("msg_" + ascending()) })),
 )
 export type ID = typeof ID.Type
+
+export interface UnknownError extends Schema.Schema.Type<typeof UnknownError> {}
+export const UnknownError = Schema.Struct({
+  type: Schema.Literal("unknown"),
+  message: Schema.String,
+}).annotate({ identifier: "Session.Error.Unknown" })
 
 const Base = {
   id: ID,
@@ -32,25 +27,19 @@ const Base = {
   time: Schema.Struct({ created: DateTimeUtcFromMillis }),
 }
 
-export const ProviderState = Schema.Record(Schema.String, Schema.Unknown).annotate({
-  identifier: "Session.Message.ProviderState",
-})
-export type ProviderState = typeof ProviderState.Type
-
-export interface AgentSelected extends Schema.Schema.Type<typeof AgentSelected> {}
-export const AgentSelected = Schema.Struct({
+export interface AgentSwitched extends Schema.Schema.Type<typeof AgentSwitched> {}
+export const AgentSwitched = Schema.Struct({
   ...Base,
-  type: Schema.tag("agent-switched"),
-  agent: Agent.ID,
-}).annotate({ identifier: "Session.Message.AgentSelected" })
+  type: Schema.Literal("agent-switched"),
+  agent: Schema.String,
+}).annotate({ identifier: "Session.Message.AgentSwitched" })
 
-export interface ModelSelected extends Schema.Schema.Type<typeof ModelSelected> {}
-export const ModelSelected = Schema.Struct({
+export interface ModelSwitched extends Schema.Schema.Type<typeof ModelSwitched> {}
+export const ModelSwitched = Schema.Struct({
   ...Base,
-  type: Schema.tag("model-switched"),
+  type: Schema.Literal("model-switched"),
   model: Model.Ref,
-  previous: Model.Ref.pipe(optional),
-}).annotate({ identifier: "Session.Message.ModelSelected" })
+}).annotate({ identifier: "Session.Message.ModelSwitched" })
 
 export interface User extends Schema.Schema.Type<typeof User> {}
 export const User = Schema.Struct({
@@ -58,57 +47,46 @@ export const User = Schema.Struct({
   text: Prompt.fields.text,
   files: Prompt.fields.files,
   agents: Prompt.fields.agents,
-  type: Schema.tag("user"),
+  type: Schema.Literal("user"),
 }).annotate({ identifier: "Session.Message.User" })
 
 export interface Synthetic extends Schema.Schema.Type<typeof Synthetic> {}
 export const Synthetic = Schema.Struct({
   ...Base,
+  sessionID: SessionID,
   text: Schema.String,
-  description: Schema.String.pipe(optional),
-  type: Schema.tag("synthetic"),
+  type: Schema.Literal("synthetic"),
 }).annotate({ identifier: "Session.Message.Synthetic" })
 
 export interface System extends Schema.Schema.Type<typeof System> {}
 export const System = Schema.Struct({
   ...Base,
-  type: Schema.tag("system"),
+  type: Schema.Literal("system"),
   text: Schema.String,
 }).annotate({ identifier: "Session.Message.System" })
-
-export interface Skill extends Schema.Schema.Type<typeof Skill> {}
-export const Skill = Schema.Struct({
-  ...Base,
-  type: Schema.tag("skill"),
-  skill: SkillSchema.ID,
-  name: SkillSchema.Name,
-  text: Schema.String,
-}).annotate({ identifier: "Session.Message.Skill" })
 
 export interface Shell extends Schema.Schema.Type<typeof Shell> {}
 export const Shell = Schema.Struct({
   ...Base,
-  type: Schema.tag("shell"),
-  shellID: ShellSchema.ID,
+  type: Schema.Literal("shell"),
+  callID: Schema.String,
   command: Schema.String,
-  status: ShellSchema.Status,
-  exit: Schema.Number.pipe(optional),
-  output: ShellSchema.Output.pipe(optional),
+  output: Schema.String,
   time: Schema.Struct({
     created: DateTimeUtcFromMillis,
     completed: DateTimeUtcFromMillis.pipe(optional),
   }),
 }).annotate({ identifier: "Session.Message.Shell" })
 
-export interface ToolStateStreaming extends Schema.Schema.Type<typeof ToolStateStreaming> {}
-export const ToolStateStreaming = Schema.Struct({
-  status: Schema.tag("streaming"),
+export interface ToolStatePending extends Schema.Schema.Type<typeof ToolStatePending> {}
+export const ToolStatePending = Schema.Struct({
+  status: Schema.Literal("pending"),
   input: Schema.String,
-}).annotate({ identifier: "Session.Message.ToolState.Streaming" })
+}).annotate({ identifier: "Session.Message.ToolState.Pending" })
 
 export interface ToolStateRunning extends Schema.Schema.Type<typeof ToolStateRunning> {}
 export const ToolStateRunning = Schema.Struct({
-  status: Schema.tag("running"),
+  status: Schema.Literal("running"),
   input: Schema.Record(Schema.String, Schema.Unknown),
   structured: Schema.Record(Schema.String, Schema.Unknown),
   content: ToolContent.pipe(Schema.Array),
@@ -116,55 +94,62 @@ export const ToolStateRunning = Schema.Struct({
 
 export interface ToolStateCompleted extends Schema.Schema.Type<typeof ToolStateCompleted> {}
 export const ToolStateCompleted = Schema.Struct({
-  status: Schema.tag("completed"),
+  status: Schema.Literal("completed"),
   input: Schema.Record(Schema.String, Schema.Unknown),
+  attachments: FileAttachment.pipe(Schema.Array, optional),
   content: ToolContent.pipe(Schema.Array),
+  outputPaths: Schema.Array(Schema.String).pipe(optional),
   structured: Schema.Record(Schema.String, Schema.Unknown),
   result: Schema.Unknown.pipe(optional),
 }).annotate({ identifier: "Session.Message.ToolState.Completed" })
 
 export interface ToolStateError extends Schema.Schema.Type<typeof ToolStateError> {}
 export const ToolStateError = Schema.Struct({
-  status: Schema.tag("error"),
+  status: Schema.Literal("error"),
   input: Schema.Record(Schema.String, Schema.Unknown),
   content: ToolContent.pipe(Schema.Array),
   structured: Schema.Record(Schema.String, Schema.Unknown),
-  error: SessionError.Error,
+  error: UnknownError,
   result: Schema.Unknown.pipe(optional),
 }).annotate({ identifier: "Session.Message.ToolState.Error" })
 
-export const ToolState = Schema.Union([ToolStateStreaming, ToolStateRunning, ToolStateCompleted, ToolStateError]).pipe(
+export const ToolState = Schema.Union([ToolStatePending, ToolStateRunning, ToolStateCompleted, ToolStateError]).pipe(
   Schema.toTaggedUnion("status"),
 )
-export type ToolState = ToolStateStreaming | ToolStateRunning | ToolStateCompleted | ToolStateError
+export type ToolState = ToolStatePending | ToolStateRunning | ToolStateCompleted | ToolStateError
 
 export interface AssistantTool extends Schema.Schema.Type<typeof AssistantTool> {}
 export const AssistantTool = Schema.Struct({
-  type: Schema.tag("tool"),
+  type: Schema.Literal("tool"),
   id: Schema.String,
   name: Schema.String,
-  executed: Schema.Boolean.pipe(optional),
-  providerState: ProviderState.pipe(optional),
-  providerResultState: ProviderState.pipe(optional),
+  provider: Schema.Struct({
+    executed: Schema.Boolean,
+    metadata: ProviderMetadata.pipe(optional),
+    resultMetadata: ProviderMetadata.pipe(optional),
+  }).pipe(optional),
   state: ToolState,
   time: Schema.Struct({
     created: DateTimeUtcFromMillis,
     ran: DateTimeUtcFromMillis.pipe(optional),
     completed: DateTimeUtcFromMillis.pipe(optional),
+    pruned: DateTimeUtcFromMillis.pipe(optional),
   }),
 }).annotate({ identifier: "Session.Message.Assistant.Tool" })
 
 export interface AssistantText extends Schema.Schema.Type<typeof AssistantText> {}
 export const AssistantText = Schema.Struct({
-  type: Schema.tag("text"),
+  type: Schema.Literal("text"),
+  id: Schema.String,
   text: Schema.String,
 }).annotate({ identifier: "Session.Message.Assistant.Text" })
 
 export interface AssistantReasoning extends Schema.Schema.Type<typeof AssistantReasoning> {}
 export const AssistantReasoning = Schema.Struct({
-  type: Schema.tag("reasoning"),
+  type: Schema.Literal("reasoning"),
+  id: Schema.String,
   text: Schema.String,
-  state: ProviderState.pipe(optional),
+  providerMetadata: ProviderMetadata.pipe(optional),
   time: Schema.Struct({
     created: DateTimeUtcFromMillis,
     completed: DateTimeUtcFromMillis.pipe(optional),
@@ -176,82 +161,53 @@ export const AssistantContent = Schema.Union([AssistantText, AssistantReasoning,
 )
 export type AssistantContent = AssistantText | AssistantReasoning | AssistantTool
 
-export interface AssistantRetry extends Schema.Schema.Type<typeof AssistantRetry> {}
-export const AssistantRetry = Schema.Struct({
-  attempt: PositiveInt,
-  at: DateTimeUtcFromMillis,
-  error: SessionError.Error,
-}).annotate({ identifier: "Session.Message.Assistant.Retry" })
-
 export interface Assistant extends Schema.Schema.Type<typeof Assistant> {}
 export const Assistant = Schema.Struct({
   ...Base,
-  type: Schema.tag("assistant"),
-  agent: Agent.ID,
+  type: Schema.Literal("assistant"),
+  agent: Schema.String,
   model: Model.Ref,
   content: AssistantContent.pipe(Schema.Array),
   snapshot: Schema.Struct({
-    start: Snapshot.ID.pipe(optional),
-    end: Snapshot.ID.pipe(optional),
+    start: Schema.String.pipe(optional),
+    end: Schema.String.pipe(optional),
     files: Schema.Array(RelativePath).pipe(optional),
   }).pipe(optional),
-  finish: FinishReason.pipe(optional),
-  cost: Money.USD.pipe(optional),
-  tokens: TokenUsage.Info.pipe(optional),
-  error: SessionError.Error.pipe(optional),
-  retry: AssistantRetry.pipe(optional),
+  finish: Schema.String.pipe(optional),
+  cost: Schema.Finite.pipe(optional),
+  tokens: Schema.Struct({
+    input: Schema.Finite,
+    output: Schema.Finite,
+    reasoning: Schema.Finite,
+    cache: Schema.Struct({ read: Schema.Finite, write: Schema.Finite }),
+  }).pipe(optional),
+  error: UnknownError.pipe(optional),
   time: Schema.Struct({
     created: DateTimeUtcFromMillis,
     completed: DateTimeUtcFromMillis.pipe(optional),
   }),
 }).annotate({ identifier: "Session.Message.Assistant" })
 
-const CompactionBase = { type: Schema.tag("compaction"), ...Base }
-
-export interface CompactionRunning extends Schema.Schema.Type<typeof CompactionRunning> {}
-export const CompactionRunning = Schema.Struct({
-  ...CompactionBase,
-  status: Schema.tag("running"),
+export interface Compaction extends Schema.Schema.Type<typeof Compaction> {}
+export const Compaction = Schema.Struct({
+  type: Schema.Literal("compaction"),
   reason: Schema.Literals(["auto", "manual"]),
   summary: Schema.String,
   recent: Schema.String,
-}).annotate({ identifier: "Session.Message.Compaction.Running" })
+  ...Base,
+}).annotate({ identifier: "Session.Message.Compaction" })
 
-export interface CompactionCompleted extends Schema.Schema.Type<typeof CompactionCompleted> {}
-export const CompactionCompleted = Schema.Struct({
-  ...CompactionBase,
-  status: Schema.tag("completed"),
-  reason: Schema.Literals(["auto", "manual"]),
-  summary: Schema.String,
-  recent: Schema.String,
-}).annotate({ identifier: "Session.Message.Compaction.Completed" })
-
-export interface CompactionFailed extends Schema.Schema.Type<typeof CompactionFailed> {}
-export const CompactionFailed = Schema.Struct({
-  ...CompactionBase,
-  status: Schema.tag("failed"),
-  reason: Schema.Literals(["auto", "manual"]),
-  error: SessionError.Error,
-}).annotate({ identifier: "Session.Message.Compaction.Failed" })
-
-export const Compaction = Schema.Union([CompactionRunning, CompactionCompleted, CompactionFailed]).pipe(
-  Schema.toTaggedUnion("status"),
-  Schema.annotate({ identifier: "Session.Message.Compaction" }),
-)
-export type Compaction = CompactionRunning | CompactionCompleted | CompactionFailed
-
-export const Info = Schema.Union([
-  AgentSelected,
-  ModelSelected,
+export const Message = Schema.Union([
+  AgentSwitched,
+  ModelSwitched,
   User,
   Synthetic,
   System,
-  Skill,
   Shell,
   Assistant,
   Compaction,
 ])
   .pipe(Schema.toTaggedUnion("type"))
-  .annotate({ identifier: "Session.Message.Info" })
-export type Info = AgentSelected | ModelSelected | User | Synthetic | System | Skill | Shell | Assistant | Compaction
-export type Type = Info["type"]
+  .annotate({ identifier: "Session.Message" })
+export type Message = AgentSwitched | ModelSwitched | User | Synthetic | System | Shell | Assistant | Compaction
+export type Type = Message["type"]

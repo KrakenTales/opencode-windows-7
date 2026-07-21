@@ -23,11 +23,7 @@ describe("CommandPlugin.Plugin", () => {
       const command = yield* CommandV2.Service
       yield* CommandPlugin.Plugin.effect(
         host({
-          command: {
-            list: () => Effect.die("unused command.list"),
-            transform: command.transform,
-            reload: command.reload,
-          },
+          command: { transform: command.transform, reload: command.reload },
         }),
       ).pipe(
         Effect.provideService(
@@ -44,6 +40,7 @@ describe("CommandPlugin.Plugin", () => {
       expect(yield* command.get("review")).toMatchObject({
         name: "review",
         description: "review changes [commit|branch|pr], defaults to uncommitted",
+        subtask: true,
       })
     }),
   )

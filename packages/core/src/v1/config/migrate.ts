@@ -2,12 +2,10 @@ export * as ConfigMigrateV1 from "./migrate"
 
 import { ConfigV1 } from "./config"
 import { ConfigAgentV1 } from "./agent"
-import { ConfigCommandV1 } from "./command"
 import { ConfigMCPV1 } from "./mcp"
 import { ConfigPermissionV1 } from "./permission"
 import { ConfigProviderV1 } from "./provider"
 import { ConfigProviderOptionsV1 } from "./provider-options"
-import { ProviderV2 } from "../../provider"
 
 const keys = new Set([
   "logLevel",
@@ -31,26 +29,14 @@ const keys = new Set([
 
 export function isV1(input: unknown) {
   if (typeof input !== "object" || input === null || Array.isArray(input)) return false
-  const record = input as Record<string, unknown>
-  if (Object.keys(record).some((key) => keys.has(key))) return true
-  // `mcp` exists in both versions, so presence alone is ambiguous: v1 lists servers directly under
-  // `mcp`, while v2 nests them under `mcp.servers`. Only the v1 shape (a server entry with `type`)
-  // counts, so a bare `mcp`-only file still migrates instead of silently parsing to zero servers.
-  const mcp = record.mcp
-  return (
-    typeof mcp === "object" &&
-    mcp !== null &&
-    !Array.isArray(mcp) &&
-    !("servers" in mcp) &&
-    Object.values(mcp).some((server) => typeof server === "object" && server !== null && "type" in server)
-  )
+  return Object.keys(input).some((key) => keys.has(key))
 }
 
 export function migrate(info: typeof ConfigV1.Info.Type) {
   return {
     $schema: info.$schema,
     shell: info.shell,
-    model: modelSelection(info.model),
+    model: info.model,
     default_agent: info.default_agent,
     autoupdate: info.autoupdate,
     share: info.share ?? (info.autoshare ? "auto" : undefined),
@@ -74,39 +60,14 @@ export function migrate(info: typeof ConfigV1.Info.Type) {
       buffer: info.compaction.reserved,
     },
     skills: info.skills && [...(info.skills.paths ?? []), ...(info.skills.urls ?? [])],
-    commands: commands(info.command),
+    commands: info.command,
     instructions: info.instructions,
     references: info.references ?? info.reference,
-    experimental: experimental(info),
     plugins: info.plugin?.map((plugin) =>
       typeof plugin === "string" ? plugin : { package: plugin[0], options: plugin[1] },
     ),
+    experimental: info.experimental?.policies && { policies: info.experimental.policies },
     providers: providers(info.provider),
-  }
-}
-
-function experimental(info: typeof ConfigV1.Info.Type) {
-  const policies = [
-    ...(info.enabled_providers === undefined
-      ? []
-      : [
-          { action: "provider.use" as const, resource: "*", effect: "deny" as const },
-          ...info.enabled_providers.map((resource) => ({
-            action: "provider.use" as const,
-            resource,
-            effect: "allow" as const,
-          })),
-        ]),
-    ...(info.disabled_providers ?? []).map((resource) => ({
-      action: "provider.use" as const,
-      resource,
-      effect: "deny" as const,
-    })),
-  ]
-  if (info.experimental?.subagent_depth === undefined && !policies.length) return
-  return {
-    subagent_depth: info.experimental?.subagent_depth,
-    policies: policies.length ? policies : undefined,
   }
 }
 
@@ -118,9 +79,8 @@ function permissions(info?: ConfigPermissionV1.Info, tools?: Readonly<Record<str
     resource: "*",
     effect: enabled ? ("allow" as const) : ("deny" as const),
   }))
-  for (const [key, rule] of Object.entries(info ?? {})) {
+  for (const [action, rule] of Object.entries(info ?? {})) {
     if (!rule) continue
-    const action = normalizeAction(key)
     if (typeof rule === "string") {
       rules.push({ action, resource: "*", effect: rule })
       continue
@@ -130,12 +90,8 @@ function permissions(info?: ConfigPermissionV1.Info, tools?: Readonly<Record<str
   return rules.length ? rules : undefined
 }
 
-// Map v1 permission/tool keys onto their renamed v2 tool actions so migrated rules keep matching.
 function normalizeAction(action: string) {
-  if (action === "write" || action === "patch") return "edit"
-  if (action === "task") return "subagent"
-  if (action === "bash") return "shell"
-  return action
+  return action === "write" || action === "patch" ? "edit" : action
 }
 
 function agents(info: typeof ConfigV1.Info.Type) {
@@ -154,7 +110,8 @@ export function migrateAgent(info: ConfigAgentV1.Info) {
     ...(info.top_p === undefined ? {} : { top_p: info.top_p }),
   }
   return {
-    model: modelSelection(info.model, info.variant),
+    model: info.model,
+    variant: info.variant,
     request: Object.keys(body).length ? { body } : undefined,
     system: info.prompt,
     description: info.description,
@@ -167,32 +124,6 @@ export function migrateAgent(info: ConfigAgentV1.Info) {
   }
 }
 
-function commands(info?: Readonly<Record<string, ConfigCommandV1.Info>>) {
-  if (!info) return undefined
-  return Object.fromEntries(
-    Object.entries(info).map(([id, command]) => [
-      id,
-      {
-        template: command.template,
-        description: command.description,
-        agent: command.agent,
-        model: modelSelection(command.model, command.variant),
-        subtask: command.subtask,
-      },
-    ]),
-  )
-}
-
-function modelSelection(input?: string, variant?: string) {
-  if (input === undefined || !/^[^/#]+\/[^#]+$/.test(input)) return undefined
-  const separator = input.indexOf("/")
-  return {
-    providerID: input.slice(0, separator),
-    model: input.slice(separator + 1),
-    ...(variant === undefined || variant.length === 0 || variant.includes("#") ? {} : { variant }),
-  }
-}
-
 function mcp(info: typeof ConfigV1.Info.Type) {
   const servers = Object.fromEntries(
     Object.entries(info.mcp ?? {}).flatMap(([name, server]) =>
@@ -201,7 +132,7 @@ function mcp(info: typeof ConfigV1.Info.Type) {
   )
   const timeout = info.experimental?.mcp_timeout
   if (!timeout && !Object.keys(servers).length) return undefined
-  return { timeout: timeout === undefined ? undefined : { catalog: timeout, execution: timeout }, servers }
+  return { timeout: timeout === undefined ? undefined : { request: timeout }, servers }
 }
 
 function migrateMcp(info: ConfigMCPV1.Info) {
@@ -213,7 +144,7 @@ function migrateMcp(info: ConfigMCPV1.Info) {
       cwd: info.cwd,
       environment: info.environment,
       disabled,
-      timeout: info.timeout === undefined ? undefined : { catalog: info.timeout, execution: info.timeout },
+      timeout: info.timeout === undefined ? undefined : { request: info.timeout },
     }
   return {
     type: info.type,
@@ -227,7 +158,7 @@ function migrateMcp(info: ConfigMCPV1.Info) {
       redirect_uri: info.oauth.redirectUri,
     },
     disabled,
-    timeout: info.timeout === undefined ? undefined : { catalog: info.timeout, execution: info.timeout },
+    timeout: info.timeout === undefined ? undefined : { request: info.timeout },
   }
 }
 
@@ -237,22 +168,31 @@ function providers(info?: Readonly<Record<string, ConfigProviderV1.Info>>) {
 }
 
 function migrateProvider(info: ConfigProviderV1.Info) {
-  const options = ConfigProviderOptionsV1.provider(info.options ?? {})
+  const lowerer = ConfigProviderOptionsV1.get(info.npm)
+  const options = lowerer.provider(info.options ?? {})
+  const url = info.api ?? options.url
   return {
     name: info.name,
     env: info.env,
-    package: info.npm ? ProviderV2.aisdk(info.npm) : undefined,
-    settings: info.api ? { ...options.settings, baseURL: info.api } : options.settings,
-    headers: info.options && options.headers,
-    body: info.options && options.body,
+    api: info.npm
+      ? {
+          type: "aisdk" as const,
+          package: info.npm,
+          ...(url === undefined ? {} : { url }),
+          settings: options.settings ?? {},
+        }
+      : undefined,
+    request: info.options && { headers: options.headers, body: options.body },
     models:
       info.models &&
-      Object.fromEntries(Object.entries(info.models).map(([name, model]) => [name, migrateModel(model)])),
+      Object.fromEntries(Object.entries(info.models).map(([name, model]) => [name, migrateModel(model, info.npm)])),
   }
 }
 
-function migrateModel(info: typeof ConfigProviderV1.Model.Type) {
-  const settings = info.options && ConfigProviderOptionsV1.model(info.options)
+function migrateModel(info: typeof ConfigProviderV1.Model.Type, packageName?: string) {
+  const packageID = info.provider?.npm ?? packageName
+  const lowerer = ConfigProviderOptionsV1.get(packageID)
+  const request = info.options && lowerer.request(info.options)
   const costs = info.cost && [
     {
       input: info.cost.input,
@@ -275,18 +215,29 @@ function migrateModel(info: typeof ConfigProviderV1.Model.Type) {
       ? { tools: info.tool_call ?? false, input: info.modalities?.input ?? [], output: info.modalities?.output ?? [] }
       : undefined
   return {
-    modelID: info.id,
     family: info.family,
     name: info.name,
-    package: info.provider?.npm ? ProviderV2.aisdk(info.provider.npm) : undefined,
-    settings: info.provider?.api ? { ...settings, baseURL: info.provider.api } : settings,
+    api: info.provider?.npm
+      ? {
+          ...(info.id === undefined ? {} : { id: info.id }),
+          type: "aisdk" as const,
+          package: info.provider.npm,
+          ...(info.provider.api === undefined ? {} : { url: info.provider.api }),
+          settings: {},
+        }
+      : info.id === undefined
+        ? undefined
+        : { id: info.id },
     capabilities,
-    headers: info.headers,
+    request: (info.headers || request) && {
+      headers: info.headers,
+      body: request,
+    },
     variants:
       info.variants &&
       Object.entries(info.variants).map(([id, options]) => ({
         id,
-        settings: ConfigProviderOptionsV1.model(options),
+        body: lowerer.request(options),
       })),
     cost: costs,
     disabled: info.status === "deprecated" ? true : undefined,

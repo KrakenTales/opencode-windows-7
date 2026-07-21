@@ -4,9 +4,7 @@ export function collapseToolOutput(output: string, maxLines: number, maxChars: n
     return { output, overflow: false }
   }
 
-  const visible = lines.slice(0, maxLines)
-  if (lines.length > maxLines && visible.length > 0) visible[visible.length - 1] += "…"
-  const preview = visible.join("\n")
+  const preview = lines.slice(0, maxLines).join("\n")
   if (Array.from(preview).length > maxChars) {
     return {
       output:
@@ -17,5 +15,5 @@ export function collapseToolOutput(output: string, maxLines: number, maxChars: n
     }
   }
 
-  return { output: preview, overflow: true }
+  return { output: [...lines.slice(0, maxLines), "…"].join("\n"), overflow: true }
 }

@@ -20,6 +20,7 @@ import { Skill } from "@/skill"
 import { Discovery } from "@/skill/discovery"
 import { Question } from "@/question"
 import { Permission } from "@/permission"
+import { Todo } from "@/session/todo"
 import { Session } from "@/session/session"
 import { SessionStatus } from "@/session/status"
 import { SessionRunState } from "@/session/run-state"
@@ -47,7 +48,7 @@ import { ShareNext } from "@/share/share-next"
 import { SessionShare } from "@/share/session"
 import { Npm } from "@opencode-ai/core/npm"
 import { memoMap } from "@opencode-ai/core/effect/memo-map"
-import { Job } from "@/job"
+import { BackgroundJob } from "@/background/job"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -74,10 +75,11 @@ export const AppLayer = AppNodeBuilderV1.build(
     Discovery.node,
     Question.node,
     Permission.node,
+    Todo.node,
     Session.node,
     SessionProjector.node,
     SessionStatus.node,
-    Job.node,
+    BackgroundJob.node,
     RuntimeFlags.node,
     EventV2Bridge.node,
     SessionRunState.node,

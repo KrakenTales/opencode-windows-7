@@ -1,19 +1,18 @@
-export { isDefaultTitle } from "./title"
-import { createDefaultTitle } from "./title"
-
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Slug } from "@opencode-ai/core/util/slug"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import path from "path"
-import { Job } from "@/job"
+import { BackgroundJob } from "@/background/job"
 import { Decimal } from "decimal.js"
-import type { ProviderMetadata, Usage } from "@opencode-ai/ai"
+import type { ProviderMetadata, Usage } from "@opencode-ai/llm"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionV2 } from "@opencode-ai/core/session"
+import * as SessionExecutionLocal from "@opencode-ai/core/session/execution/local"
+import { locationServiceMapLayer } from "@opencode-ai/core/location-services"
 
 import { NotFoundError } from "@/storage/storage"
 import { eq } from "drizzle-orm"
@@ -46,6 +45,15 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionMessage } from "@opencode-ai/schema/session-message"
 
+const parentTitlePrefix = "New session - "
+const childTitlePrefix = "Child session - "
+
+export function isDefaultTitle(title: string) {
+  return new RegExp(
+    `^(${parentTitlePrefix}|${childTitlePrefix})\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$`,
+  ).test(title)
+}
+
 type SessionRow = typeof SessionTable.$inferSelect
 
 export function fromRow(row: SessionRow): Info {
@@ -64,7 +72,7 @@ export function fromRow(row: SessionRow): Info {
         messageID: MessageID.make(row.revert.messageID),
         partID: row.revert.partID ? PartID.make(row.revert.partID) : undefined,
         snapshot: row.revert.snapshot,
-        diff: "diff" in row.revert ? row.revert.diff : undefined,
+        diff: row.revert.diff,
       }
     : undefined
   return {
@@ -480,13 +488,13 @@ export type Patch = Omit<Partial<Info>, "time" | "share" | "summary" | "revert" 
 const layer: Layer.Layer<
   Service,
   never,
-  Job.Service | RuntimeFlags.Service | Database.Service | EventV2Bridge.Service
+  BackgroundJob.Service | RuntimeFlags.Service | Database.Service | EventV2Bridge.Service
 > = Layer.effect(
   Service,
   Effect.gen(function* () {
     const { db } = yield* Database.Service
     const database = yield* Database.Service
-    const jobs = yield* Job.Service
+    const background = yield* BackgroundJob.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
 
@@ -512,7 +520,7 @@ const layer: Layer.Layer<
         path: input.path,
         workspaceID: input.workspaceID,
         parentID: input.parentID,
-        title: input.title ?? createDefaultTitle(!!input.parentID),
+        title: input.title ?? (input.parentID ? childTitlePrefix : parentTitlePrefix) + new Date().toISOString(),
         agent: input.agent,
         model: input.model,
         metadata: input.metadata,
@@ -607,7 +615,7 @@ const layer: Layer.Layer<
           Effect.catchCause(() => Effect.succeed(false)),
         )
 
-        if (hasInstance) yield* cancelJobs(jobs, sessionID)
+        if (hasInstance) yield* cancelBackgroundJobs(background, sessionID)
         const kids = yield* children(sessionID)
         for (const child of kids) {
           yield* remove(child.id)
@@ -929,16 +937,19 @@ const layer: Layer.Layer<
   }),
 )
 
-const cancelJobs = Effect.fn("Session.cancelJobs")(function* (jobs: Job.Interface, sessionID: SessionID) {
-  const running = yield* jobs.list()
+const cancelBackgroundJobs = Effect.fn("Session.cancelBackgroundJobs")(function* (
+  background: BackgroundJob.Interface,
+  sessionID: SessionID,
+) {
+  const jobs = yield* background.list()
   yield* Effect.forEach(
-    running.filter((job) => {
+    jobs.filter((job) => {
       if (job.status !== "running") return false
       if (job.id === sessionID) return true
       if (job.metadata?.sessionId === sessionID) return true
       return job.metadata?.parentSessionId === sessionID
     }),
-    (job) => jobs.cancel(job.id),
+    (job) => background.cancel(job.id),
     { concurrency: "unbounded", discard: true },
   )
 })
@@ -1001,7 +1012,7 @@ function listByProject(
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [Job.node, RuntimeFlags.node, Database.node, EventV2Bridge.node],
+  deps: [BackgroundJob.node, RuntimeFlags.node, Database.node, EventV2Bridge.node],
 })
 
 export * as Session from "./session"

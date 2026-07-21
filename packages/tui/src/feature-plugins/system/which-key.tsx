@@ -2,7 +2,7 @@
 import { RGBA, TextAttributes, type KeyEvent, type Renderable } from "@opentui/core"
 import { useTerminalDimensions } from "@opentui/solid"
 import { createEffect, createMemo, createSignal, For, Show } from "solid-js"
-import { Keymap } from "../../context/keymap"
+import { useBindings, useKeymapSelector } from "../../keymap"
 import type { ActiveKey } from "@opentui/keymap"
 import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui"
 import type { BuiltinTuiPlugin } from "../builtins"
@@ -22,6 +22,8 @@ const command = {
 } as const
 
 const LAYER_PRIORITY = 900
+const KV_LAYOUT = "which_key_layout"
+const KV_PENDING_PREVIEW = "which_key_pending_preview"
 const toggleCommands = [command.toggle, command.toggleLayout, command.togglePending] as const
 const scrollCommands = [
   command.scrollUp,
@@ -153,9 +155,12 @@ function grouped(entries: Entry[]): Group[] {
     .toSorted((a, b) => a.label.localeCompare(b.label))
 }
 
-function commandShortcut(_api: TuiPluginApi, name: string) {
-  const shortcuts = Keymap.useShortcuts()
-  return () => shortcuts.get(name) ?? ""
+function commandShortcut(api: TuiPluginApi, name: string) {
+  return useKeymapSelector((keymap) =>
+    api.keys.formatSequence(
+      keymap.getCommandBindings({ visibility: "registered", commands: [name] }).get(name)?.[0]?.sequence,
+    ),
+  )
 }
 
 function layout(value: unknown): Layout {
@@ -186,8 +191,8 @@ function WhichKeyPanel(props: {
   const dimensions = useTerminalDimensions()
   const [offset, setOffset] = createSignal(0)
   const [activeGroup, setActiveGroup] = createSignal<string | undefined>()
-  const pending = Keymap.usePendingSequence()
-  const active = Keymap.useActiveKeys()
+  const pending = useKeymapSelector((keymap) => keymap.getPendingSequence())
+  const active = useKeymapSelector((keymap) => keymap.getActiveKeys({ includeMetadata: true }))
   const pendingActive = createMemo(() => pending().length > 0 && active().length > 0)
   const pendingAutoVisible = createMemo(() => props.mode() === "overlay" && props.pendingPreview() && pendingActive())
   const visible = createMemo(() => props.pinned() || pendingAutoVisible())
@@ -278,92 +283,86 @@ function WhichKeyPanel(props: {
     setOffset(0)
   }
 
-  Keymap.createLayer(() => ({
+  useBindings(() => ({
     priority: 1000,
     enabled: visible(),
     commands: [
       {
-        id: command.groupPrevious,
-        bind: false,
+        name: command.groupPrevious,
         title: "Previous key binding group",
-        description: "Show the previous which-key group",
-        group: "System",
+        desc: "Show the previous which-key group",
+        category: "System",
         run() {
           moveGroup(-1)
         },
       },
       {
-        id: command.groupNext,
-        bind: false,
+        name: command.groupNext,
         title: "Next key binding group",
-        description: "Show the next which-key group",
-        group: "System",
+        desc: "Show the next which-key group",
+        category: "System",
         run() {
           moveGroup(1)
         },
       },
       {
-        id: command.scrollUp,
-        bind: false,
+        name: command.scrollUp,
         title: "Scroll key bindings up",
-        description: "Scroll the which-key panel up",
-        group: "System",
+        desc: "Scroll the which-key panel up",
+        category: "System",
         run() {
           scroll(-columns())
         },
       },
       {
-        id: command.scrollDown,
-        bind: false,
+        name: command.scrollDown,
         title: "Scroll key bindings down",
-        description: "Scroll the which-key panel down",
-        group: "System",
+        desc: "Scroll the which-key panel down",
+        category: "System",
         run() {
           scroll(columns())
         },
       },
       {
-        id: command.pageUp,
-        bind: false,
+        name: command.pageUp,
         title: "Page key bindings up",
-        description: "Page the which-key panel up",
-        group: "System",
+        desc: "Page the which-key panel up",
+        category: "System",
         run() {
           scroll(-pageSize())
         },
       },
       {
-        id: command.pageDown,
-        bind: false,
+        name: command.pageDown,
         title: "Page key bindings down",
-        description: "Page the which-key panel down",
-        group: "System",
+        desc: "Page the which-key panel down",
+        category: "System",
         run() {
           scroll(pageSize())
         },
       },
       {
-        id: command.home,
-        bind: false,
+        name: command.home,
         title: "First key binding",
-        description: "Jump to the first which-key binding",
-        group: "System",
+        desc: "Jump to the first which-key binding",
+        category: "System",
         run() {
           setOffset(0)
         },
       },
       {
-        id: command.end,
-        bind: false,
+        name: command.end,
         title: "Last key binding",
-        description: "Jump to the last which-key binding",
-        group: "System",
+        desc: "Jump to the last which-key binding",
+        category: "System",
         run() {
           setOffset(maxOffset())
         },
       },
     ],
-    bindings: pendingMode() ? scrollCommands : panelCommands,
+    bindings: pendingMode()
+      ? props.api.tuiConfig.keybinds.gather("which-key.scroll", scrollCommands)
+      : props.api.tuiConfig.keybinds.gather("which-key.panel", panelCommands),
   }))
 
   createEffect(() => {
@@ -532,8 +531,8 @@ function WhichKeyPanel(props: {
 
 const tui: TuiPlugin = async (api) => {
   const [pinned, setPinned] = createSignal(false)
-  const [mode, setMode] = createSignal(layout("dock"))
-  const [pendingPreview, setPendingPreview] = createSignal(false)
+  const [mode, setMode] = createSignal(layout(api.kv.get(KV_LAYOUT, "dock")))
+  const [pendingPreview, setPendingPreview] = createSignal(api.kv.get(KV_PENDING_PREVIEW, false))
 
   api.keymap.registerLayer({
     priority: LAYER_PRIORITY,
@@ -555,6 +554,7 @@ const tui: TuiPlugin = async (api) => {
         run() {
           setMode((value) => {
             const next = value === "dock" ? "overlay" : "dock"
+            api.kv.set(KV_LAYOUT, next)
             return next
           })
         },
@@ -566,12 +566,13 @@ const tui: TuiPlugin = async (api) => {
         category: "System",
         run() {
           setPendingPreview((value) => {
+            api.kv.set(KV_PENDING_PREVIEW, !value)
             return !value
           })
         },
       },
     ],
-    bindings: toggleCommands.flatMap((command) => api.tuiConfig.keybinds.get(command)),
+    bindings: api.tuiConfig.keybinds.gather("which-key.toggle", toggleCommands),
   })
 
   api.slots.register({

@@ -1,5 +1,5 @@
 import { Schema } from "effect"
-import { statics } from "./schema.js"
+import { statics } from "./schema"
 
 export const ProjectID = Schema.String.pipe(
   Schema.brand("Project.ID"),

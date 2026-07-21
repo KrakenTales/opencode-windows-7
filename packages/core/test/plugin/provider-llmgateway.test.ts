@@ -21,7 +21,7 @@ const addPlugin = Effect.fn(function* () {
 
 describe("LLMGatewayPlugin", () => {
   it.effect("is registered so legacy referer headers can be applied", () =>
-    Effect.sync(() => expect(ProviderPlugins.map((item) => item.id)).toContain("opencode.provider.llmgateway")),
+    Effect.sync(() => expect(ProviderPlugins.map((item) => item.id)).toContain(PluginV2.ID.make("llmgateway"))),
   )
 
   it.effect("applies legacy referer headers only to enabled llmgateway", () =>
@@ -34,20 +34,23 @@ describe("LLMGatewayPlugin", () => {
       })
       yield* catalog.transform((catalog) => {
         catalog.provider.update(ProviderV2.ID.make("llmgateway"), (provider) => {
-          provider.package = ProviderV2.aisdk("@ai-sdk/openai-compatible")
-          provider.settings = { baseURL: "https://api.llmgateway.io/v1" }
-          provider.headers = { Existing: "value" }
+          provider.api = {
+            type: "aisdk",
+            package: "@ai-sdk/openai-compatible",
+            url: "https://api.llmgateway.io/v1",
+          }
+          provider.request = { headers: { Existing: "value" }, body: {} }
         })
         catalog.provider.update(ProviderV2.ID.openrouter, () => {})
       })
       yield* addPlugin()
-      expect((yield* catalog.provider.get(ProviderV2.ID.make("llmgateway")))?.headers).toEqual({
+      expect((yield* catalog.provider.get(ProviderV2.ID.make("llmgateway")))?.request.headers).toEqual({
         Existing: "value",
         "HTTP-Referer": "https://opencode.ai/",
         "X-Title": "opencode",
         "X-Source": "opencode",
       })
-      expect((yield* catalog.provider.get(ProviderV2.ID.openrouter))?.headers).toBeUndefined()
+      expect((yield* catalog.provider.get(ProviderV2.ID.openrouter))?.request.headers).toEqual({})
     }),
   )
 
@@ -61,14 +64,17 @@ describe("LLMGatewayPlugin", () => {
       yield* catalog.transform((catalog) => {
         catalog.provider.update(ProviderV2.ID.make("llmgateway"), (provider) => {
           provider.disabled = true
-          provider.package = ProviderV2.aisdk("@ai-sdk/openai-compatible")
-          provider.settings = { baseURL: "https://api.llmgateway.io/v1" }
+          provider.api = {
+            type: "aisdk",
+            package: "@ai-sdk/openai-compatible",
+            url: "https://api.llmgateway.io/v1",
+          }
         })
       })
       yield* addPlugin()
 
       expect((yield* catalog.provider.get(ProviderV2.ID.make("llmgateway")))?.disabled).toBe(true)
-      expect((yield* catalog.provider.get(ProviderV2.ID.make("llmgateway")))?.headers).toBeUndefined()
+      expect((yield* catalog.provider.get(ProviderV2.ID.make("llmgateway")))?.request.headers).toEqual({})
     }),
   )
 })

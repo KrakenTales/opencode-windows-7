@@ -2,6 +2,7 @@ export * as ConfigV1 from "./config"
 
 import { Schema } from "effect"
 import { NonNegativeInt, PositiveInt, type DeepMutable } from "../../schema"
+import { ConfigExperimental } from "../../config/experimental"
 import { ConfigReference } from "../../config/reference"
 import { ConfigAgentV1 } from "./agent"
 import { ConfigAttachmentV1 } from "./attachment"
@@ -175,14 +176,14 @@ export const Info = Schema.Struct({
       primary_tools: Schema.optional(Schema.mutable(Schema.Array(Schema.String))).annotate({
         description: "Tools that should only be available to primary agents.",
       }),
-      subagent_depth: Schema.optional(NonNegativeInt).annotate({
-        description: "Maximum subagent nesting depth. Defaults to 1.",
-      }),
       continue_loop_on_deny: Schema.optional(Schema.Boolean).annotate({
         description: "Continue the agent loop when a tool call is denied",
       }),
       mcp_timeout: Schema.optional(PositiveInt).annotate({
         description: "Timeout in milliseconds for model context protocol (MCP) requests",
+      }),
+      policies: Schema.optional(Schema.mutable(Schema.Array(ConfigExperimental.Policy))).annotate({
+        description: "Policy statements applied to supported resources, such as provider access",
       }),
     }),
   ),

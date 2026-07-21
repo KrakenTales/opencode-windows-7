@@ -1,30 +1,29 @@
-import { Plugin } from "@opencode-ai/plugin/v2/tui"
+import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui"
+import type { BuiltinTuiPlugin } from "../builtins"
 import { createMemo, For, Match, Show, Switch, createSignal } from "solid-js"
-import { useTheme } from "../../context/theme"
 
-function View(props: { context: Plugin.Context; sessionID: string }) {
+const id = "internal:sidebar-mcp"
+
+function View(props: { api: TuiPluginApi }) {
   const [open, setOpen] = createSignal(true)
-  const { themeV2 } = useTheme()
-  const session = createMemo(() => props.context.data.session.get(props.sessionID))
-  const list = createMemo(() => props.context.data.location.mcp.server.list(session()?.location) ?? [])
-  const on = createMemo(() => list().filter((item) => item.status.status === "connected").length)
+  const theme = () => props.api.theme.current
+  const list = createMemo(() => props.api.state.mcp())
+  const on = createMemo(() => list().filter((item) => item.status === "connected").length)
   const bad = createMemo(
     () =>
       list().filter(
         (item) =>
-          item.status.status === "failed" ||
-          item.status.status === "needs_auth" ||
-          item.status.status === "needs_client_registration",
+          item.status === "failed" || item.status === "needs_auth" || item.status === "needs_client_registration",
       ).length,
   )
 
   const dot = (status: string) => {
-    if (status === "connected") return themeV2.text.feedback.success()
-    if (status === "failed") return themeV2.text.feedback.error()
-    if (status === "disabled") return themeV2.text.subdued()
-    if (status === "needs_auth") return themeV2.text.feedback.warning()
-    if (status === "needs_client_registration") return themeV2.text.feedback.error()
-    return themeV2.text.subdued()
+    if (status === "connected") return theme().success
+    if (status === "failed") return theme().error
+    if (status === "disabled") return theme().textMuted
+    if (status === "needs_auth") return theme().warning
+    if (status === "needs_client_registration") return theme().error
+    return theme().textMuted
   }
 
   return (
@@ -32,12 +31,12 @@ function View(props: { context: Plugin.Context; sessionID: string }) {
       <box>
         <box flexDirection="row" gap={1} onMouseDown={() => list().length > 2 && setOpen((x) => !x)}>
           <Show when={list().length > 2}>
-            <text fg={themeV2.text()}>{open() ? "▼" : "▶"}</text>
+            <text fg={theme().text}>{open() ? "▼" : "▶"}</text>
           </Show>
-          <text fg={themeV2.text()}>
+          <text fg={theme().text}>
             <b>MCP</b>
             <Show when={!open()}>
-              <span style={{ fg: themeV2.text.subdued() }}>
+              <span style={{ fg: theme().textMuted }}>
                 {" "}
                 ({on()} active{bad() > 0 ? `, ${bad()} error${bad() > 1 ? "s" : ""}` : ""})
               </span>
@@ -51,22 +50,22 @@ function View(props: { context: Plugin.Context; sessionID: string }) {
                 <text
                   flexShrink={0}
                   style={{
-                    fg: dot(item.status.status),
+                    fg: dot(item.status),
                   }}
                 >
                   •
                 </text>
-                <text fg={themeV2.text()} wrapMode="word">
+                <text fg={theme().text} wrapMode="word">
                   {item.name}{" "}
-                  <span style={{ fg: themeV2.text.subdued() }}>
-                    <Switch fallback={item.status.status}>
-                      <Match when={item.status.status === "connected"}>Connected</Match>
-                      <Match when={item.status.status === "failed"}>
-                        <i>{item.status.status === "failed" ? item.status.error : undefined}</i>
+                  <span style={{ fg: theme().textMuted }}>
+                    <Switch fallback={item.status}>
+                      <Match when={item.status === "connected"}>Connected</Match>
+                      <Match when={item.status === "failed"}>
+                        <i>{item.error}</i>
                       </Match>
-                      <Match when={item.status.status === "disabled"}>Disabled</Match>
-                      <Match when={item.status.status === "needs_auth"}>Needs auth</Match>
-                      <Match when={item.status.status === "needs_client_registration"}>Needs client ID</Match>
+                      <Match when={item.status === "disabled"}>Disabled</Match>
+                      <Match when={item.status === "needs_auth"}>Needs auth</Match>
+                      <Match when={item.status === "needs_client_registration"}>Needs client ID</Match>
                     </Switch>
                   </span>
                 </text>
@@ -79,9 +78,20 @@ function View(props: { context: Plugin.Context; sessionID: string }) {
   )
 }
 
-export default Plugin.define({
-  id: "internal:sidebar-mcp",
-  setup(context) {
-    context.ui.slot("sidebar.content", (props) => <View context={context} sessionID={props.sessionID} />)
-  },
-})
+const tui: TuiPlugin = async (api) => {
+  api.slots.register({
+    order: 200,
+    slots: {
+      sidebar_content() {
+        return <View api={api} />
+      },
+    },
+  })
+}
+
+const plugin: BuiltinTuiPlugin = {
+  id,
+  tui,
+}
+
+export default plugin

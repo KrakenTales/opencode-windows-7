@@ -1,7 +1,7 @@
-import { Plugin } from "@opencode-ai/plugin/v2/effect"
+import { define } from "@opencode-ai/plugin/v2/effect"
 import { Effect } from "effect"
 
-export default Plugin.define({
+export default define({
   id: "config-effect-plugin",
   effect: (ctx) =>
     ctx.agent

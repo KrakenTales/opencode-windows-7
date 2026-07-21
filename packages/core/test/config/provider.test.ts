@@ -1,5 +1,4 @@
 import { describe, expect } from "bun:test"
-import { Money } from "@opencode-ai/schema/money"
 import { Effect, Schema } from "effect"
 import { Catalog } from "@opencode-ai/core/catalog"
 import { Config } from "@opencode-ai/core/config"
@@ -46,6 +45,13 @@ function withEnv<A, E, R>(vars: Record<string, string | undefined>, effect: () =
   )
 }
 
+function request(headers: Record<string, string>, variant?: string) {
+  return {
+    headers,
+    variant,
+  }
+}
+
 const decode = Schema.decodeUnknownSync(Config.Info)
 
 describe("ConfigProviderPlugin.Plugin", () => {
@@ -62,8 +68,7 @@ describe("ConfigProviderPlugin.Plugin", () => {
               info: decode({
                 providers: {
                   opencode: {
-                    package: "aisdk:@ai-sdk/openai",
-                    settings: { baseURL: "https://opencode.test/v1" },
+                    api: { type: "aisdk", package: "@ai-sdk/openai", url: "https://opencode.test/v1" },
                     models: {
                       "alpha-gpt-next": {
                         variants: [
@@ -114,8 +119,7 @@ describe("ConfigProviderPlugin.Plugin", () => {
               info: decode({
                 providers: {
                   opencode: {
-                    package: "aisdk:@ai-sdk/openai",
-                    settings: { baseURL: "https://opencode.test/v1" },
+                    api: { type: "aisdk", package: "@ai-sdk/openai", url: "https://opencode.test/v1" },
                   },
                 },
               }),
@@ -140,7 +144,7 @@ describe("ConfigProviderPlugin.Plugin", () => {
       yield* addPlugin(config)
 
       const model = required(yield* catalog.model.get(providerID, modelID))
-      expect(model.variants?.[0]).toMatchObject({
+      expect(model.variants[0]).toMatchObject({
         id: "high",
         body: { reasoningEffort: "high" },
       })
@@ -165,8 +169,8 @@ describe("ConfigProviderPlugin.Plugin", () => {
                     custom: {
                       name: "Configured",
                       env: ["CUSTOM_API_KEY"],
-                      package: "native",
-                      headers: { first: "first", shared: "first" },
+                      api: { type: "native", settings: {} },
+                      request: request({ first: "first", shared: "first" }),
                       models: {
                         chat: {
                           name: "First",
@@ -174,8 +178,7 @@ describe("ConfigProviderPlugin.Plugin", () => {
                           disabled: true,
                           limit: { context: 100, output: 50 },
                           cost: { input: 1, output: 2 },
-                          settings: { retained: true },
-                          headers: { first: "first", shared: "first" },
+                          request: request({ first: "first", shared: "first" }, "retained"),
                           variants: [
                             {
                               id: "fast",
@@ -194,18 +197,17 @@ describe("ConfigProviderPlugin.Plugin", () => {
                   model: "custom/default",
                   providers: {
                     custom: {
-                      package: "aisdk:custom-sdk",
-                      settings: { baseURL: "https://example.test" },
-                      headers: { last: "last", shared: "last" },
+                      api: { type: "aisdk", package: "custom-sdk", url: "https://example.test" },
+                      request: request({ last: "last", shared: "last" }),
                       models: {
                         default: {
                           name: "Default",
                         },
                         chat: {
-                          modelID: "api-chat",
+                          api: { id: "api-chat" },
                           name: "Last",
                           limit: { output: 75 },
-                          headers: { last: "last", shared: "last" },
+                          request: request({ last: "last", shared: "last" }),
                           variants: [
                             {
                               id: "fast",
@@ -245,34 +247,22 @@ describe("ConfigProviderPlugin.Plugin", () => {
         })
         expect((yield* integrations.get(Integration.ID.make("custom")))?.name).toBe("Renamed")
         expect(provider.disabled).toBeUndefined()
-        expect(provider.package).toBe("aisdk:custom-sdk")
-        expect(provider.settings).toEqual({ baseURL: "https://example.test" })
-        expect(provider.headers).toEqual({ first: "first", shared: "last", last: "last" })
-        expect(model.id).toBe(modelID)
-        expect(model.modelID).toBe(ModelV2.ID.make("api-chat"))
+        expect(provider.api).toEqual({ type: "aisdk", package: "custom-sdk", url: "https://example.test" })
+        expect(provider.request.headers).toEqual({ first: "first", shared: "last", last: "last" })
+        expect(model.api.id).toBe(ModelV2.ID.make("api-chat"))
         expect(model.name).toBe("Last")
         expect(model.capabilities).toEqual({ tools: true, input: ["text"], output: ["text"] })
         expect(model.enabled).toBe(false)
         expect(model.limit).toEqual({ context: 100, output: 75 })
-        expect(model.cost).toEqual([
-          {
-            input: Money.USDPerMillionTokens.make(1),
-            output: Money.USDPerMillionTokens.make(2),
-            cache: {
-              read: Money.USDPerMillionTokens.zero,
-              write: Money.USDPerMillionTokens.zero,
-            },
-            tier: undefined,
-          },
-        ])
-        expect(model.settings).toEqual({ baseURL: "https://example.test", retained: true })
-        expect(model.headers).toEqual({ first: "first", shared: "last", last: "last" })
-        expect(model.variants?.map((variant) => variant.id)).toEqual([
+        expect(model.cost).toEqual([{ input: 1, output: 2, cache: { read: 0, write: 0 }, tier: undefined }])
+        expect(model.request.headers).toEqual({ first: "first", shared: "last", last: "last" })
+        expect(model.request.variant).toBe("retained")
+        expect(model.variants.map((variant) => variant.id)).toEqual([
           ModelV2.VariantID.make("fast"),
           ModelV2.VariantID.make("slow"),
         ])
-        expect(model.variants?.[0]?.headers).toEqual({ first: "first", shared: "last", last: "last" })
-        expect(model.variants?.[1]?.headers).toEqual({ slow: "slow" })
+        expect(model.variants[0]?.headers).toEqual({ first: "first", shared: "last", last: "last" })
+        expect(model.variants[1]?.headers).toEqual({ slow: "slow" })
       }),
     ),
   )

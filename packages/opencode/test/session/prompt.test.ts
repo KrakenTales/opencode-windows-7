@@ -11,7 +11,7 @@ import path from "path"
 import { fileURLToPath } from "url"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Agent as AgentSvc } from "../../src/agent/agent"
-import { Job } from "@/job"
+import { BackgroundJob } from "@/background/job"
 import { Command } from "../../src/command"
 import { Config } from "@/config/config"
 import { LSP } from "@/lsp/lsp"
@@ -24,6 +24,7 @@ import { Git } from "../../src/git"
 import { Image } from "../../src/image/image"
 
 import { Question } from "../../src/question"
+import { Todo } from "../../src/session/todo"
 import { Session } from "@/session/session"
 import { SessionMessageTable } from "@opencode-ai/core/session/sql"
 import { LLM } from "../../src/session/llm"
@@ -42,7 +43,7 @@ import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { Skill } from "../../src/skill"
 import { SystemPrompt } from "../../src/session/system"
-import { ShellSelect } from "@opencode-ai/core/shell/select"
+import { Shell } from "@opencode-ai/core/shell"
 import { Snapshot } from "../../src/snapshot"
 import { ToolRegistry } from "@/tool/registry"
 import { Truncate } from "@/tool/truncate"
@@ -76,7 +77,7 @@ function withSh<A, E, R>(fx: () => Effect.Effect<A, E, R>) {
     Effect.sync(() => {
       const prev = process.env.SHELL
       process.env.SHELL = "/bin/sh"
-      ShellSelect.preferred.reset()
+      Shell.preferred.reset()
       return prev
     }),
     () => fx(),
@@ -84,7 +85,7 @@ function withSh<A, E, R>(fx: () => Effect.Effect<A, E, R>) {
       Effect.sync(() => {
         if (prev === undefined) delete process.env.SHELL
         else process.env.SHELL = prev
-        ShellSelect.preferred.reset()
+        Shell.preferred.reset()
       }),
   )
 }
@@ -184,12 +185,13 @@ const promptRoot = LayerNode.group([
   LSP.node,
   MCP.node,
   FSUtil.node,
-  Job.node,
+  BackgroundJob.node,
   SessionStatus.node,
   SessionRunState.node,
   Database.node,
   EventV2Bridge.node,
   Question.node,
+  Todo.node,
   ToolRegistry.node,
   Skill.node,
   Git.node,

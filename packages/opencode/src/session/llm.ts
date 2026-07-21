@@ -7,9 +7,9 @@ import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { Context, Effect, Layer } from "effect"
 import * as Stream from "effect/Stream"
 import { streamText, wrapLanguageModel, type ModelMessage, type Tool } from "ai"
-import type { LLMEvent } from "@opencode-ai/ai"
-import { LLMClient } from "@opencode-ai/ai/route"
-import type { LLMClientService } from "@opencode-ai/ai/route"
+import type { LLMEvent } from "@opencode-ai/llm"
+import { LLMClient } from "@opencode-ai/llm/route"
+import type { LLMClientService } from "@opencode-ai/llm/route"
 import { GitLabWorkflowLanguageModel } from "gitlab-ai-provider"
 import { ProviderTransform } from "@/provider/transform"
 import { Config } from "@/config/config"
@@ -25,7 +25,7 @@ import { Auth } from "@/auth"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import * as Option from "effect/Option"
-import * as OtelTracer from "@effect/opentelemetry/OtelTracer"
+import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
@@ -221,7 +221,7 @@ const live: Layer.Layer<
           })
         : undefined
 
-      // Runtime seam: native is an opt-in adapter over @opencode-ai/ai. It
+      // Runtime seam: native is an opt-in adapter over @opencode-ai/llm. It
       // either returns a ready LLMEvent stream or a concrete fallback reason.
       if (flags.experimentalNativeLlm) {
         const native = LLMNativeRuntime.stream({

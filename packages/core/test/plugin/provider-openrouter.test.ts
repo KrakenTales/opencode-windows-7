@@ -22,7 +22,7 @@ const addPlugin = Effect.fn(function* () {
 
 describe("OpenRouterPlugin", () => {
   it.effect("is registered so legacy OpenRouter behavior can be applied", () =>
-    Effect.sync(() => expect(ProviderPlugins.map((item) => item.id)).toContain("opencode.provider.openrouter")),
+    Effect.sync(() => expect(ProviderPlugins.map((item) => item.id)).toContain(PluginV2.ID.make("openrouter"))),
   )
 
   it.effect("applies legacy referer headers only to openrouter", () =>
@@ -30,19 +30,19 @@ describe("OpenRouterPlugin", () => {
       const catalog = yield* Catalog.Service
       yield* catalog.transform((catalog) => {
         catalog.provider.update(ProviderV2.ID.openrouter, (provider) => {
-          provider.package = ProviderV2.aisdk("@openrouter/ai-sdk-provider")
-          provider.headers = { Existing: "value" }
+          provider.api = { type: "aisdk", package: "@openrouter/ai-sdk-provider" }
+          provider.request = { headers: { Existing: "value" }, body: {} }
         })
         catalog.provider.update(ProviderV2.ID.make("nvidia"), () => {})
       })
       yield* addPlugin()
 
-      expect((yield* catalog.provider.get(ProviderV2.ID.openrouter))?.headers).toEqual({
+      expect((yield* catalog.provider.get(ProviderV2.ID.openrouter))?.request.headers).toEqual({
         Existing: "value",
         "HTTP-Referer": "https://opencode.ai/",
         "X-Title": "opencode",
       })
-      expect((yield* catalog.provider.get(ProviderV2.ID.make("nvidia")))?.headers).toBeUndefined()
+      expect((yield* catalog.provider.get(ProviderV2.ID.make("nvidia")))?.request.headers).toEqual({})
     }),
   )
 
@@ -55,8 +55,7 @@ describe("OpenRouterPlugin", () => {
       const ignored = yield* aisdk.runSDK({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.openrouter, ModelV2.ID.make("openai/gpt-5")),
-          modelID: ModelV2.ID.make("openai/gpt-5"),
-          package: ProviderV2.aisdk("test-provider"),
+          api: { id: ModelV2.ID.make("openai/gpt-5"), type: "aisdk", package: "test-provider" },
         }),
         package: "@ai-sdk/openai-compatible",
         options: { name: "openrouter" },
@@ -66,8 +65,7 @@ describe("OpenRouterPlugin", () => {
       const result = yield* aisdk.runSDK({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.make("custom"), ModelV2.ID.make("openai/gpt-5")),
-          modelID: ModelV2.ID.make("openai/gpt-5"),
-          package: ProviderV2.aisdk("test-provider"),
+          api: { id: ModelV2.ID.make("openai/gpt-5"), type: "aisdk", package: "test-provider" },
         }),
         package: "@openrouter/ai-sdk-provider",
         options: { name: "custom" },
@@ -81,7 +79,7 @@ describe("OpenRouterPlugin", () => {
       const catalog = yield* Catalog.Service
       yield* catalog.transform((catalog) => {
         catalog.provider.update(ProviderV2.ID.openrouter, (provider) => {
-          provider.package = ProviderV2.aisdk("@openrouter/ai-sdk-provider")
+          provider.api = { type: "aisdk", package: "@openrouter/ai-sdk-provider" }
         })
         catalog.provider.update(ProviderV2.ID.openai, () => {})
         catalog.model.update(ProviderV2.ID.openrouter, ModelV2.ID.make("openai/gpt-5-chat"), () => {})

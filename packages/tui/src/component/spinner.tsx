@@ -1,24 +1,20 @@
 import { Show } from "solid-js"
 import { useTheme } from "../context/theme"
-import { useConfig } from "../config"
+import { useKV } from "../context/kv"
 import type { JSX } from "@opentui/solid"
 import type { RGBA } from "@opentui/core"
 import { registerOpencodeSpinner } from "./register-spinner"
-import { SPINNER_FRAMES } from "./spinner-frames"
-
-export { SPINNER_FRAMES } from "./spinner-frames"
 
 registerOpencodeSpinner()
 
+export const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
 export function Spinner(props: { children?: JSX.Element; color?: RGBA }) {
-  const { themeV2 } = useTheme()
-  const config = useConfig().data
-  const color = () => props.color ?? themeV2.text.subdued()
+  const { theme } = useTheme()
+  const kv = useKV()
+  const color = () => props.color ?? theme.textMuted
   return (
-    <Show
-      when={config.animations ?? true}
-      fallback={<text fg={color()}>{props.children ? <>⋯ {props.children}</> : "⋯"}</text>}
-    >
+    <Show when={kv.get("animations_enabled", true)} fallback={<text fg={color()}>⋯ {props.children}</text>}>
       <box flexDirection="row" gap={1}>
         <spinner frames={SPINNER_FRAMES} interval={80} color={color()} />
         <Show when={props.children}>

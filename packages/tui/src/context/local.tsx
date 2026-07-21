@@ -1,26 +1,17 @@
 import { createStore } from "solid-js/store"
-import { dedupeWith } from "effect/Array"
 import { createSimpleContext } from "./helper"
 import { batch, createEffect, createMemo } from "solid-js"
+import { useSync } from "./sync"
 import { useEvent } from "./event"
 import path from "path"
 import { useTuiPaths } from "./runtime"
 import { useArgs } from "./args"
-import { useClient } from "./client"
+import { useSDK } from "./sdk"
 import { RGBA } from "@opentui/core"
 import { readJson, writeJsonAtomic } from "../util/persistence"
-import {
-  createModelPreferenceRepository,
-  cycleModelVariant,
-  modelPreferenceKey,
-  normalizeModelVariant,
-  type ModelPreference,
-  type ModelPreferenceModel,
-} from "../model-preference"
 import { useTheme } from "./theme"
 import { useToast } from "../ui/toast"
 import { useRoute } from "./route"
-import { useData } from "./data"
 import { usePermission } from "./permission"
 
 export type LocalTheme = {
@@ -42,13 +33,13 @@ export function parseModel(model: string) {
 }
 
 export function recentModels(
-  model: ModelPreferenceModel,
-  recent: ModelPreferenceModel[],
+  model: { providerID: string; modelID: string },
+  recent: { providerID: string; modelID: string }[],
 ) {
   const seen = new Set<string>()
   return [model, ...recent]
     .filter((item) => {
-      const key = modelPreferenceKey(item)
+      const key = `${item.providerID}/${item.modelID}`
       if (seen.has(key)) return false
       seen.add(key)
       return true
@@ -60,23 +51,22 @@ export function recentModels(
 export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
   name: "Local",
   init: () => {
-    const data = useData()
-    const client = useClient()
+    const sync = useSync()
+    const sdk = useSDK()
     const toast = useToast()
-    const { theme, themeV2, mode } = useTheme()
+    const theme = useTheme().theme
     const route = useRoute()
     const paths = useTuiPaths()
     const args = useArgs()
     const event = useEvent()
     const permission = usePermission()
 
-    function isModelValid(model: ModelPreferenceModel) {
-      return !!data.location.model
-        .list()
-        ?.some((item) => item.providerID === model.providerID && item.id === model.modelID)
+    function isModelValid(model: { providerID: string; modelID: string }) {
+      const provider = sync.data.provider.find((item) => item.id === model.providerID)
+      return !!provider?.models[model.modelID]
     }
 
-    function getFirstValidModel(...modelFns: (() => ModelPreferenceModel | undefined)[]) {
+    function getFirstValidModel(...modelFns: (() => { providerID: string; modelID: string } | undefined)[]) {
       for (const modelFn of modelFns) {
         const model = modelFn()
         if (!model) continue
@@ -85,56 +75,49 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
     }
 
     function createAgent() {
-      const agents = createMemo(() =>
-        (data.location.agent.list() ?? []).filter((agent) => agent.mode !== "subagent" && !agent.hidden),
-      )
-      const visibleAgents = createMemo(() => (data.location.agent.list() ?? []).filter((agent) => !agent.hidden))
+      const agents = createMemo(() => sync.data.agent.filter((agent) => agent.mode !== "subagent" && !agent.hidden))
+      const visibleAgents = createMemo(() => sync.data.agent.filter((agent) => !agent.hidden))
       const [agentStore, setAgentStore] = createStore({
         current: undefined as string | undefined,
       })
-      const colors = createMemo(() => {
-        const step = mode() === "light" ? 800 : 200
-        return dedupeWith(
-          [
-            themeV2.hue.blue(step),
-            themeV2.hue.purple(step),
-            themeV2.hue.green(step),
-            themeV2.hue.orange(step),
-            themeV2.hue.red(step),
-            themeV2.hue.cyan(step),
-          ],
-          (first, second) => first.equals(second),
-        )
-      })
+      const colors = createMemo(() => [
+        theme.secondary,
+        theme.accent,
+        theme.success,
+        theme.warning,
+        theme.primary,
+        theme.error,
+        theme.info,
+      ])
       return {
         list() {
           return agents()
         },
         current() {
-          return agents().find((agent) => agent.id === agentStore.current) ?? agents().at(0)
+          return agents().find((x) => x.name === agentStore.current) ?? agents().at(0)
         },
-        set(id: string) {
-          if (!agents().some((agent) => agent.id === id))
+        set(name: string) {
+          if (!agents().some((x) => x.name === name))
             return toast.show({
               variant: "warning",
-              message: `Agent not found: ${id}`,
+              message: `Agent not found: ${name}`,
               duration: 3000,
             })
-          setAgentStore("current", id)
+          setAgentStore("current", name)
         },
         move(direction: 1 | -1) {
           batch(() => {
             const current = this.current()
             if (!current) return
-            let next = agents().findIndex((agent) => agent.id === current.id) + direction
+            let next = agents().findIndex((x) => x.name === current.name) + direction
             if (next < 0) next = agents().length - 1
             if (next >= agents().length) next = 0
             const value = agents()[next]
-            setAgentStore("current", value.id)
+            setAgentStore("current", value.name)
           })
         },
-        color(id: string) {
-          const index = visibleAgents().findIndex((agent) => agent.id === id)
+        color(name: string) {
+          const index = visibleAgents().findIndex((x) => x.name === name)
           if (index === -1) return colors()[0]
           const agent = visibleAgents()[index]
 
@@ -152,12 +135,25 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
     const agent = createAgent()
 
     function createModel() {
-      const [modelStore, setModelStore] = createStore<
-        ModelPreference & {
-          ready: boolean
-          model: Record<string, ModelPreferenceModel>
-        }
-      >({
+      const [modelStore, setModelStore] = createStore<{
+        ready: boolean
+        model: Record<
+          string,
+          {
+            providerID: string
+            modelID: string
+          }
+        >
+        recent: {
+          providerID: string
+          modelID: string
+        }[]
+        favorite: {
+          providerID: string
+          modelID: string
+        }[]
+        variant: Record<string, string | undefined>
+      }>({
         ready: false,
         model: {},
         recent: [],
@@ -165,7 +161,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         variant: {},
       })
 
-      const repository = createModelPreferenceRepository(path.join(paths.state, "model.json"))
+      const filePath = path.join(paths.state, "model.json")
       const state = {
         pending: false,
       }
@@ -176,21 +172,21 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           return
         }
         state.pending = false
-        void repository
-          .patch({
-            recent: modelStore.recent,
-            favorite: modelStore.favorite,
-            variant: modelStore.variant,
-          })
-          .catch(() => undefined)
+        void writeJsonAtomic(filePath, {
+          recent: modelStore.recent,
+          favorite: modelStore.favorite,
+          variant: modelStore.variant,
+        })
       }
 
-      repository
-        .load()
-        .then((value) => {
-          setModelStore("recent", value.recent)
-          setModelStore("favorite", value.favorite)
-          setModelStore("variant", value.variant)
+      readJson<unknown>(filePath)
+        .then((x) => {
+          if (!x || typeof x !== "object") return
+          const value = x as Record<string, unknown>
+          if (Array.isArray(value.recent)) setModelStore("recent", value.recent)
+          if (Array.isArray(value.favorite)) setModelStore("favorite", value.favorite)
+          if (typeof value.variant === "object" && value.variant !== null)
+            setModelStore("variant", value.variant as Record<string, string | undefined>)
         })
         .catch(() => {})
         .finally(() => {
@@ -209,17 +205,31 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           }
         }
 
+        if (sync.data.config.model) {
+          const { providerID, modelID } = parseModel(sync.data.config.model)
+          if (isModelValid({ providerID, modelID })) {
+            return {
+              providerID,
+              modelID,
+            }
+          }
+        }
+
         for (const item of modelStore.recent) {
           if (isModelValid(item)) {
             return item
           }
         }
 
-        const model = data.location.model.list()?.[0]
+        const provider = sync.data.provider[0]
+        if (!provider) return undefined
+        const defaultModel = sync.data.provider_default[provider.id]
+        const firstModel = Object.values(provider.models)[0]
+        const model = defaultModel ?? firstModel?.id
         if (!model) return undefined
         return {
-          providerID: model.providerID,
-          modelID: model.id,
+          providerID: provider.id,
+          modelID: model,
         }
       })
 
@@ -227,8 +237,8 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         const a = agent.current()
         return (
           getFirstValidModel(
-            () => a && modelStore.model[a.id],
-            () => a?.model && { providerID: a.model.providerID, modelID: a.model.id },
+            () => a && modelStore.model[a.name],
+            () => a && a.model,
             fallbackModel,
           ) ?? undefined
         )
@@ -254,14 +264,12 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
               reasoning: false,
             }
           }
-          const provider = data.location.provider.list()?.find((item) => item.id === value.providerID)
-          const info = data.location.model
-            .list()
-            ?.find((item) => item.providerID === value.providerID && item.id === value.modelID)
+          const provider = sync.data.provider.find((item) => item.id === value.providerID)
+          const info = provider?.models[value.modelID]
           return {
             provider: provider?.name ?? value.providerID,
             model: info?.name ?? value.modelID,
-            reasoning: (info?.variants?.length ?? 0) !== 0,
+            reasoning: info?.capabilities?.reasoning ?? false,
           }
         }),
         cycle(direction: 1 | -1) {
@@ -277,7 +285,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           if (!val) return
           const a = agent.current()
           if (!a) return
-          setModelStore("model", a.id, { ...val })
+          setModelStore("model", a.name, { ...val })
         },
         cycleFavorite(direction: 1 | -1) {
           const favorites = modelStore.favorite.filter((item) => isModelValid(item))
@@ -305,7 +313,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           if (!next) return
           const a = agent.current()
           if (!a) return
-          setModelStore("model", a.id, { ...next })
+          setModelStore("model", a.name, { ...next })
           setModelStore("recent", recentModels(next, modelStore.recent))
           save()
         },
@@ -321,7 +329,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
             }
             const a = agent.current()
             if (!a) return
-            setModelStore("model", a.id, model)
+            setModelStore("model", a.name, model)
             if (options?.recent) {
               setModelStore("recent", recentModels(model, modelStore.recent))
               save()
@@ -355,31 +363,44 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           selected() {
             const m = currentModel()
             if (!m) return undefined
-            return normalizeModelVariant(modelStore.variant[modelPreferenceKey(m)])
+            const key = `${m.providerID}/${m.modelID}`
+            return modelStore.variant[key]
           },
           current() {
             const v = this.selected()
-            if (v && this.list().includes(v)) return v
-            return undefined
+            if (!v) return undefined
+            if (!this.list().includes(v)) return undefined
+            return v
           },
           list() {
             const m = currentModel()
             if (!m) return []
-            const info = data.location.model
-              .list()
-              ?.find((item) => item.providerID === m.providerID && item.id === m.modelID)
-            return info?.variants?.map((variant) => variant.id) ?? []
+            const provider = sync.data.provider.find((item) => item.id === m.providerID)
+            const info = provider?.models[m.modelID]
+            if (!info?.variants) return []
+            return Object.keys(info.variants)
           },
           set(value: string | undefined) {
             const m = currentModel()
             if (!m) return
-            setModelStore("variant", modelPreferenceKey(m), normalizeModelVariant(value))
+            const key = `${m.providerID}/${m.modelID}`
+            setModelStore("variant", key, value ?? "default")
             save()
           },
           cycle() {
             const variants = this.list()
             if (variants.length === 0) return
-            this.set(cycleModelVariant(this.current(), variants))
+            const current = this.current()
+            if (!current) {
+              this.set(variants[0])
+              return
+            }
+            const index = variants.indexOf(current)
+            if (index === -1 || index === variants.length - 1) {
+              this.set(undefined)
+              return
+            }
+            this.set(variants[index + 1])
           },
         },
       }
@@ -429,12 +450,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         })
 
       const slots = createMemo(() => {
-        const existing = new Set(
-          data.session
-            .list()
-            .filter((x) => x.parentID === undefined)
-            .map((x) => x.id),
-        )
+        const existing = new Set(sync.data.session.filter((x) => x.parentID === undefined).map((x) => x.id))
         return sessionStore.pinned.filter((id) => existing.has(id)).slice(0, 9)
       })
 
@@ -451,7 +467,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       }
 
       event.on("session.deleted", (evt) => {
-        prune(evt.data.sessionID)
+        prune(evt.properties.info.id)
       })
 
       return {
@@ -486,13 +502,30 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
 
     const session = createSession()
 
+    const mcp = {
+      isEnabled(name: string) {
+        const status = sync.data.mcp[name]
+        return status?.status === "connected"
+      },
+      async toggle(name: string) {
+        const status = sync.data.mcp[name]
+        if (status?.status === "connected") {
+          // Disable: disconnect the MCP
+          await sdk.client.mcp.disconnect({ name })
+        } else {
+          // Enable/Retry: connect the MCP (handles disabled, failed, and other states)
+          await sdk.client.mcp.connect({ name })
+        }
+      },
+    }
+
     createEffect(() => {
       const value = agent.current()
       if (!value?.model) return
-      if (isModelValid({ providerID: value.model.providerID, modelID: value.model.id })) return
+      if (isModelValid(value.model)) return
       toast.show({
         variant: "warning",
-        message: `Agent ${value.id}'s configured model ${value.model.providerID}/${value.model.id} is not valid`,
+        message: `Agent ${value.name}'s configured model ${value.model.providerID}/${value.model.modelID} is not valid`,
         duration: 3000,
       })
     })
@@ -500,6 +533,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
     const result = {
       model,
       agent,
+      mcp,
       session,
       permission,
     }

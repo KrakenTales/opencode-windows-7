@@ -1,10 +1,10 @@
-export * as SessionStatusEvent from "./session-status-event.js"
+export * as SessionStatusEvent from "./session-status-event"
 
 import { Schema } from "effect"
-import { optional } from "./schema.js"
-import { Event } from "./event.js"
-import { NonNegativeInt } from "./schema.js"
-import { SessionID } from "./session-id.js"
+import { optional } from "./schema"
+import { Event } from "./event"
+import { NonNegativeInt } from "./schema"
+import { SessionID } from "./session-id"
 
 export const Info = Schema.Union([
   Schema.Struct({
@@ -32,7 +32,7 @@ export const Info = Schema.Union([
 ]).annotate({ identifier: "SessionStatus" })
 export type Info = Schema.Schema.Type<typeof Info>
 
-export const Status = Event.ephemeral({
+export const Status = Event.define({
   type: "session.status",
   schema: {
     sessionID: SessionID,
@@ -41,7 +41,7 @@ export const Status = Event.ephemeral({
 })
 
 // deprecated
-export const Idle = Event.ephemeral({
+export const Idle = Event.define({
   type: "session.idle",
   schema: {
     sessionID: SessionID,

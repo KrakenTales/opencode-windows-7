@@ -1,15 +1,12 @@
-export * as LLM from "./llm.js"
+export * as LLM from "./llm"
 
 import { Schema } from "effect"
-import { optional } from "./schema.js"
+import { optional } from "./schema"
 
 export const ProviderMetadata = Schema.Record(Schema.String, Schema.Record(Schema.String, Schema.Unknown)).annotate({
   identifier: "LLM.ProviderMetadata",
 })
 export type ProviderMetadata = Schema.Schema.Type<typeof ProviderMetadata>
-
-export const FinishReason = Schema.Literals(["stop", "length", "tool-calls", "content-filter", "error", "unknown"])
-export type FinishReason = typeof FinishReason.Type
 
 export interface ToolTextContent extends Schema.Schema.Type<typeof ToolTextContent> {}
 export const ToolTextContent = Schema.Struct({

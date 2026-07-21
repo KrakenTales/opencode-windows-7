@@ -1,7 +1,7 @@
 export * as Database from "./database"
 
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
-import { layer } from "#sqlite"
+import { layer as sqliteLayer } from "#sqlite"
 import { Context, Effect, Layer } from "effect"
 import { Global } from "../global"
 import { Flag } from "../flag/flag"
@@ -19,7 +19,7 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/storage/Database") {}
 
-const databaseLayer = Layer.effect(
+const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const db = yield* makeDatabase
@@ -37,7 +37,7 @@ const databaseLayer = Layer.effect(
 )
 
 export function layerFromPath(filename: string) {
-  return databaseLayer.pipe(Layer.provide(layer({ filename })))
+  return layer.pipe(Layer.provide(sqliteLayer({ filename })))
 }
 
 export function path() {
@@ -54,10 +54,4 @@ export function path() {
   return join(Global.Path.data, `opencode-${InstallationChannel.replace(/[^a-zA-Z0-9._-]/g, "-")}.db`)
 }
 
-// Resolve the database path lazily so tests and embedders that set
-// Flag.OPENCODE_DB after module evaluation still control the storage target.
-export const node = makeGlobalNode({
-  service: Service,
-  layer: Layer.suspend(() => layerFromPath(path())),
-  deps: [],
-})
+export const node = makeGlobalNode({ service: Service, layer: layerFromPath(path()), deps: [] })

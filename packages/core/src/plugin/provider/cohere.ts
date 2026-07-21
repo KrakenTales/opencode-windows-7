@@ -1,11 +1,10 @@
 import { Effect } from "effect"
-import { define } from "@opencode-ai/plugin/v2/effect/plugin"
+import { define } from "../internal"
 
 export const CoherePlugin = define({
-  id: "opencode.provider.cohere",
+  id: "cohere",
   effect: Effect.fn(function* (ctx) {
-    yield* ctx.aisdk.hook(
-      "sdk",
+    yield* ctx.aisdk.sdk(
       Effect.fn(function* (evt) {
         if (evt.package !== "@ai-sdk/cohere") return
         const mod = yield* Effect.promise(() => import("@ai-sdk/cohere"))

@@ -1,7 +1,8 @@
 import * as Tool from "./tool"
 import DESCRIPTION from "./task.txt"
+import { ToolJsonSchema } from "./json-schema"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Job } from "@/job"
+import { BackgroundJob } from "@/background/job"
 import { Session } from "@/session/session"
 import { SessionID, MessageID } from "../session/schema"
 import { MessageV2 } from "../session/message-v2"
@@ -11,6 +12,7 @@ import type { SessionPrompt } from "../session/prompt"
 import { Config } from "@/config/config"
 import { Effect, Exit, Schema, Scope } from "effect"
 import { EffectBridge } from "@/effect/bridge"
+import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
 
 export interface TaskPromptOps {
@@ -31,11 +33,11 @@ const BACKGROUND_STARTED = [
   "DO NOT sleep, poll for progress, ask the task for status, or duplicate this task's work — avoid working with the same files or topics it is using.",
   "Work on non-overlapping tasks, or briefly tell the user what you launched and end your response.",
 ].join("\n")
-const BACKGROUND_ALREADY_RUNNING = [
-  "The task is already working in the background.",
+const BACKGROUND_UPDATED = [
+  "Additional context sent to the running background task.",
   "The task is still working in the background. You will be notified automatically when it finishes.",
   "DO NOT sleep, poll for progress, ask the task for status, or duplicate this task's work — avoid working with the same files or topics it is using.",
-  "Work on non-overlapping tasks, or briefly tell the user it is still running and end your response.",
+  "Work on non-overlapping tasks, or briefly tell the user what you sent and end your response.",
 ].join("\n")
 
 const BaseParameterFields = {
@@ -48,6 +50,8 @@ const BaseParameterFields = {
   }),
   command: Schema.optional(Schema.String).annotate({ description: "The command that triggered this task" }),
 }
+
+const BaseParameters = Schema.Struct(BaseParameterFields)
 
 export const Parameters = Schema.Struct({
   ...BaseParameterFields,
@@ -78,10 +82,11 @@ export const TaskTool = Tool.define(
   id,
   Effect.gen(function* () {
     const agent = yield* Agent.Service
-    const jobs = yield* Job.Service
+    const background = yield* BackgroundJob.Service
     const config = yield* Config.Service
     const sessions = yield* Session.Service
     const scope = yield* Scope.Scope
+    const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
 
     const run = Effect.fn("TaskTool.execute")(function* (
@@ -90,6 +95,11 @@ export const TaskTool = Tool.define(
     ) {
       const cfg = yield* config.get()
       const runInBackground = params.background === true
+      if (runInBackground && !flags.experimentalBackgroundSubagents) {
+        return yield* Effect.fail(
+          new Error("Background subagents require OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true"),
+        )
+      }
 
       const parent = yield* sessions.get(ctx.sessionID)
       let current = parent
@@ -131,6 +141,9 @@ export const TaskTool = Tool.define(
         subagent: next,
       })
       const childToolDenies = [
+        ...(next.permission.some((rule) => rule.permission === "todowrite")
+          ? []
+          : [{ permission: "todowrite" as const, pattern: "*" as const, action: "deny" as const }]),
         ...(next.permission.some((rule) => rule.permission === id)
           ? []
           : [{ permission: id, pattern: "*" as const, action: "deny" as const }]),
@@ -230,7 +243,7 @@ export const TaskTool = Tool.define(
       })
 
       const notify = Effect.fn("TaskTool.notifyBackgroundResult")(function* (jobID: string) {
-        yield* jobs.wait({ id: jobID }).pipe(
+        yield* background.wait({ id: jobID }).pipe(
           Effect.flatMap((result) => {
             if (result.info?.status === "completed") return inject("completed", result.info.output ?? "")
             if (result.info?.status === "error") return inject("error", result.info.error ?? "")
@@ -240,8 +253,7 @@ export const TaskTool = Tool.define(
         )
       })
 
-      const existing = yield* jobs.get(nextSession.id)
-      if (existing?.status === "running") {
+      if (yield* background.extend({ id: nextSession.id, run: runTask() })) {
         return {
           title: params.description,
           metadata: {
@@ -252,17 +264,24 @@ export const TaskTool = Tool.define(
           output: renderOutput({
             sessionID: nextSession.id,
             state: "running",
-            summary: "Background task already running",
-            text: BACKGROUND_ALREADY_RUNNING,
+            summary: "Background task updated",
+            text: BACKGROUND_UPDATED,
           }),
         }
       }
 
-      const info = yield* jobs.start({
+      const info = yield* background.start({
         id: nextSession.id,
         type: id,
         title: params.description,
         metadata,
+        onPromote: Effect.all([
+          ctx.metadata({
+            title: params.description,
+            metadata: { ...metadata, background: true, jobId: nextSession.id },
+          }),
+          notify(nextSession.id),
+        ]),
         run: runTask().pipe(Effect.onInterrupt(() => ops.cancel(nextSession.id))),
       })
 
@@ -284,7 +303,6 @@ export const TaskTool = Tool.define(
       }
 
       if (runInBackground) {
-        yield* jobs.background(info.id)
         yield* notify(info.id)
         return backgroundResult()
       }
@@ -302,27 +320,23 @@ export const TaskTool = Tool.define(
         }),
         () =>
           Effect.gen(function* () {
-            const result = yield* jobs.block({ id: nextSession.id, sessionID: ctx.sessionID })
-            if (result?.type === "backgrounded") {
-              yield* ctx.metadata({
-                title: params.description,
-                metadata: { ...metadata, background: true, jobId: nextSession.id },
-              })
-              yield* notify(nextSession.id)
-              return backgroundResult()
-            }
-            if (result?.info.status === "error")
-              return yield* Effect.fail(new Error(result.info.error ?? "Task failed"))
-            if (result?.info.status === "cancelled") return yield* Effect.fail(new Error("Task cancelled"))
+            const result = yield* Effect.raceFirst(
+              background.wait({ id: nextSession.id }).pipe(Effect.map((waited) => waited.info)),
+              background.waitForPromotion(nextSession.id),
+            )
+            if (result?.metadata?.background === true) return backgroundResult()
+            if (result?.status === "error") return yield* Effect.fail(new Error(result.error ?? "Task failed"))
+            if (result?.status === "cancelled") return yield* Effect.fail(new Error("Task cancelled"))
             return {
               title: params.description,
               metadata,
-              output: renderOutput({ sessionID: nextSession.id, state: "completed", text: result?.info.output ?? "" }),
+              output: renderOutput({ sessionID: nextSession.id, state: "completed", text: result?.output ?? "" }),
             }
           }),
         (_, exit) =>
           Effect.gen(function* () {
-            if (Exit.hasInterrupts(exit)) yield* Effect.all([cancel, jobs.cancel(nextSession.id)], { discard: true })
+            if (Exit.hasInterrupts(exit))
+              yield* Effect.all([cancel, background.cancel(nextSession.id)], { discard: true })
           }).pipe(
             Effect.ensuring(
               Effect.sync(() => {
@@ -334,8 +348,11 @@ export const TaskTool = Tool.define(
     })
 
     return {
-      description: [DESCRIPTION, BACKGROUND_DESCRIPTION].join("\n\n"),
+      description: flags.experimentalBackgroundSubagents
+        ? [DESCRIPTION, BACKGROUND_DESCRIPTION].join("\n\n")
+        : DESCRIPTION,
       parameters: Parameters,
+      jsonSchema: flags.experimentalBackgroundSubagents ? undefined : ToolJsonSchema.fromSchema(BaseParameters),
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
         run(params, ctx).pipe(Effect.orDie),
     }

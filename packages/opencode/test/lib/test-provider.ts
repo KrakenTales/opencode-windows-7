@@ -30,7 +30,7 @@ export function testProviderConfig(llmUrl: string) {
             options: {},
           },
         },
-        options: { apiKey: "test-key", baseURL: llmUrl, body: { apiKey: "test-key" } },
+        options: { apiKey: "test-key", baseURL: llmUrl },
       },
     },
   }

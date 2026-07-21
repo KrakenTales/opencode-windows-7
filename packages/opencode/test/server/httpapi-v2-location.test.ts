@@ -82,7 +82,7 @@ describe("v2 location HttpApi", () => {
     expect(
       Schema.decodeUnknownSync(Event)({
         id: "evt_test",
-        type: "filesystem.changed",
+        type: "file.watcher.updated",
         location: { directory: "/tmp/project" },
         data: {},
       }),

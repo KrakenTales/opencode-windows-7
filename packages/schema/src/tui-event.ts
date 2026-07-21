@@ -1,16 +1,16 @@
-export * as TuiEvent from "./tui-event.js"
+export * as TuiEvent from "./tui-event"
 
 import { Effect, Schema } from "effect"
-import { optional } from "./schema.js"
-import { Event } from "./event.js"
-import { PositiveInt } from "./schema.js"
-import { SessionID } from "./session-id.js"
+import { optional } from "./schema"
+import { Event } from "./event"
+import { PositiveInt } from "./schema"
+import { SessionID } from "./session-id"
 
 const DEFAULT_TOAST_DURATION = 5000
 
-export const PromptAppend = Event.ephemeral({ type: "tui.prompt.append", schema: { text: Schema.String } })
+export const PromptAppend = Event.define({ type: "tui.prompt.append", schema: { text: Schema.String } })
 
-export const CommandExecute = Event.ephemeral({
+export const CommandExecute = Event.define({
   type: "tui.command.execute",
   schema: {
     command: Schema.Union([
@@ -19,7 +19,6 @@ export const CommandExecute = Event.ephemeral({
         "session.new",
         "session.share",
         "session.interrupt",
-        "session.background",
         "session.compact",
         "session.page.up",
         "session.page.down",
@@ -38,7 +37,7 @@ export const CommandExecute = Event.ephemeral({
   },
 })
 
-export const ToastShow = Event.ephemeral({
+export const ToastShow = Event.define({
   type: "tui.toast.show",
   schema: {
     title: optional(Schema.String),
@@ -50,7 +49,7 @@ export const ToastShow = Event.ephemeral({
   },
 })
 
-export const SessionSelect = Event.ephemeral({
+export const SessionSelect = Event.define({
   type: "tui.session.select",
   schema: {
     sessionID: SessionID.annotate({ description: "Session ID to navigate to" }),

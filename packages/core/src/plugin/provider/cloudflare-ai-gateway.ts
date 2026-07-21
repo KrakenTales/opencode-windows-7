@@ -1,13 +1,12 @@
 import os from "os"
 import { InstallationVersion } from "../../installation/version"
 import { Effect, Option, Schema } from "effect"
-import { define } from "@opencode-ai/plugin/v2/effect/plugin"
+import { define } from "../internal"
 
 export const CloudflareAIGatewayPlugin = define({
-  id: "opencode.provider.cloudflare-ai-gateway",
+  id: "cloudflare-ai-gateway",
   effect: Effect.fn(function* (ctx) {
-    yield* ctx.aisdk.hook(
-      "sdk",
+    yield* ctx.aisdk.sdk(
       Effect.fn(function* (evt) {
         if (evt.package !== "ai-gateway-provider") return
         if (evt.options.baseURL) return

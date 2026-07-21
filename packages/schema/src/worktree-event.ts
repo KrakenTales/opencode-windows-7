@@ -1,10 +1,10 @@
-export * as WorktreeEvent from "./worktree-event.js"
+export * as WorktreeEvent from "./worktree-event"
 
 import { Schema } from "effect"
-import { optional } from "./schema.js"
-import { Event } from "./event.js"
+import { optional } from "./schema"
+import { Event } from "./event"
 
-export const Ready = Event.ephemeral({
+export const Ready = Event.define({
   type: "worktree.ready",
   schema: {
     name: Schema.String,
@@ -12,7 +12,7 @@ export const Ready = Event.ephemeral({
   },
 })
 
-export const Failed = Event.ephemeral({
+export const Failed = Event.define({
   type: "worktree.failed",
   schema: {
     message: Schema.String,

@@ -18,10 +18,6 @@ import { agentHost, host } from "../plugin/host"
 
 const it = testEffect(AppNodeBuilder.build(LayerNode.group([AgentV2.node, FSUtil.node, Global.node])))
 const decode = Schema.decodeUnknownSync(Config.Info)
-const defaultPermissions = [
-  { action: "*", resource: "*", effect: "allow" },
-  { action: "external_directory", resource: "*", effect: "ask" },
-] satisfies PermissionV2.Ruleset
 
 describe("ConfigAgentPlugin.Plugin", () => {
   it.effect("matches POSIX paths against home-relative permissions", () =>
@@ -33,9 +29,7 @@ describe("ConfigAgentPlugin.Plugin", () => {
       expect(PermissionV2.evaluate("external_directory", "/home/test/cache/files/*", permissions).effect).toBe("deny")
       expect(PermissionV2.evaluate("external_directory", "/some/~/path", permissions).effect).toBe("deny")
       expect(PermissionV2.evaluate("external_directory", "$HOMELESS/private/*", permissions).effect).toBe("deny")
-      expect(permissions).toContainEqual({ action: "shell", resource: "$HOME/private/**", effect: "deny" })
-      expect(permissions).not.toContainEqual({ action: "shell", resource: "/home/test/private/**", effect: "deny" })
-      expect(PermissionV2.evaluate("shell", "$HOME/private/key", permissions).effect).toBe("deny")
+      expect(PermissionV2.evaluate("bash", "$HOME/private/key", permissions).effect).toBe("deny")
     }),
   )
 
@@ -91,7 +85,7 @@ describe("ConfigAgentPlugin.Plugin", () => {
               info: decode({
                 permissions: [{ action: "read", resource: "*", effect: "allow" }],
                 agents: {
-                  reviewer: { model: "openrouter/openai/gpt-5#high", hidden: true },
+                  reviewer: { variant: "high", hidden: true },
                   removed: { disabled: true },
                   late: {
                     permissions: [{ action: "edit", resource: "*", effect: "allow" }],
@@ -109,7 +103,6 @@ describe("ConfigAgentPlugin.Plugin", () => {
       const buildAgent = yield* agents.get(build)
       if (!buildAgent) throw new Error("expected configured build agent")
       expect(buildAgent.permissions).toEqual([
-        ...defaultPermissions,
         { action: "bash", resource: "*", effect: "allow" },
         { action: "bash", resource: "*", effect: "ask" },
         { action: "read", resource: "*", effect: "allow" },
@@ -127,7 +120,6 @@ describe("ConfigAgentPlugin.Plugin", () => {
         model: { providerID: "openrouter", id: "openai/gpt-5", variant: "high" },
       })
       expect(reviewer.permissions).toEqual([
-        ...defaultPermissions,
         { action: "bash", resource: "*", effect: "ask" },
         { action: "read", resource: "*", effect: "allow" },
         { action: "edit", resource: "*", effect: "deny" },
@@ -135,7 +127,6 @@ describe("ConfigAgentPlugin.Plugin", () => {
       ])
       expect(PermissionV2.evaluate("read", "README.md", reviewer.permissions).effect).toBe("deny")
       expect((yield* agents.get(AgentV2.ID.make("late")))?.permissions).toEqual([
-        ...defaultPermissions,
         { action: "bash", resource: "*", effect: "ask" },
         { action: "read", resource: "*", effect: "allow" },
         { action: "edit", resource: "*", effect: "allow" },
@@ -199,10 +190,9 @@ describe("ConfigAgentPlugin.Plugin", () => {
         hidden: true,
         color: "warning",
         steps: 12,
-        model: { providerID: "anthropic", id: "claude-sonnet" },
+        model: { providerID: "anthropic", id: "claude-sonnet", variant: undefined },
       })
       expect(reviewer.request).toEqual({
-        settings: {},
         headers: { first: "one", shared: "last", second: "two" },
         body: { enabled: true, profile: "review", retries: 2, effort: "high" },
       })
@@ -294,13 +284,13 @@ Use native v2 fields.`,
             system: "Review carefully.",
             description: "Markdown description",
             request: { body: { temperature: 0.5 } },
-            permissions: [...defaultPermissions, { action: "edit", resource: "*", effect: "deny" }],
+            permissions: [{ action: "edit", resource: "*", effect: "deny" }],
           })
           expect(yield* agents.get(AgentV2.ID.make("team/helper"))).toMatchObject({ system: "Help the team." })
           expect(yield* agents.get(AgentV2.ID.make("native"))).toMatchObject({
             system: "Use native v2 fields.",
             request: { headers: { "x-agent": "native" }, body: { effort: "high" } },
-            permissions: [...defaultPermissions, { action: "edit", resource: "*", effect: "deny" }],
+            permissions: [{ action: "edit", resource: "*", effect: "deny" }],
           })
           expect(yield* agents.get(AgentV2.ID.make("disabled"))).toBeUndefined()
           expect(yield* agents.get(AgentV2.ID.make("plan"))).toMatchObject({ system: "Make a plan.", mode: "primary" })

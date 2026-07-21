@@ -5,13 +5,15 @@ The Effect plugin API grants plugins two in-process capabilities:
 - `hook` installs behavior at an OpenCode extension point.
 - `reload` reruns every transform hook for a stateful domain.
 
+The public server client will be exposed separately. It is intentionally not part of `PluginContext` yet.
+
 ## Defining A Plugin
 
 ```ts
-import { Plugin } from "@opencode-ai/plugin/v2/effect"
+import { define } from "@opencode-ai/plugin/v2/effect"
 import { Effect } from "effect"
 
-export default Plugin.define({
+export const Plugin = define({
   id: "example",
   effect: Effect.fn(function* (ctx) {
     yield* ctx.catalog.transform((catalog) => {
@@ -23,7 +25,7 @@ export default Plugin.define({
 })
 ```
 
-Plugin setup registers hooks imperatively through each domain's `hook` method.
+Plugin setup registers hooks imperatively. It does not return a hook object.
 
 Configuration supplied for the plugin is available as `ctx.options`.
 
@@ -62,8 +64,7 @@ Runtime hooks intercept live operations rather than rebuilding domain state:
 
 ```ts
 yield *
-  ctx.aisdk.hook(
-    "sdk",
+  ctx.aisdk.sdk(
     Effect.fn(function* (event) {
       if (event.package !== "@ai-sdk/xai") return
       const mod = yield* Effect.promise(() => import("@ai-sdk/xai"))
@@ -72,25 +73,13 @@ yield *
   )
 
 yield *
-  ctx.aisdk.hook("language", (event) => {
+  ctx.aisdk.language((event) => {
     if (event.model.providerID !== "xai") return
     event.language = event.sdk.responses(event.model.api.id)
   })
 ```
 
 Hooks run sequentially in registration order. Later hooks observe mutations made by earlier hooks.
-
-Session context is mutable immediately before provider dispatch:
-
-```ts
-yield *
-  ctx.session.hook("context", (event) =>
-    Effect.sync(() => {
-      event.tools.read.description = "Read a file using narrow line ranges."
-      delete event.tools.write
-    }),
-  )
-```
 
 ## Reloading A Domain
 

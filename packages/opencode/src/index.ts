@@ -18,7 +18,8 @@ import { McpCommand } from "./cli/cmd/mcp"
 import { GithubCommand } from "./cli/cmd/github"
 import { ExportCommand } from "./cli/cmd/export"
 import { ImportCommand } from "./cli/cmd/import"
-import { V2ServeCommand } from "./cli/cmd/v2-serve"
+import { AttachCommand } from "./cli/cmd/attach"
+import { TuiThreadCommand } from "./cli/cmd/tui"
 import { AcpCommand } from "./cli/cmd/acp"
 import { EOL } from "os"
 import { WebCommand } from "./cli/cmd/web"
@@ -79,7 +80,8 @@ const cli = yargs(args)
   .completion("completion", "generate shell completion script")
   .command(AcpCommand)
   .command(McpCommand)
-  .command(V2ServeCommand)
+  .command(TuiThreadCommand)
+  .command(AttachCommand)
   .command(RunCommand)
   .command(GenerateCommand)
   .command(DebugCommand)
