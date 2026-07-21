@@ -1,7 +1,7 @@
 import { NodeFileSystem } from "@effect/platform-node"
-import { dirname, isAbsolute, join, relative, resolve as pathResolve, sep } from "path"
+import path, { dirname, isAbsolute, join, relative, sep } from "path"
 import { realpathSync } from "fs"
-import * as NFS from "fs/promises"
+import { readdir } from "fs/promises"
 import { lookup } from "mime-types"
 import { Context, Effect, FileSystem, Layer, Schema } from "effect"
 import type { PlatformError } from "effect/PlatformError"
@@ -42,7 +42,7 @@ export namespace FSUtil {
     readonly findUp: (target: string, start: string, stop?: string) => Effect.Effect<string[], Error>
     readonly up: (options: { targets: string[]; start: string; stop?: string }) => Effect.Effect<string[], Error>
     readonly globUp: (pattern: string, start: string, stop?: string) => Effect.Effect<string[], Error>
-    readonly glob: (pattern: string, options?: Glob.Options) => Effect.Effect<string[], Error>
+    readonly scan: (pattern: string, options?: Glob.Options) => Effect.Effect<string[], Error>
     readonly globMatch: (pattern: string, filepath: string) => boolean
   }
 
@@ -50,7 +50,9 @@ export namespace FSUtil {
 
   export const use = serviceUse(Service)
 
-  const layer = Layer.effect(
+  // Exported so simulation can wrap this layer and override the methods that
+  // bypass the injected FileSystem (readDirectoryEntries, scan, globUp).
+  export const layer = Layer.effect(
     Service,
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem
@@ -79,7 +81,7 @@ export namespace FSUtil {
       const readDirectoryEntries = Effect.fn("FileSystem.readDirectoryEntries")(function* (dirPath: string) {
         return yield* Effect.tryPromise({
           try: async () => {
-            const entries = await NFS.readdir(dirPath, { withFileTypes: true })
+            const entries = await readdir(dirPath, { withFileTypes: true })
             return entries.map(
               (e): DirEntry => ({
                 name: e.name,
@@ -91,8 +93,8 @@ export namespace FSUtil {
         })
       })
 
-      const resolve = Effect.fn("FileSystem.resolve")(function* (path: string) {
-        const resolved = pathResolve(windowsPath(path))
+      const resolve = Effect.fn("FileSystem.resolve")(function* (input: string) {
+        const resolved = path.resolve(windowsPath(input))
         return yield* fs.realPath(resolved).pipe(
           Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed(resolved)),
           Effect.orDie,
@@ -144,7 +146,7 @@ export namespace FSUtil {
         if (mode) yield* fs.chmod(path, mode)
       })
 
-      const glob = Effect.fn("FileSystem.glob")(function* (pattern: string, options?: Glob.Options) {
+      const scan = Effect.fn("FileSystem.scan")(function* (pattern: string, options?: Glob.Options) {
         return yield* Effect.tryPromise({
           try: () => Glob.scan(pattern, options),
           catch: (cause) => new FileSystemError({ method: "glob", cause }),
@@ -185,7 +187,7 @@ export namespace FSUtil {
         const result: string[] = []
         let current = start
         while (true) {
-          const matches = yield* glob(pattern, { cwd: current, absolute: true, include: "file", dot: true }).pipe(
+          const matches = yield* scan(pattern, { cwd: current, absolute: true, include: "file", dot: true }).pipe(
             Effect.catch(() => Effect.succeed([] as string[])),
           )
           result.push(...matches)
@@ -212,7 +214,7 @@ export namespace FSUtil {
         findUp,
         up,
         globUp,
-        glob,
+        scan,
         globMatch: Glob.match,
       })
     }),
@@ -227,7 +229,7 @@ export namespace FSUtil {
 
   export function normalizePath(p: string): string {
     if (process.platform !== "win32") return p
-    const resolved = pathResolve(windowsPath(p))
+    const resolved = path.resolve(windowsPath(p))
     try {
       return realpathSync.native(resolved)
     } catch {
@@ -245,7 +247,7 @@ export namespace FSUtil {
   }
 
   export function resolve(p: string): string {
-    const resolved = pathResolve(windowsPath(p))
+    const resolved = path.resolve(windowsPath(p))
     try {
       return normalizePath(realpathSync(resolved))
     } catch (e: any) {

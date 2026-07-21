@@ -1,14 +1,30 @@
-export * as Project from "./project"
+export * as Project from "./project.js"
 
 import { Schema } from "effect"
-import { define, inventory } from "./event"
-import { NonNegativeInt, optional } from "./schema"
-import { ProjectID } from "./project-id"
+import { ephemeral, inventory } from "./event.js"
+import { AbsolutePath, NonNegativeInt, optional } from "./schema.js"
+import { ProjectID } from "./project-id.js"
 
 export const ID = ProjectID
 export type ID = typeof ID.Type
 
-export const Vcs = Schema.Literal("git").annotate({ identifier: "Project.Vcs" })
+export const Vcs = Schema.Literals(["git", "hg"]).annotate({ identifier: "Project.Vcs" })
+export const Current = Schema.Struct({
+  id: ID,
+  directory: AbsolutePath,
+}).annotate({ identifier: "Project.Current" })
+export interface Current extends Schema.Schema.Type<typeof Current> {}
+export const Directory = Schema.Struct({
+  directory: AbsolutePath,
+  strategy: optional(Schema.String),
+}).annotate({ identifier: "Project.Directory" })
+export interface Directory extends Schema.Schema.Type<typeof Directory> {}
+export const DirectoriesInput = Schema.Struct({
+  projectID: ID,
+}).annotate({ identifier: "Project.DirectoriesInput" })
+export interface DirectoriesInput extends Schema.Schema.Type<typeof DirectoriesInput> {}
+export const Directories = Schema.Array(Directory).annotate({ identifier: "Project.Directories" })
+export type Directories = typeof Directories.Type
 export const Icon = Schema.Struct({
   url: optional(Schema.String),
   override: optional(Schema.String),
@@ -40,5 +56,5 @@ export const Info = Schema.Struct({
 }).annotate({ identifier: "Project" })
 export interface Info extends Schema.Schema.Type<typeof Info> {}
 
-const Updated = define({ type: "project.updated", schema: Info.fields })
+const Updated = ephemeral({ type: "project.updated", schema: Info.fields })
 export const Event = { Updated, Definitions: inventory(Updated) }

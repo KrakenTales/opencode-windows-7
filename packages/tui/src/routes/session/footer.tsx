@@ -1,21 +1,24 @@
 import { createMemo, Match, onCleanup, onMount, Show, Switch } from "solid-js"
 import { useTheme } from "../../context/theme"
-import { useSync } from "../../context/sync"
+import { useData } from "../../context/data"
 import { useDirectory } from "../../context/directory"
 import { useConnected } from "../../component/use-connected"
 import { createStore } from "solid-js/store"
 import { useRoute } from "../../context/route"
 
 export function Footer() {
-  const { theme } = useTheme()
-  const sync = useSync()
+  const { themeV2 } = useTheme()
+  const data = useData()
   const route = useRoute()
-  const mcp = createMemo(() => Object.values(sync.data.mcp).filter((x) => x.status === "connected").length)
-  const mcpError = createMemo(() => Object.values(sync.data.mcp).some((x) => x.status === "failed"))
-  const lsp = createMemo(() => Object.keys(sync.data.lsp))
+  const mcp = createMemo(
+    () => (data.location.mcp.server.list() ?? []).filter((x) => x.status.status === "connected").length,
+  )
+  const mcpError = createMemo(() =>
+    (data.location.mcp.server.list() ?? []).some((x) => x.status.status === "failed"),
+  )
   const permissions = createMemo(() => {
     if (route.data.type !== "session") return []
-    return sync.data.permission[route.data.sessionID] ?? []
+    return data.session.permission.list(route.data.sessionID) ?? []
   })
   const directory = useDirectory()
   const connected = useConnected()
@@ -51,38 +54,35 @@ export function Footer() {
 
   return (
     <box flexDirection="row" justifyContent="space-between" gap={1} flexShrink={0}>
-      <text fg={theme.textMuted}>{directory()}</text>
+      <text fg={themeV2.text.subdued()}>{directory()}</text>
       <box gap={2} flexDirection="row" flexShrink={0}>
         <Switch>
           <Match when={store.welcome}>
-            <text fg={theme.text}>
-              Get started <span style={{ fg: theme.textMuted }}>/connect</span>
+            <text fg={themeV2.text()}>
+              Get started <span style={{ fg: themeV2.text.subdued() }}>/connect</span>
             </text>
           </Match>
           <Match when={connected()}>
             <Show when={permissions().length > 0}>
-              <text fg={theme.warning}>
-                <span style={{ fg: theme.warning }}>△</span> {permissions().length} Permission
+              <text fg={themeV2.text.feedback.warning()}>
+                <span style={{ fg: themeV2.text.feedback.warning() }}>△</span> {permissions().length} Permission
                 {permissions().length > 1 ? "s" : ""}
               </text>
             </Show>
-            <text fg={theme.text}>
-              <span style={{ fg: lsp().length > 0 ? theme.success : theme.textMuted }}>•</span> {lsp().length} LSP
-            </text>
             <Show when={mcp()}>
-              <text fg={theme.text}>
+              <text fg={themeV2.text()}>
                 <Switch>
                   <Match when={mcpError()}>
-                    <span style={{ fg: theme.error }}>⊙ </span>
+                    <span style={{ fg: themeV2.text.feedback.error() }}>⊙ </span>
                   </Match>
                   <Match when={true}>
-                    <span style={{ fg: theme.success }}>⊙ </span>
+                    <span style={{ fg: themeV2.text.feedback.success() }}>⊙ </span>
                   </Match>
                 </Switch>
                 {mcp()} MCP
               </text>
             </Show>
-            <text fg={theme.textMuted}>/status</text>
+            <text fg={themeV2.text.subdued()}>/status</text>
           </Match>
         </Switch>
       </box>

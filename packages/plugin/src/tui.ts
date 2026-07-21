@@ -1,11 +1,7 @@
 import type {
-  AgentPart,
   OpencodeClient,
-  Event,
-  FilePart,
   LspStatus,
   McpStatus,
-  Todo,
   Message,
   Part,
   Provider,
@@ -13,9 +9,11 @@ import type {
   QuestionRequest,
   Session,
   SessionStatus,
-  TextPart,
   Config as SdkConfig,
 } from "@opencode-ai/sdk/v2"
+import type { OpenCodeEvent } from "@opencode-ai/client/promise"
+import type { PromptInput } from "@opencode-ai/schema"
+import type { Types } from "effect"
 import type { CliRenderer, KeyEvent, RGBA, Renderable, SlotMode } from "@opentui/core"
 import type { Binding, Keymap } from "@opentui/keymap"
 import {
@@ -180,22 +178,16 @@ export type TuiDialogSelectProps<Value = unknown> = {
   current?: Value
 }
 
-export type TuiPromptInfo = {
-  input: string
+export type TuiPromptInfo = Types.DeepMutable<PromptInput.Prompt> & {
+  pasted: {
+    text: string
+    source: {
+      start: number
+      end: number
+      text: string
+    }
+  }[]
   mode?: "normal" | "shell"
-  parts: (
-    | Omit<FilePart, "id" | "messageID" | "sessionID">
-    | Omit<AgentPart, "id" | "messageID" | "sessionID">
-    | (Omit<TextPart, "id" | "messageID" | "sessionID"> & {
-        source?: {
-          text: {
-            start: number
-            end: number
-            value: string
-          }
-        }
-      })
-  )[]
 }
 
 export type TuiPromptRef = {
@@ -366,6 +358,7 @@ export type TuiTheme = {
   readonly ready: boolean
 }
 
+/** @deprecated Persistent TUI KV storage is not supported in V2. */
 export type TuiKV = {
   get: <Value = unknown>(key: string, fallback?: Value) => Value
   set: (key: string, value: unknown) => void
@@ -387,7 +380,6 @@ export type TuiState = {
     count: () => number
     get: (sessionID: string) => Session | undefined
     diff: (sessionID: string) => ReadonlyArray<TuiSidebarFileItem>
-    todo: (sessionID: string) => ReadonlyArray<TuiSidebarTodoItem>
     messages: (sessionID: string) => ReadonlyArray<Message>
     status: (sessionID: string) => SessionStatus | undefined
     permission: (sessionID: string) => ReadonlyArray<PermissionRequest>
@@ -416,13 +408,41 @@ type TuiAttentionConfigView = {
   sounds: Partial<Record<TuiAttentionSoundName, string>>
 }
 
-type TuiConfigView = Pick<PluginConfig, "$schema" | "theme" | "plugin"> &
-  NonNullable<PluginConfig["tui"]> & {
-    leader_timeout: number
-    attention: TuiAttentionConfigView
-    plugin_enabled?: Record<string, boolean>
-    keybinds: TuiBindingLookupView
+type TuiConfigView = {
+  $schema?: string
+  theme?: string | { name?: string; mode?: "system" | "dark" | "light" }
+  plugin?: PluginConfig["plugin"]
+  plugins?: ReadonlyArray<string | { package: string; options?: Record<string, any> }>
+  plugin_enabled?: Record<string, boolean>
+  leader?: { timeout: number }
+  leader_timeout?: number
+  scroll?: { speed?: number; acceleration?: boolean }
+  scroll_speed?: number
+  scroll_acceleration?: { enabled: boolean }
+  attention: TuiAttentionConfigView
+  diffs?: {
+    wrap?: "word" | "none"
+    tree?: boolean
+    single?: boolean
+    view?: "auto" | "split" | "unified"
   }
+  diff_style?: "auto" | "stacked"
+  terminal?: { title?: boolean }
+  prompt?:
+    | { editor?: boolean; paste?: "compact" | "full" }
+    | { max_height?: number; max_width?: number | "auto" }
+  session?: {
+    sidebar?: "auto" | "hide"
+    scrollbar?: boolean
+    thinking?: "show" | "hide"
+    markdown?: "source" | "rendered"
+    grouping?: "auto" | "none"
+  }
+  hints?: { onboarding?: boolean }
+  animations?: boolean
+  mouse: boolean
+  keybinds: TuiBindingLookupView
+}
 
 export type TuiApp = {
   readonly version: string
@@ -443,8 +463,6 @@ export type TuiSidebarMcpItem = {
 }
 
 export type TuiSidebarLspItem = Pick<LspStatus, "id" | "root" | "status">
-
-export type TuiSidebarTodoItem = Pick<Todo, "content" | "status">
 
 export type TuiSidebarFileItem = {
   file: string
@@ -482,6 +500,7 @@ export type TuiHostSlotMap = {
   }
   sidebar_footer: {
     session_id: string
+    directory: string
   }
 }
 
@@ -517,7 +536,10 @@ export type TuiSlots = {
 }
 
 export type TuiEventBus = {
-  on: <Type extends Event["type"]>(type: Type, handler: (event: Extract<Event, { type: Type }>) => void) => () => void
+  on: <Type extends OpenCodeEvent["type"]>(
+    type: Type,
+    handler: (event: Extract<OpenCodeEvent, { type: Type }>) => void,
+  ) => () => void
 }
 
 export type TuiDispose = () => void | Promise<void>
@@ -608,6 +630,7 @@ export type TuiPluginApi = {
     dialog: TuiDialogStack
   }
   readonly tuiConfig: Frozen<TuiConfigView>
+  /** @deprecated Persistent TUI KV storage is not supported in V2. */
   kv: TuiKV
   state: TuiState
   theme: TuiTheme

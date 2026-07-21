@@ -1,12 +1,12 @@
-export * as Integration from "./integration"
+export * as Integration from "./integration.js"
 
 import { Schema } from "effect"
-import { optional } from "./schema"
-import { define, inventory } from "./event"
-import { Connection } from "./connection"
-import { ascending } from "./identifier"
-import { statics } from "./schema"
-import { IntegrationID, IntegrationMethodID } from "./integration-id"
+import { optional } from "./schema.js"
+import { ephemeral, inventory } from "./event.js"
+import { Connection } from "./connection.js"
+import { ascending } from "./identifier.js"
+import { statics } from "./schema.js"
+import { IntegrationID, IntegrationMethodID } from "./integration-id.js"
 
 export const ID = IntegrationID
 export type ID = typeof ID.Type
@@ -56,6 +56,14 @@ export const OAuthMethod = Schema.Struct({
   prompts: optional(Schema.Array(Prompt)),
 }).annotate({ identifier: "Integration.OAuthMethod" })
 
+export interface CommandMethod extends Schema.Schema.Type<typeof CommandMethod> {}
+export const CommandMethod = Schema.Struct({
+  id: MethodID,
+  type: Schema.Literal("command"),
+  label: Schema.String,
+  command: Schema.Array(Schema.String),
+}).annotate({ identifier: "Integration.CommandMethod" })
+
 export interface KeyMethod extends Schema.Schema.Type<typeof KeyMethod> {}
 export const KeyMethod = Schema.Struct({
   type: Schema.Literal("key"),
@@ -68,7 +76,7 @@ export const EnvMethod = Schema.Struct({
   names: Schema.Array(Schema.String),
 }).annotate({ identifier: "Integration.EnvMethod" })
 
-export const Method = Schema.Union([OAuthMethod, KeyMethod, EnvMethod])
+export const Method = Schema.Union([OAuthMethod, CommandMethod, KeyMethod, EnvMethod])
   .pipe(Schema.toTaggedUnion("type"))
   .annotate({ identifier: "Integration.Method" })
 export type Method = typeof Method.Type
@@ -76,11 +84,11 @@ export type Method = typeof Method.Type
 export const Inputs = Schema.Record(Schema.String, Schema.String).annotate({ identifier: "Integration.Inputs" })
 export type Inputs = typeof Inputs.Type
 
-const Updated = define({
+const Updated = ephemeral({
   type: "integration.updated",
   schema: {},
 })
-const ConnectionUpdated = define({
+const ConnectionUpdated = ephemeral({
   type: "integration.connection.updated",
   schema: { integrationID: ID },
 })
@@ -92,12 +100,13 @@ export const Ref = Schema.Struct({
   name: Schema.String,
 }).annotate({ identifier: "Integration.Ref" })
 
-export class Info extends Schema.Class<Info>("Integration.Info")({
+export const Info = Schema.Struct({
   id: ID,
   name: Schema.String,
   methods: Schema.Array(Method),
   connections: Schema.Array(Connection.Info),
-}) {}
+}).annotate({ identifier: "Integration.Info" })
+export interface Info extends Schema.Schema.Type<typeof Info> {}
 
 export const AttemptID = Schema.String.pipe(
   Schema.brand("Integration.AttemptID"),
@@ -127,3 +136,19 @@ export const AttemptStatus = Schema.Union([
   .pipe(Schema.toTaggedUnion("status"))
   .annotate({ identifier: "Integration.AttemptStatus" })
 export type AttemptStatus = typeof AttemptStatus.Type
+
+export interface CommandAttempt extends Schema.Schema.Type<typeof CommandAttempt> {}
+export const CommandAttempt = Schema.Struct({
+  attemptID: AttemptID,
+  time: AttemptTime,
+}).annotate({ identifier: "Integration.CommandAttempt" })
+
+export const CommandAttemptStatus = Schema.Union([
+  Schema.Struct({ status: Schema.Literal("pending"), message: optional(Schema.String), time: AttemptTime }),
+  Schema.Struct({ status: Schema.Literal("complete"), time: AttemptTime }),
+  Schema.Struct({ status: Schema.Literal("failed"), message: Schema.String, time: AttemptTime }),
+  Schema.Struct({ status: Schema.Literal("expired"), time: AttemptTime }),
+])
+  .pipe(Schema.toTaggedUnion("status"))
+  .annotate({ identifier: "Integration.CommandAttemptStatus" })
+export type CommandAttemptStatus = typeof CommandAttemptStatus.Type

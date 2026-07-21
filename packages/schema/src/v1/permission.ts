@@ -1,11 +1,11 @@
-export * as PermissionV1 from "./permission"
+export * as PermissionV1 from "./permission.js"
 
 import { Schema } from "effect"
-import { define, inventory } from "../event"
-import { ascending } from "../identifier"
-import { Project } from "../project"
-import { statics } from "../schema"
-import { SessionID } from "../session-id"
+import { ephemeral, inventory } from "../event.js"
+import { ascending } from "../identifier.js"
+import { Project } from "../project.js"
+import { statics } from "../schema.js"
+import { SessionID } from "../session-id.js"
 
 export const ID = Schema.String.check(Schema.isStartsWith("per")).pipe(
   Schema.brand("PermissionID"),
@@ -58,8 +58,8 @@ export const ReplyInput = Schema.Struct({ requestID: ID, ...ReplyBody.fields }).
 })
 export type ReplyInput = typeof ReplyInput.Type
 
-const Asked = define({ type: "permission.asked", schema: Request.fields })
-const Replied = define({
+const Asked = ephemeral({ type: "permission.asked", schema: Request.fields })
+const Replied = ephemeral({
   type: "permission.replied",
   schema: { sessionID: SessionID, requestID: ID, reply: Reply },
 })

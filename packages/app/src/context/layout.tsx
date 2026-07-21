@@ -71,7 +71,6 @@ type SessionView = {
   reviewFile?: string
   pendingMessage?: string
   pendingMessageAt?: number
-  todoCollapsed?: boolean
 }
 
 type TabHandoff = {
@@ -849,18 +848,6 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
           },
           setScroll(tab: string, pos: SessionScroll) {
             scroll.setScroll(key(), tab, pos)
-          },
-          todoCollapsed: {
-            get: () => s().todoCollapsed ?? false,
-            set(collapsed: boolean) {
-              const session = key()
-              const current = store.sessionView[session]
-              if (!current) {
-                setStore("sessionView", session, { scroll: {}, todoCollapsed: collapsed })
-              } else {
-                setStore("sessionView", session, "todoCollapsed", collapsed)
-              }
-            },
           },
           terminal: {
             opened: terminalOpened,

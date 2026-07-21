@@ -9,11 +9,14 @@
     "./*": "./src/*.ts"
   },
   "scripts": {
+    "test": "bun test --only-failures",
     "typecheck": "tsgo --noEmit"
   },
   "dependencies": {
+    "@effect/platform-node": "catalog:",
     "@opencode-ai/core": "workspace:*",
     "@opencode-ai/protocol": "workspace:*",
+    "@opencode-ai/simulation": "workspace:*",
     "drizzle-orm": "catalog:",
     "effect": "catalog:"
   },

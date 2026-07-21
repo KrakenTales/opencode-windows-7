@@ -1,35 +1,72 @@
-import type { PluginContext } from "@opencode-ai/plugin/v2/effect"
+import type { Context as PluginContext } from "@opencode-ai/plugin/v2/effect/plugin"
 import { AgentV2 } from "@opencode-ai/core/agent"
 import { Catalog } from "@opencode-ai/core/catalog"
 import { Credential } from "@opencode-ai/core/credential"
 import { Integration } from "@opencode-ai/core/integration"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
-import type { IntegrationEnvMethod, IntegrationKeyMethod, IntegrationOAuthMethod } from "@opencode-ai/sdk/v2/types"
-import { Effect } from "effect"
+import type {
+  IntegrationCommandMethod,
+  IntegrationEnvMethod,
+  IntegrationKeyMethod,
+  IntegrationOAuthMethod,
+} from "@opencode-ai/sdk/v2/types"
+import { Effect, Stream } from "effect"
 
-type Overrides = Partial<Omit<PluginContext, "options">>
+type Overrides = Partial<Omit<PluginContext, "options" | "session">> & {
+  readonly session?: Partial<PluginContext["session"]>
+}
 
 export function host(overrides: Overrides = {}): PluginContext {
   return {
     options: {},
     agent: overrides.agent ?? {
+      get: () => Effect.die("unused agent.get"),
+      list: () => Effect.die("unused agent.list"),
       transform: () => Effect.die("unused agent.transform"),
       reload: () => Effect.die("unused agent.reload"),
     },
     aisdk: overrides.aisdk ?? {
-      sdk: () => Effect.die("unused aisdk.sdk"),
-      language: () => Effect.die("unused aisdk.language"),
+      hook: () => Effect.die("unused aisdk.hook"),
     },
     catalog: overrides.catalog ?? {
+      provider: {
+        list: () => Effect.die("unused catalog.provider.list"),
+        get: () => Effect.die("unused catalog.provider.get"),
+      },
+      model: {
+        get: () => Effect.die("unused catalog.model.get"),
+        list: () => Effect.die("unused catalog.model.list"),
+        default: () => Effect.die("unused catalog.model.default"),
+      },
       transform: () => Effect.die("unused catalog.transform"),
       reload: () => Effect.die("unused catalog.reload"),
     },
     command: overrides.command ?? {
+      list: () => Effect.die("unused command.list"),
       transform: () => Effect.die("unused command.transform"),
       reload: () => Effect.die("unused command.reload"),
     },
+    event: overrides.event ?? {
+      subscribe: () => Stream.empty,
+    },
     integration: overrides.integration ?? {
+      list: () => Effect.die("unused integration.list"),
+      get: () => Effect.die("unused integration.get"),
+      connect: {
+        key: () => Effect.die("unused integration.connect.key"),
+      },
+      oauth: {
+        connect: () => Effect.die("unused integration.oauth.connect"),
+        status: () => Effect.die("unused integration.oauth.status"),
+        complete: () => Effect.die("unused integration.oauth.complete"),
+        cancel: () => Effect.die("unused integration.oauth.cancel"),
+      },
+      command: {
+        connect: () => Effect.die("unused integration.command.connect"),
+        status: () => Effect.die("unused integration.command.status"),
+        cancel: () => Effect.die("unused integration.command.cancel"),
+      },
       transform: () => Effect.die("unused integration.transform"),
       reload: () => Effect.die("unused integration.reload"),
       connection: {
@@ -38,22 +75,39 @@ export function host(overrides: Overrides = {}): PluginContext {
       },
     },
     plugin: overrides.plugin ?? {
-      add: () => Effect.die("unused plugin.add"),
-      remove: () => Effect.die("unused plugin.remove"),
+      list: () => Effect.die("unused plugin.list"),
     },
     reference: overrides.reference ?? {
+      list: () => Effect.die("unused reference.list"),
       transform: () => Effect.die("unused reference.transform"),
       reload: () => Effect.die("unused reference.reload"),
     },
     skill: overrides.skill ?? {
+      list: () => Effect.die("unused skill.list"),
       transform: () => Effect.die("unused skill.transform"),
       reload: () => Effect.die("unused skill.reload"),
+    },
+    tool: overrides.tool ?? {
+      transform: () => Effect.die("unused tool.transform"),
+      hook: () => Effect.die("unused tool.hook"),
+    },
+    session: {
+      hook: overrides.session?.hook ?? (() => Effect.die("unused session.hook")),
+      create: overrides.session?.create ?? (() => Effect.die("unused session.create")),
+      get: overrides.session?.get ?? (() => Effect.die("unused session.get")),
+      prompt: overrides.session?.prompt ?? (() => Effect.die("unused session.prompt")),
+      generate: overrides.session?.generate ?? (() => Effect.die("unused session.generate")),
+      command: overrides.session?.command ?? (() => Effect.die("unused session.command")),
+      synthetic: overrides.session?.synthetic ?? (() => Effect.die("unused session.synthetic")),
+      interrupt: overrides.session?.interrupt ?? (() => Effect.die("unused session.interrupt")),
     },
   }
 }
 
 export function agentHost(agent: AgentV2.Interface): PluginContext["agent"] {
   return {
+    get: (id) => agent.get(AgentV2.ID.make(id)).pipe(Effect.map((value) => value && agentInfo(value))),
+    list: () => Effect.die("unused agent.list"),
     reload: agent.reload,
     transform: (callback) =>
       agent.transform((draft) =>
@@ -78,6 +132,18 @@ export function agentHost(agent: AgentV2.Interface): PluginContext["agent"] {
 
 export function catalogHost(catalog: Catalog.Interface): PluginContext["catalog"] {
   return {
+    provider: {
+      list: () => Effect.die("unused catalog.provider.list"),
+      get: () => Effect.die("unused catalog.provider.get"),
+    },
+    model: {
+      get: (providerID, modelID) =>
+        catalog.model
+          .get(ProviderV2.ID.make(providerID), ModelV2.ID.make(modelID))
+          .pipe(Effect.map((value) => value && modelInfo(value))),
+      list: () => Effect.die("unused catalog.model.list"),
+      default: () => Effect.die("unused catalog.model.default"),
+    },
     reload: catalog.reload,
     transform: (callback) =>
       catalog.transform((draft) =>
@@ -118,7 +184,7 @@ export function catalogHost(catalog: Catalog.Interface): PluginContext["catalog"
                   id: ModelV2.ID.make(current.id),
                   providerID: ProviderV2.ID.make(current.providerID),
                   family: current.family === undefined ? undefined : ModelV2.Family.make(current.family),
-                  variants: current.variants.map((variant) => ({
+                  variants: current.variants?.map((variant) => ({
                     ...variant,
                     id: ModelV2.VariantID.make(variant.id),
                   })),
@@ -142,6 +208,22 @@ export function catalogHost(catalog: Catalog.Interface): PluginContext["catalog"
 
 export function integrationHost(integration: Integration.Interface): PluginContext["integration"] {
   return {
+    list: () => Effect.die("unused integration.list"),
+    get: () => Effect.die("unused integration.get"),
+    connect: {
+      key: () => Effect.die("unused integration.connect.key"),
+    },
+    oauth: {
+      connect: () => Effect.die("unused integration.oauth.connect"),
+      status: () => Effect.die("unused integration.oauth.status"),
+      complete: () => Effect.die("unused integration.oauth.complete"),
+      cancel: () => Effect.die("unused integration.oauth.cancel"),
+    },
+    command: {
+      connect: () => Effect.die("unused integration.command.connect"),
+      status: () => Effect.die("unused integration.command.status"),
+      cancel: () => Effect.die("unused integration.command.cancel"),
+    },
     reload: integration.reload,
     connection: {
       active: (id) => integration.connection.active(Integration.ID.make(id)),
@@ -223,6 +305,17 @@ export function integrationHost(integration: Integration.Interface): PluginConte
                 })
                 return
               }
+              if (input.method.type === "command") {
+                draft.method.update({
+                  integrationID: Integration.ID.make(input.integrationID),
+                  method: {
+                    ...input.method,
+                    id: Integration.MethodID.make(input.method.id),
+                    command: [...input.method.command],
+                  },
+                })
+                return
+              }
               draft.method.update({
                 integrationID: Integration.ID.make(input.integrationID),
                 method: input.method,
@@ -238,6 +331,7 @@ export function integrationHost(integration: Integration.Interface): PluginConte
 function method(value: Integration.Method) {
   if (value.type === "env") return { type: value.type, names: [...value.names] }
   if (value.type === "key") return { type: value.type, label: value.label }
+  if (value.type === "command") return { ...value, command: [...value.command] }
   return {
     type: value.type,
     id: value.id,
@@ -250,10 +344,17 @@ function method(value: Integration.Method) {
 }
 
 function internalMethod(
-  value: IntegrationOAuthMethod | IntegrationKeyMethod | IntegrationEnvMethod,
+  value: IntegrationOAuthMethod | IntegrationCommandMethod | IntegrationKeyMethod | IntegrationEnvMethod,
 ): Integration.Method {
   if (value.type === "env") return value
   if (value.type === "key") return value
+  if (value.type === "command") {
+    return {
+      ...value,
+      id: Integration.MethodID.make(value.id),
+      command: [...value.command],
+    }
+  }
   return {
     ...value,
     id: Integration.MethodID.make(value.id),
@@ -264,7 +365,11 @@ function agentInfo(value: AgentV2.Info) {
   return {
     ...value,
     model: value.model && { ...value.model },
-    request: { headers: { ...value.request.headers }, body: { ...value.request.body } },
+    request: {
+      settings: { ...value.request.settings },
+      headers: { ...value.request.headers },
+      body: { ...value.request.body },
+    },
     permissions: value.permissions.map((permission) => ({ ...permission })),
   }
 }
@@ -272,29 +377,28 @@ function agentInfo(value: AgentV2.Info) {
 function providerInfo(value: ProviderV2.MutableInfo) {
   return {
     ...value,
-    api: { ...value.api, settings: value.api.settings && { ...value.api.settings } },
-    request: { headers: { ...value.request.headers }, body: { ...value.request.body } },
+    settings: value.settings && { ...value.settings },
+    headers: value.headers && { ...value.headers },
+    body: value.body && { ...value.body },
   }
 }
 
 function modelInfo(value: ModelV2.Info | ModelV2.MutableInfo) {
   return {
     ...value,
-    api: { ...value.api, settings: value.api.settings && { ...value.api.settings } },
+    settings: value.settings && { ...value.settings },
+    headers: value.headers && { ...value.headers },
+    body: value.body && { ...value.body },
     capabilities: {
       ...value.capabilities,
       input: [...value.capabilities.input],
       output: [...value.capabilities.output],
     },
-    request: {
-      ...value.request,
-      headers: { ...value.request.headers },
-      body: { ...value.request.body },
-    },
-    variants: value.variants.map((variant) => ({
+    variants: value.variants?.map((variant) => ({
       ...variant,
-      headers: { ...variant.headers },
-      body: { ...variant.body },
+      settings: variant.settings && { ...variant.settings },
+      headers: variant.headers && { ...variant.headers },
+      body: variant.body && { ...variant.body },
     })),
     time: { ...value.time },
     cost: value.cost.map((cost) => ({ ...cost, tier: cost.tier && { ...cost.tier }, cache: { ...cost.cache } })),

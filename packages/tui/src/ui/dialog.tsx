@@ -1,21 +1,22 @@
 import { useRenderer, useTerminalDimensions } from "@opentui/solid"
 import { batch, createContext, createEffect, onCleanup, Show, useContext, type JSX, type ParentProps } from "solid-js"
+import { Keymap } from "../context/keymap"
 import { useTheme } from "../context/theme"
 import { MouseButton, Renderable, RGBA } from "@opentui/core"
 import { createStore } from "solid-js/store"
 import { useToast } from "./toast"
 import { Flag } from "@opencode-ai/core/flag/flag"
-import { useBindings, useOpencodeModeStack } from "../keymap"
 import { useClipboard } from "../context/clipboard"
 
 export function Dialog(
   props: ParentProps<{
     size?: "medium" | "large" | "xlarge"
+    centered?: boolean
     onClose: () => void
   }>,
 ) {
   const dimensions = useTerminalDimensions()
-  const { theme } = useTheme()
+  const { themeV2 } = useTheme().contextual("elevated")
   const renderer = useRenderer()
 
   let dismiss = false
@@ -40,9 +41,10 @@ export function Dialog(
       width={dimensions().width}
       height={dimensions().height}
       alignItems="center"
+      justifyContent={props.centered ? "center" : undefined}
       position="absolute"
       zIndex={3000}
-      paddingTop={dimensions().height / 4}
+      paddingTop={props.centered ? 0 : dimensions().height / 4}
       left={0}
       top={0}
       backgroundColor={RGBA.fromInts(0, 0, 0, 150)}
@@ -57,7 +59,7 @@ export function Dialog(
         }}
         width={width()}
         maxWidth={dimensions().width - 2}
-        backgroundColor={theme.backgroundPanel}
+        backgroundColor={themeV2.background()}
         paddingTop={1}
       >
         {props.children}
@@ -73,20 +75,22 @@ function init() {
       onClose?: () => void
     }[],
     size: "medium" as "medium" | "large" | "xlarge",
+    centered: false,
   })
 
   const renderer = useRenderer()
-  const modeStack = useOpencodeModeStack()
+  const keymap = Keymap.use()
 
   createEffect(() => {
     if (store.stack.length === 0) return
-    const popMode = modeStack.push("modal")
+    const popMode = keymap.mode.push("modal")
     onCleanup(popMode)
   })
 
   let focus: Renderable | null
   function refocus() {
     setTimeout(() => {
+      if (store.stack.length > 0) return
       if (!focus) return
       if (focus.isDestroyed) return
       function find(item: Renderable) {
@@ -102,14 +106,15 @@ function init() {
     }, 1)
   }
 
-  useBindings(() => ({
+  Keymap.createLayer(() => ({
+    mode: "modal",
     enabled: store.stack.length > 0 && !renderer.getSelection()?.getSelectedText(),
-    bindings: [
+    commands: [
       {
-        key: "escape",
-        desc: "Close dialog",
+        bind: "escape",
+        title: "Close dialog",
         group: "Dialog",
-        cmd: () => {
+        run: () => {
           if (renderer.getSelection()) {
             renderer.clearSelection()
           }
@@ -120,10 +125,10 @@ function init() {
         },
       },
       {
-        key: "ctrl+c",
-        desc: "Close dialog",
+        bind: "ctrl+c",
+        title: "Close dialog",
         group: "Dialog",
-        cmd: () => {
+        run: () => {
           if (renderer.getSelection()) {
             renderer.clearSelection()
           }
@@ -143,6 +148,7 @@ function init() {
       }
       batch(() => {
         setStore("size", "medium")
+        setStore("centered", false)
         setStore("stack", [])
       })
       refocus()
@@ -156,6 +162,7 @@ function init() {
         if (item.onClose) item.onClose()
       }
       setStore("size", "medium")
+      setStore("centered", false)
       setStore("stack", [
         {
           element: input,
@@ -169,8 +176,14 @@ function init() {
     get size() {
       return store.size
     },
+    get centered() {
+      return store.centered
+    },
     setSize(size: "medium" | "large" | "xlarge") {
       setStore("size", size)
+    },
+    setCentered(centered: boolean) {
+      setStore("centered", centered)
     },
   }
 }
@@ -213,7 +226,7 @@ export function DialogProvider(props: ParentProps) {
         onMouseUp={!Flag.OPENCODE_EXPERIMENTAL_DISABLE_COPY_ON_SELECT ? copySelection : undefined}
       >
         <Show when={value.stack.length}>
-          <Dialog onClose={() => value.clear()} size={value.size}>
+          <Dialog onClose={() => value.clear()} size={value.size} centered={value.centered}>
             {value.stack.at(-1)!.element}
           </Dialog>
         </Show>

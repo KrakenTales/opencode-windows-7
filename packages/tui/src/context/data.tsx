@@ -1,45 +1,80 @@
+// Client data layer: apply server events and cache API reads into a Solid store.
+// Prefer straightforward projection. Do not add generation counters, stale-response
+// merges, live/history overlays, or other race machinery here—last write wins.
+// Reconnect invalidates cached reads; active UI owners decide what to sync again.
+
 import type {
-  AgentV2Info,
-  CommandV2Info,
+  AgentInfo,
+  CommandInfo,
+  FormInfo,
   IntegrationInfo,
   LocationRef,
-  ModelV2Info,
+  LocationGetOutput,
+  McpResource,
+  McpServer,
+  ModelInfo,
   PermissionSavedInfo,
   PermissionV2Request,
   ProviderV2Info,
-  QuestionV2Request,
   ReferenceInfo,
-  SessionMessage,
+  SessionMessageInfo,
   SessionMessageAssistant,
   SessionMessageAssistantReasoning,
   SessionMessageAssistantText,
   SessionMessageAssistantTool,
-  SessionV2Info,
-  SkillV2Info,
-  V2Event,
-} from "@opencode-ai/sdk/v2"
-import { createStore, produce } from "solid-js/store"
+  SessionInfo,
+  SessionPendingInfo,
+  ShellInfo,
+  SkillInfo,
+  OpenCodeEvent,
+} from "@opencode-ai/client"
+import type { Plugin } from "@opencode-ai/plugin/v2/tui"
+import { createStore, produce, reconcile } from "solid-js/store"
 import { createSimpleContext } from "./helper"
-import { useSDK } from "./sdk"
-import { useEvent } from "./event"
-import { createSignal, onCleanup, onMount } from "solid-js"
+import { useClient } from "./client"
+import { createEffect, createSignal, onCleanup } from "solid-js"
+
+export type DataSessionStatus = "idle" | "running"
+
+const messageIDFromEvent = (eventID: string) => eventID.replace(/^evt_/, "msg_")
+
+// Global MCP elicitations temporarily use "global" instead of a real session ID, so the
+// server cannot recover their Location when settling them. Preserve the event Location
+// until MCP elicitations carry session ownership.
+export type FormWithLocation = FormInfo & { readonly location?: LocationRef }
 
 type LocationData = {
-  agent?: AgentV2Info[]
-  command?: CommandV2Info[]
+  info?: LocationGetOutput
+  agent?: AgentInfo[]
+  command?: CommandInfo[]
   integration?: IntegrationInfo[]
-  model?: ModelV2Info[]
+  mcp?: {
+    server?: McpServer[]
+    resource?: McpResource[]
+  }
+  model?: ModelInfo[]
   provider?: ProviderV2Info[]
   reference?: ReferenceInfo[]
-  skill?: SkillV2Info[]
+  // Currently running shell commands for this location, keyed by shell id. Entries are removed
+  // once the command exits or is deleted, so this only ever holds in-flight shells.
+  shell?: Record<string, ShellInfo>
+  skill?: SkillInfo[]
 }
 
-type Data = {
+type Store = {
   session: {
-    info: Record<string, SessionV2Info>
-    message: Record<string, SessionMessage[]>
+    info: Record<string, SessionInfo>
+    // Family index keyed by a family's root (or furthest-known-ancestor when the
+    // true root is not yet loaded). The value is a flat deduplicated list of every
+    // session ID in that family, including the key itself once its info arrives.
+    family: Record<string, string[]>
+    active: Record<string, DataSessionStatus>
+    message: Record<string, SessionMessageInfo[]>
+    pending: Record<string, SessionPendingInfo[]>
+    input: Record<string, string[]>
     permission: Record<string, PermissionV2Request[]>
-    question: Record<string, QuestionV2Request[]>
+    // Pending forms keyed by owner: a session ID or the temporary "global" elicitation sentinel.
+    form: Record<string, FormWithLocation[]>
   }
   project: {
     permission: Record<string, PermissionSavedInfo[]>
@@ -55,15 +90,50 @@ function locationQuery(ref?: LocationRef) {
   return ref ? { directory: ref.directory, workspace: ref.workspaceID } : undefined
 }
 
+function createSync() {
+  const state = new Map<string, true | Promise<void>>()
+  return {
+    run(key: string, load: () => Promise<void>) {
+      const active = state.get(key)
+      if (active === true) return Promise.resolve()
+      if (active) return active
+      const pending = load()
+        .then(() => {
+          if (state.get(key) === pending) state.set(key, true)
+        })
+        .finally(() => {
+          if (state.get(key) === pending) state.delete(key)
+        })
+      state.set(key, pending)
+      return pending
+    },
+    complete(key: string) {
+      if (state.has(key)) return
+      state.set(key, true)
+    },
+    invalidate(key?: string) {
+      if (key) {
+        state.delete(key)
+        return
+      }
+      state.clear()
+    },
+  }
+}
+
 export const { use: useData, provider: DataProvider } = createSimpleContext({
   name: "Data",
   init: () => {
-    const [store, setStore] = createStore<Data>({
+    const [store, setStore] = createStore<Store>({
       session: {
         info: {},
+        family: {},
+        active: {},
         message: {},
+        pending: {},
+        input: {},
         permission: {},
-        question: {},
+        form: {},
       },
       project: {
         permission: {},
@@ -71,37 +141,63 @@ export const { use: useData, provider: DataProvider } = createSimpleContext({
       location: {},
     })
 
-    const sdk = useSDK()
-    const events = useEvent()
+    const client = useClient()
     const [defaultLocation, setDefaultLocation] = createSignal<LocationRef>({
-      directory: sdk.directory ?? process.cwd(),
+      directory: process.cwd(),
     })
+    const messageIndex = new Map<string, Map<string, number>>()
+    const sync = createSync()
+
+    function setSessionActive(sessionID: string, status: DataSessionStatus) {
+      setStore("session", "active", sessionID, status)
+    }
+
+    function addPending(item: SessionPendingInfo) {
+      if (store.session.pending[item.sessionID]?.some((pending) => pending.id === item.id)) return
+      setStore("session", "pending", item.sessionID, [...(store.session.pending[item.sessionID] ?? []), item])
+    }
+
+    function removePending(sessionID: string, inputID?: string) {
+      if (!inputID) return
+      setStore(
+        "session",
+        "pending",
+        sessionID,
+        (store.session.pending[sessionID] ?? []).filter((item) => item.id !== inputID),
+      )
+    }
 
     const message = {
-      update(sessionID: string, fn: (messages: SessionMessage[]) => void) {
+      update(sessionID: string, fn: (messages: SessionMessageInfo[], index: Map<string, number>) => void) {
         setStore(
           "session",
           "message",
           produce((draft) => {
-            fn((draft[sessionID] ??= []))
+            fn((draft[sessionID] ??= []), index(sessionID))
           }),
         )
       },
-      prepend(messages: SessionMessage[], item: SessionMessage) {
-        if (messages.some((existing) => existing.id === item.id)) return
-        messages.unshift(item)
+      append(messages: SessionMessageInfo[], index: Map<string, number>, item: SessionMessageInfo) {
+        if (index.has(item.id)) return
+        index.set(item.id, messages.length)
+        messages.push(item)
       },
-      activeAssistant(messages: SessionMessage[]) {
-        const item = messages.find((item) => item.type === "assistant" && !item.time.completed)
+      activeAssistant(messages: SessionMessageInfo[]) {
+        const item = messages.findLast((item) => item.type === "assistant" && !item.time.completed)
         return item?.type === "assistant" ? item : undefined
       },
-      assistant(messages: SessionMessage[], messageID: string) {
-        const item = messages.find((item) => item.type === "assistant" && item.id === messageID)
+      assistant(messages: SessionMessageInfo[], index: Map<string, number>, messageID: string) {
+        const position = index.get(messageID)
+        const item = position === undefined ? undefined : messages[position]
         return item?.type === "assistant" ? item : undefined
       },
-      activeShell(messages: SessionMessage[], callID: string) {
-        const item = messages.find((item) => item.type === "shell" && item.callID === callID)
+      shell(messages: SessionMessageInfo[], shellID: string) {
+        const item = messages.findLast((item) => item.type === "shell" && item.shellID === shellID)
         return item?.type === "shell" ? item : undefined
+      },
+      compaction(messages: SessionMessageInfo[]) {
+        const item = messages.findLast((item) => item.type === "compaction" && item.status === "running")
+        return item?.type === "compaction" ? item : undefined
       },
       latestTool(assistant: SessionMessageAssistant | undefined, callID?: string) {
         return assistant?.content.findLast(
@@ -109,123 +205,319 @@ export const { use: useData, provider: DataProvider } = createSimpleContext({
             item.type === "tool" && (callID === undefined || item.id === callID),
         )
       },
-      latestText(assistant: SessionMessageAssistant | undefined, textID: string) {
-        return assistant?.content.findLast(
-          (item): item is SessionMessageAssistantText => item.type === "text" && item.id === textID,
-        )
+      latestText(assistant: SessionMessageAssistant | undefined) {
+        return assistant?.content.findLast((item): item is SessionMessageAssistantText => item.type === "text")
       },
-      latestReasoning(assistant: SessionMessageAssistant | undefined, reasoningID: string) {
+      latestReasoning(assistant: SessionMessageAssistant | undefined) {
         return assistant?.content.findLast(
-          (item): item is SessionMessageAssistantReasoning => item.type === "reasoning" && item.id === reasoningID,
+          (item): item is SessionMessageAssistantReasoning => item.type === "reasoning" && !item.time?.completed,
         )
       },
     }
 
-    function handleEvent(event: V2Event) {
+    function index(sessionID: string) {
+      const existing = messageIndex.get(sessionID)
+      if (existing) return existing
+      const created = new Map<string, number>()
+      messageIndex.set(sessionID, created)
+      return created
+    }
+
+    // Walk parentID upward through loaded session info to the family root. When a
+    // parent's info is missing, that missing ID is the furthest-known ancestor and
+    // is returned so orphan subtrees group under it until the parent arrives. A
+    // seen set guards against parent cycles, stopping at the last non-repeating
+    // ancestor.
+    function resolveRoot(sessionID: string) {
+      let current = sessionID
+      let parentID = store.session.info[sessionID]?.parentID
+      const seen = new Set([sessionID])
+      while (parentID) {
+        if (seen.has(parentID)) break
+        seen.add(parentID)
+        current = parentID
+        parentID = store.session.info[parentID]?.parentID
+      }
+      return current
+    }
+
+    // Register one session into the family index. Idempotent: syncing an
+    // existing session never duplicates its ID. When a tentative family keyed by
+    // sessionID exists (descendants arrived while sessionID's own info was
+    // absent) but sessionID turns out to have a parent, fold the orphan subtree
+    // into the resolved root's family and drop the tentative entry.
+    function registerSession(sessionID: string) {
+      const info = store.session.info[sessionID]
+      if (!info) return
+      const rootID = resolveRoot(sessionID)
+      setStore(
+        "session",
+        "family",
+        produce((draft) => {
+          if (sessionID !== rootID && draft[sessionID]) {
+            const members = (draft[rootID] ??= [])
+            for (const id of draft[sessionID]) {
+              if (!members.includes(id)) members.push(id)
+            }
+            delete draft[sessionID]
+          }
+          const family = (draft[rootID] ??= [])
+          if (!family.includes(sessionID)) family.push(sessionID)
+        }),
+      )
+    }
+
+    function removeSession(sessionID: string) {
+      messageIndex.delete(sessionID)
+      sync.invalidate(`session:${sessionID}`)
+      sync.invalidate(`session.pending:${sessionID}`)
+      sync.invalidate(`session.message:${sessionID}`)
+      sync.invalidate(`session.permission:${sessionID}`)
+      sync.invalidate(`session.form:${sessionID}:`)
+      setStore(
+        "session",
+        produce((draft) => {
+          delete draft.info[sessionID]
+          delete draft.active[sessionID]
+          delete draft.message[sessionID]
+          delete draft.pending[sessionID]
+          delete draft.input[sessionID]
+          delete draft.permission[sessionID]
+          delete draft.form[sessionID]
+          for (const [rootID, family] of Object.entries(draft.family)) {
+            const next = family.filter((id) => id !== sessionID)
+            if (next.length === 0) delete draft.family[rootID]
+            else draft.family[rootID] = next
+          }
+        }),
+      )
+    }
+
+    function handleEvent(event: OpenCodeEvent) {
       switch (event.type) {
-        case "catalog.updated":
-          void Promise.all([
-            result.location.model.refresh(event.location),
-            result.location.provider.refresh(event.location),
-          ])
+        case "session.created":
+          result.session.invalidate(event.data.sessionID)
+          void result.session.sync(event.data.sessionID)
           break
-        case "session.next.agent.switched":
-          message.update(event.data.sessionID, (draft) => {
-            message.prepend(draft, {
-              id: event.data.messageID,
+        case "session.deleted":
+          removeSession(event.data.sessionID)
+          break
+        case "session.usage.updated":
+          if (store.session.info[event.data.sessionID])
+            setStore("session", "info", event.data.sessionID, {
+              cost: event.data.cost,
+              tokens: event.data.tokens,
+            })
+          break
+        case "catalog.updated":
+          result.location.model.invalidate(event.location)
+          result.location.provider.invalidate(event.location)
+          void Promise.all([result.location.model.sync(event.location), result.location.provider.sync(event.location)])
+          break
+        case "agent.updated":
+          result.location.agent.invalidate(event.location)
+          void result.location.agent.sync(event.location)
+          break
+        case "command.updated":
+          result.location.command.invalidate(event.location)
+          void result.location.command.sync(event.location)
+          break
+        case "skill.updated":
+          result.location.skill.invalidate(event.location)
+          void result.location.skill.sync(event.location)
+          break
+        case "session.agent.selected":
+          if (store.session.info[event.data.sessionID])
+            setStore("session", "info", event.data.sessionID, "agent", event.data.agent)
+          message.update(event.data.sessionID, (draft, index) => {
+            message.append(draft, index, {
+              id: messageIDFromEvent(event.id),
               type: "agent-switched",
               agent: event.data.agent,
-              time: { created: event.data.timestamp },
+              time: { created: event.created },
             })
           })
           break
-        case "session.next.model.switched":
-          message.update(event.data.sessionID, (draft) => {
-            message.prepend(draft, {
-              id: event.data.messageID,
+        case "session.model.selected":
+          if (store.session.info[event.data.sessionID])
+            setStore("session", "info", event.data.sessionID, "model", event.data.model)
+          if (!store.session.message[event.data.sessionID]) break
+          message.update(event.data.sessionID, (draft, index) => {
+            message.append(draft, index, {
+              id: messageIDFromEvent(event.id),
               type: "model-switched",
               model: event.data.model,
-              time: { created: event.data.timestamp },
+              time: { created: event.created },
             })
           })
+          void client.api.session
+            .message({ sessionID: event.data.sessionID, messageID: messageIDFromEvent(event.id) })
+            .then((item) => {
+              message.update(event.data.sessionID, (draft, index) => {
+                const position = index.get(item.id)
+                if (position === undefined) return message.append(draft, index, item)
+                draft[position] = item
+              })
+            })
+            .catch((error) => console.error("Failed to load projected model switch message", error))
           break
-        case "session.next.prompted": {
-          message.update(event.data.sessionID, (draft) => {
-            message.prepend(draft, {
-              id: event.data.messageID,
-              type: "user",
-              text: event.data.prompt.text,
-              files: event.data.prompt.files,
-              agents: event.data.prompt.agents,
-              time: { created: event.data.timestamp },
-            })
+        case "session.renamed":
+          if (store.session.info[event.data.sessionID])
+            setStore("session", "info", event.data.sessionID, "title", event.data.title)
+          break
+        case "session.moved":
+          if (store.session.info[event.data.sessionID]) {
+            setStore("session", "info", event.data.sessionID, "location", event.data.location)
+            if (event.data.projectID)
+              setStore("session", "info", event.data.sessionID, "projectID", event.data.projectID)
+            setStore("session", "info", event.data.sessionID, "subpath", event.data.subpath)
+          }
+          break
+        case "session.input.promoted": {
+          removePending(event.data.sessionID, event.data.inputID)
+          message.update(event.data.sessionID, (draft, index) => {
+            const position = index.get(event.data.inputID)
+            if (position === undefined) return
+            const existing = draft[position]
+            if (!existing || !store.session.input[event.data.sessionID]?.includes(event.data.inputID)) return
+            existing.time.created = event.created
+            draft.splice(position, 1)
+            draft.push(existing)
+            index.clear()
+            draft.forEach((message, indexValue) => index.set(message.id, indexValue))
           })
+          setStore(
+            "session",
+            "input",
+            event.data.sessionID,
+            (store.session.input[event.data.sessionID] ?? []).filter((id) => id !== event.data.inputID),
+          )
           break
         }
-        case "session.next.prompt.admitted":
+        case "session.input.admitted":
+          addPending({
+            id: event.data.inputID,
+            sessionID: event.data.sessionID,
+            admittedSeq: event.durable.seq,
+            timeCreated: event.created,
+            ...event.data.input,
+          })
+          if (!store.session.input[event.data.sessionID]?.includes(event.data.inputID))
+            setStore("session", "input", event.data.sessionID, [
+              ...(store.session.input[event.data.sessionID] ?? []),
+              event.data.inputID,
+            ])
+          message.update(event.data.sessionID, (draft, index) => {
+            message.append(
+              draft,
+              index,
+              event.data.input.type === "user"
+                ? {
+                    id: event.data.inputID,
+                    type: "user",
+                    ...event.data.input.data,
+                    time: { created: event.created },
+                  }
+                : {
+                    id: event.data.inputID,
+                    type: "synthetic",
+                    ...event.data.input.data,
+                    time: { created: event.created },
+                  },
+            )
+          })
           break
-        case "session.next.context.updated":
-          message.update(event.data.sessionID, (draft) => {
-            message.prepend(draft, {
-              id: event.data.messageID,
+        case "session.instructions.updated":
+          const instructions = event.metadata?.instructions
+          if (
+            typeof instructions === "object" &&
+            instructions !== null &&
+            "initial" in instructions &&
+            instructions.initial === true
+          )
+            break
+          message.update(event.data.sessionID, (draft, index) => {
+            message.append(draft, index, {
+              id: messageIDFromEvent(event.id),
               type: "system",
-              text: event.data.text,
-              time: { created: event.data.timestamp },
+              text: `Instructions updated: ${Object.keys(event.data.delta).join(", ")}`,
+              metadata: event.metadata,
+              time: { created: event.created },
             })
           })
           break
-        case "session.next.synthetic":
-          message.update(event.data.sessionID, (draft) => {
-            message.prepend(draft, {
-              id: event.data.messageID,
+        case "session.synthetic":
+          message.update(event.data.sessionID, (draft, index) => {
+            message.append(draft, index, {
+              id: messageIDFromEvent(event.id),
               type: "synthetic",
-              sessionID: event.data.sessionID,
               text: event.data.text,
-              time: { created: event.data.timestamp },
+              description: event.data.description,
+              metadata: event.data.metadata,
+              time: { created: event.created },
             })
           })
           break
-        case "session.next.shell.started":
-          message.update(event.data.sessionID, (draft) => {
-            message.prepend(draft, {
-              id: event.data.messageID,
+        case "session.shell.started":
+          message.update(event.data.sessionID, (draft, index) => {
+            message.append(draft, index, {
+              id: messageIDFromEvent(event.id),
               type: "shell",
-              callID: event.data.callID,
-              command: event.data.command,
-              output: "",
-              time: { created: event.data.timestamp },
+              shellID: event.data.shell.id,
+              command: event.data.shell.command,
+              status: event.data.shell.status,
+              exit: event.data.shell.exit,
+              metadata: event.metadata,
+              time: { created: event.created },
             })
           })
           break
-        case "session.next.shell.ended":
+        case "session.shell.ended":
           message.update(event.data.sessionID, (draft) => {
-            const match = message.activeShell(draft, event.data.callID)
+            const match = message.shell(draft, event.data.shell.id)
             if (!match) return
+            match.status = event.data.shell.status
+            match.exit = event.data.shell.exit
             match.output = event.data.output
-            match.time.completed = event.data.timestamp
+            match.time.completed = event.created
           })
           break
-        case "session.next.step.started":
-          message.update(event.data.sessionID, (draft) => {
-            if (draft.some((message) => message.id === event.data.assistantMessageID)) return
+        case "session.step.started":
+          message.update(event.data.sessionID, (draft, index) => {
+            const position = index.get(event.data.assistantMessageID)
+            const existing = position === undefined ? undefined : draft[position]
+            if (existing?.type === "assistant") {
+              existing.agent = event.data.agent
+              existing.model = event.data.model
+              existing.retry = undefined
+              existing.error = undefined
+              existing.finish = undefined
+              existing.time.completed = undefined
+              if (event.data.snapshot) existing.snapshot = { ...existing.snapshot, start: event.data.snapshot }
+              return
+            }
             const currentAssistant = message.activeAssistant(draft)
-            if (currentAssistant) currentAssistant.time.completed = event.data.timestamp
-            message.prepend(draft, {
+            if (currentAssistant) {
+              currentAssistant.retry = undefined
+              currentAssistant.time.completed = event.created
+            }
+            message.append(draft, index, {
               id: event.data.assistantMessageID,
               type: "assistant",
               agent: event.data.agent,
               model: event.data.model,
+              metadata: event.metadata,
               content: [],
               snapshot: event.data.snapshot ? { start: event.data.snapshot } : undefined,
-              time: { created: event.data.timestamp },
+              time: { created: event.created },
             })
           })
           break
-        case "session.next.step.ended":
-          message.update(event.data.sessionID, (draft) => {
-            const currentAssistant = message.assistant(draft, event.data.assistantMessageID)
+        case "session.step.ended": {
+          message.update(event.data.sessionID, (draft, index) => {
+            const currentAssistant = message.assistant(draft, index, event.data.assistantMessageID)
             if (!currentAssistant) return
-            currentAssistant.time.completed = event.data.timestamp
+            currentAssistant.time.completed = event.created
             currentAssistant.finish = event.data.finish
             currentAssistant.cost = event.data.cost
             currentAssistant.tokens = event.data.tokens
@@ -233,79 +525,100 @@ export const { use: useData, provider: DataProvider } = createSimpleContext({
               currentAssistant.snapshot = { ...currentAssistant.snapshot, end: event.data.snapshot }
           })
           break
-        case "session.next.step.failed":
-          message.update(event.data.sessionID, (draft) => {
-            const currentAssistant = message.assistant(draft, event.data.assistantMessageID)
+        }
+        case "session.step.failed":
+          message.update(event.data.sessionID, (draft, index) => {
+            const currentAssistant = message.assistant(draft, index, event.data.assistantMessageID)
             if (!currentAssistant) return
-            currentAssistant.time.completed = event.data.timestamp
+            currentAssistant.time.completed = event.created
             currentAssistant.finish = "error"
             currentAssistant.error = event.data.error
+            currentAssistant.retry = undefined
+            if (event.data.cost !== undefined && event.data.tokens !== undefined) {
+              currentAssistant.cost = event.data.cost
+              currentAssistant.tokens = event.data.tokens
+            }
           })
           break
-        case "session.next.text.started":
-          message.update(event.data.sessionID, (draft) => {
-            message.assistant(draft, event.data.assistantMessageID)?.content.push({
+        case "session.text.started":
+          message.update(event.data.sessionID, (draft, index) => {
+            message.assistant(draft, index, event.data.assistantMessageID)?.content.push({
               type: "text",
-              id: event.data.textID,
               text: "",
             })
           })
           break
-        case "session.next.text.delta":
-          message.update(event.data.sessionID, (draft) => {
-            const match = message.latestText(message.assistant(draft, event.data.assistantMessageID), event.data.textID)
+        case "session.text.delta":
+          message.update(event.data.sessionID, (draft, index) => {
+            const match = message.latestText(message.assistant(draft, index, event.data.assistantMessageID))
             if (match) match.text += event.data.delta
           })
           break
-        case "session.next.text.ended":
-          message.update(event.data.sessionID, (draft) => {
-            const match = message.latestText(message.assistant(draft, event.data.assistantMessageID), event.data.textID)
+        case "session.text.ended":
+          message.update(event.data.sessionID, (draft, index) => {
+            const match = message.latestText(message.assistant(draft, index, event.data.assistantMessageID))
             if (match) match.text = event.data.text
           })
           break
-        case "session.next.tool.input.started":
-          message.update(event.data.sessionID, (draft) => {
-            message.assistant(draft, event.data.assistantMessageID)?.content.push({
+        case "session.tool.input.started":
+          message.update(event.data.sessionID, (draft, index) => {
+            message.assistant(draft, index, event.data.assistantMessageID)?.content.push({
               type: "tool",
               id: event.data.callID,
               name: event.data.name,
-              time: { created: event.data.timestamp },
-              state: { status: "pending", input: "" },
+              time: { created: event.created },
+              state: { status: "streaming", input: "" },
             })
           })
           break
-        case "session.next.tool.input.delta":
-          message.update(event.data.sessionID, (draft) => {
-            const match = message.latestTool(message.assistant(draft, event.data.assistantMessageID), event.data.callID)
-            if (match?.state.status === "pending") match.state.input += event.data.delta
+        case "session.tool.input.delta":
+          message.update(event.data.sessionID, (draft, index) => {
+            const match = message.latestTool(
+              message.assistant(draft, index, event.data.assistantMessageID),
+              event.data.callID,
+            )
+            if (match?.state.status === "streaming") match.state.input += event.data.delta
           })
           break
-        case "session.next.tool.input.ended":
-          message.update(event.data.sessionID, (draft) => {
-            const match = message.latestTool(message.assistant(draft, event.data.assistantMessageID), event.data.callID)
-            if (match?.state.status === "pending") match.state.input = event.data.text
+        case "session.tool.input.ended":
+          message.update(event.data.sessionID, (draft, index) => {
+            const match = message.latestTool(
+              message.assistant(draft, index, event.data.assistantMessageID),
+              event.data.callID,
+            )
+            if (match?.state.status === "streaming") match.state.input = event.data.text
           })
           break
-        case "session.next.tool.called":
-          message.update(event.data.sessionID, (draft) => {
-            const match = message.latestTool(message.assistant(draft, event.data.assistantMessageID), event.data.callID)
+        case "session.tool.called":
+          message.update(event.data.sessionID, (draft, index) => {
+            const match = message.latestTool(
+              message.assistant(draft, index, event.data.assistantMessageID),
+              event.data.callID,
+            )
             if (!match) return
-            match.time.ran = event.data.timestamp
-            match.provider = event.data.provider
+            match.time.ran = event.created
+            match.executed = event.data.executed
+            match.providerState = event.data.state
             match.state = { status: "running", input: event.data.input, structured: {}, content: [] }
           })
           break
-        case "session.next.tool.progress":
-          message.update(event.data.sessionID, (draft) => {
-            const match = message.latestTool(message.assistant(draft, event.data.assistantMessageID), event.data.callID)
+        case "session.tool.progress":
+          message.update(event.data.sessionID, (draft, index) => {
+            const match = message.latestTool(
+              message.assistant(draft, index, event.data.assistantMessageID),
+              event.data.callID,
+            )
             if (match?.state.status !== "running") return
             match.state.structured = event.data.structured
             match.state.content = [...event.data.content]
           })
           break
-        case "session.next.tool.success":
-          message.update(event.data.sessionID, (draft) => {
-            const match = message.latestTool(message.assistant(draft, event.data.assistantMessageID), event.data.callID)
+        case "session.tool.success":
+          message.update(event.data.sessionID, (draft, index) => {
+            const match = message.latestTool(
+              message.assistant(draft, index, event.data.assistantMessageID),
+              event.data.callID,
+            )
             if (match?.state.status !== "running") return
             match.state = {
               status: "completed",
@@ -314,18 +627,18 @@ export const { use: useData, provider: DataProvider } = createSimpleContext({
               content: [...event.data.content],
               result: event.data.result,
             }
-            match.provider = {
-              executed: event.data.provider.executed || match.provider?.executed === true,
-              metadata: match.provider?.metadata,
-              resultMetadata: event.data.provider.metadata,
-            }
-            match.time.completed = event.data.timestamp
+            match.executed = event.data.executed || match.executed === true
+            match.providerResultState = event.data.resultState
+            match.time.completed = event.created
           })
           break
-        case "session.next.tool.failed":
-          message.update(event.data.sessionID, (draft) => {
-            const match = message.latestTool(message.assistant(draft, event.data.assistantMessageID), event.data.callID)
-            if (!match || (match.state.status !== "pending" && match.state.status !== "running")) return
+        case "session.tool.failed":
+          message.update(event.data.sessionID, (draft, index) => {
+            const match = message.latestTool(
+              message.assistant(draft, index, event.data.assistantMessageID),
+              event.data.callID,
+            )
+            if (!match || (match.state.status !== "streaming" && match.state.status !== "running")) return
             match.state = {
               status: "error",
               error: event.data.error,
@@ -334,119 +647,378 @@ export const { use: useData, provider: DataProvider } = createSimpleContext({
               content: match.state.status === "running" ? match.state.content : [],
               result: event.data.result,
             }
-            match.provider = {
-              executed: event.data.provider.executed || match.provider?.executed === true,
-              metadata: match.provider?.metadata,
-              resultMetadata: event.data.provider.metadata,
-            }
-            match.time.completed = event.data.timestamp
+            match.executed = event.data.executed || match.executed === true
+            match.providerResultState = event.data.resultState
+            match.time.completed = event.created
           })
           break
-        case "session.next.reasoning.started":
-          message.update(event.data.sessionID, (draft) => {
-            message.assistant(draft, event.data.assistantMessageID)?.content.push({
+        case "session.reasoning.started":
+          message.update(event.data.sessionID, (draft, index) => {
+            message.assistant(draft, index, event.data.assistantMessageID)?.content.push({
               type: "reasoning",
-              id: event.data.reasoningID,
               text: "",
-              providerMetadata: event.data.providerMetadata,
+              state: event.data.state,
+              time: { created: event.created },
             })
           })
           break
-        case "session.next.reasoning.delta":
-          message.update(event.data.sessionID, (draft) => {
-            const match = message.latestReasoning(
-              message.assistant(draft, event.data.assistantMessageID),
-              event.data.reasoningID,
-            )
+        case "session.reasoning.delta":
+          message.update(event.data.sessionID, (draft, index) => {
+            const match = message.latestReasoning(message.assistant(draft, index, event.data.assistantMessageID))
             if (match) match.text += event.data.delta
           })
           break
-        case "session.next.reasoning.ended":
-          message.update(event.data.sessionID, (draft) => {
-            const match = message.latestReasoning(
-              message.assistant(draft, event.data.assistantMessageID),
-              event.data.reasoningID,
-            )
+        case "session.reasoning.ended":
+          message.update(event.data.sessionID, (draft, index) => {
+            const match = message.latestReasoning(message.assistant(draft, index, event.data.assistantMessageID))
             if (match) {
               match.text = event.data.text
-              if (event.data.providerMetadata !== undefined) match.providerMetadata = event.data.providerMetadata
+              match.time = { created: match.time?.created ?? event.created, completed: event.created }
+              if (event.data.state !== undefined) match.state = event.data.state
             }
           })
           break
-        case "session.next.retried":
-        case "session.next.compaction.started":
-        case "session.next.compaction.delta":
+        case "session.retry.scheduled":
+          message.update(event.data.sessionID, (draft, index) => {
+            const currentAssistant = message.assistant(draft, index, event.data.assistantMessageID)
+            if (!currentAssistant) return
+            currentAssistant.retry = {
+              attempt: event.data.attempt,
+              at: event.data.at,
+              error: event.data.error,
+            }
+          })
           break
-        case "session.next.compaction.ended":
-          message.update(event.data.sessionID, (draft) => {
-            message.prepend(draft, {
-              id: event.data.messageID,
+        case "session.execution.started":
+          setSessionActive(event.data.sessionID, "running")
+          break
+        case "session.compaction.admitted":
+          addPending({
+            id: event.data.inputID,
+            sessionID: event.data.sessionID,
+            admittedSeq: event.durable.seq,
+            timeCreated: event.created,
+            type: "compaction",
+          })
+          break
+        case "session.compaction.started":
+          removePending(event.data.sessionID, event.data.inputID)
+          message.update(event.data.sessionID, (draft, index) => {
+            message.append(draft, index, {
+              id: event.data.inputID ?? messageIDFromEvent(event.id),
               type: "compaction",
+              status: "running",
               reason: event.data.reason,
-              summary: event.data.text,
-              recent: event.data.recent,
-              time: { created: event.data.timestamp },
+              summary: "",
+              recent: event.data.recent ?? "",
+              time: { created: event.created },
             })
           })
           break
+        case "session.execution.succeeded":
+        case "session.execution.failed":
+        case "session.execution.interrupted":
+          setSessionActive(event.data.sessionID, "idle")
+          message.update(event.data.sessionID, (draft) => {
+            const currentAssistant = message.activeAssistant(draft)
+            if (currentAssistant) currentAssistant.retry = undefined
+          })
+          break
+        case "session.revert.staged":
+          if (store.session.info[event.data.sessionID])
+            setStore("session", "info", event.data.sessionID, "revert", event.data.revert)
+          break
+        case "session.revert.cleared":
+          if (store.session.info[event.data.sessionID])
+            setStore("session", "info", event.data.sessionID, "revert", undefined)
+          break
+        case "session.revert.committed":
+          if (store.session.info[event.data.sessionID]) {
+            setStore("session", "info", event.data.sessionID, "revert", undefined)
+          }
+          setStore(
+            "session",
+            "input",
+            event.data.sessionID,
+            (store.session.input[event.data.sessionID] ?? []).filter((id) => id < event.data.to),
+          )
+          message.update(event.data.sessionID, (draft, index) => {
+            const position = draft.findIndex((item) => item.id >= event.data.to)
+            if (position === -1) return
+            for (const item of draft.splice(position)) index.delete(item.id)
+          })
+          break
+        case "session.compaction.delta":
+          message.update(event.data.sessionID, (draft) => {
+            const current = message.compaction(draft)
+            if (current?.status === "running") current.summary += event.data.text
+          })
+          break
+        case "session.compaction.ended":
+          message.update(event.data.sessionID, (draft, index) => {
+            const position = draft.findLastIndex((item) => item.type === "compaction" && item.status === "running")
+            const current = draft[position]
+            if (current?.type === "compaction") {
+              Object.assign(current, {
+                status: "completed",
+                reason: event.data.reason,
+                summary: event.data.text,
+                recent: event.data.recent,
+              })
+              return
+            }
+            message.append(draft, index, {
+              id: messageIDFromEvent(event.id),
+              type: "compaction",
+              status: "completed",
+              reason: event.data.reason,
+              summary: event.data.text,
+              recent: event.data.recent,
+              time: { created: event.created },
+            })
+          })
+          break
+        case "session.compaction.failed":
+          removePending(event.data.sessionID, event.data.inputID)
+          message.update(event.data.sessionID, (draft, index) => {
+            const position = draft.findLastIndex((item) => item.type === "compaction" && item.status === "running")
+            const current = draft[position]
+            const failed: Extract<SessionMessageInfo, { type: "compaction"; status: "failed" }> = {
+              id: current?.id ?? event.data.inputID ?? messageIDFromEvent(event.id),
+              type: "compaction",
+              status: "failed",
+              reason: event.data.reason ?? "manual",
+              error: event.data.error ?? {
+                type: "compaction.failed",
+                message: "Compaction failed before recording an error",
+              },
+              metadata: current?.type === "compaction" ? current.metadata : event.metadata,
+              time: current?.type === "compaction" ? current.time : { created: event.created },
+            }
+            if (current?.type === "compaction") {
+              draft[position] = failed
+              return
+            }
+            message.append(draft, index, failed)
+          })
+          break
+        case "permission.v2.asked":
+          if (store.session.permission[event.data.sessionID]?.some((request) => request.id === event.data.id)) break
+          setStore("session", "permission", event.data.sessionID, [
+            ...(store.session.permission[event.data.sessionID] ?? []),
+            event.data,
+          ])
+          break
+        case "permission.v2.replied":
+          setStore(
+            "session",
+            "permission",
+            event.data.sessionID,
+            (store.session.permission[event.data.sessionID] ?? []).filter(
+              (request) => request.id !== event.data.requestID,
+            ),
+          )
+          break
+        case "form.created":
+          if (store.session.form[event.data.form.sessionID]?.some((form) => form.id === event.data.form.id)) break
+          setStore("session", "form", event.data.form.sessionID, [
+            ...(store.session.form[event.data.form.sessionID] ?? []),
+            event.data.form.sessionID === "global" ? { ...event.data.form, location: event.location } : event.data.form,
+          ])
+          break
+        case "form.replied":
+        case "form.cancelled":
+          setStore(
+            "session",
+            "form",
+            event.data.sessionID,
+            (store.session.form[event.data.sessionID] ?? []).filter((form) => form.id !== event.data.id),
+          )
+          break
+        case "shell.created":
+          setStore("location", locationKey(event.location ?? defaultLocation()), (data) => ({
+            ...data,
+            shell: { ...data?.shell, [event.data.info.id]: event.data.info },
+          }))
+          break
+        case "shell.exited":
+        case "shell.deleted":
+          if (event.location) {
+            setStore("location", locationKey(event.location), (data) => ({
+              ...data,
+              shell: Object.fromEntries(Object.entries(data?.shell ?? {}).filter(([id]) => id !== event.data.id)),
+            }))
+            break
+          }
+          setStore(
+            "location",
+            produce((draft) => {
+              for (const data of Object.values(draft)) delete data.shell?.[event.data.id]
+            }),
+          )
+          break
         case "reference.updated":
-          void result.location.reference.refresh()
+          result.location.reference.invalidate()
+          void result.location.reference.sync()
           break
         case "integration.updated":
+          result.location.integration.invalidate(event.location)
+          result.location.model.invalidate(event.location)
+          result.location.provider.invalidate(event.location)
           void Promise.all([
-            result.location.integration.refresh(event.location),
-            result.location.model.refresh(event.location),
-            result.location.provider.refresh(event.location),
+            result.location.integration.sync(event.location),
+            result.location.model.sync(event.location),
+            result.location.provider.sync(event.location),
           ])
+          break
+        // Authenticating an MCP integration reconnects its server, which emits mcp.status.changed,
+        // so the mcp list syncs here rather than off integration.updated.
+        case "mcp.status.changed":
+          result.location.mcp.server.invalidate(event.location)
+          void result.location.mcp.server.sync(event.location)
+          break
+        case "mcp.resources.changed":
+          result.location.mcp.resource.invalidate(event.location)
+          void result.location.mcp.resource.sync(event.location)
           break
       }
     }
 
-    onMount(() => {
-      const unsub = events.subscribe((event, metadata) => {
-        handleEvent({
-          ...event,
-          data: event.properties,
-          location: { directory: metadata.directory, workspaceID: metadata.workspace },
-        } as V2Event)
-      })
-      onCleanup(unsub)
-    })
-
     const result = {
+      on: client.event.on,
+      listen: client.event.listen,
       session: {
+        list() {
+          return Object.values(store.session.info).toSorted((a, b) => b.time.updated - a.time.updated)
+        },
         get(sessionID: string) {
           return store.session.info[sessionID]
         },
-        async refresh(sessionID: string) {
-          const result = await sdk.client.v2.session.get({ sessionID }, { throwOnError: true })
-          setStore("session", "info", sessionID, result.data.data)
+        root(sessionID: string) {
+          return resolveRoot(sessionID)
+        },
+        family(sessionID: string) {
+          return store.session.family[resolveRoot(sessionID)] ?? []
+        },
+        cost(sessionID: string) {
+          const session = store.session.info[sessionID]
+          if (!session) return 0
+          if (session.parentID) return session.cost
+          return (store.session.family[sessionID] ?? [sessionID]).reduce(
+            (total, id) => total + (store.session.info[id]?.cost ?? 0),
+            0,
+          )
+        },
+        status(sessionID: string) {
+          return store.session.active[sessionID] ?? "idle"
+        },
+        input: {
+          list(sessionID: string) {
+            return store.session.input[sessionID] ?? []
+          },
+          has(sessionID: string, inputID: string) {
+            return store.session.input[sessionID]?.includes(inputID) ?? false
+          },
+        },
+        pending: {
+          list(sessionID: string) {
+            return store.session.pending[sessionID] ?? []
+          },
+          sync(sessionID: string) {
+            return sync.run(`session.pending:${sessionID}`, async () => {
+              const pending = await client.api.session.pending.list({ sessionID })
+              setStore("session", "pending", sessionID, reconcile(pending))
+              setStore(
+                "session",
+                "input",
+                sessionID,
+                reconcile(pending.filter((item) => item.type !== "compaction").map((item) => item.id)),
+              )
+            })
+          },
+          invalidate(sessionID: string) {
+            sync.invalidate(`session.pending:${sessionID}`)
+          },
+        },
+        sync(sessionID: string) {
+          return sync.run(`session:${sessionID}`, async () => {
+            setStore("session", "info", sessionID, await client.api.session.get({ sessionID }))
+            registerSession(sessionID)
+          })
+        },
+        invalidate(sessionID: string) {
+          sync.invalidate(`session:${sessionID}`)
         },
         message: {
           list(sessionID: string) {
-            return store.session.message[sessionID]
+            return store.session.message[sessionID] ?? []
           },
-          async refresh(sessionID: string) {
-            const result = await sdk.client.v2.session.messages({ sessionID }, { throwOnError: true })
-            setStore("session", "message", sessionID, result.data.data)
+          get(sessionID: string, messageID: string) {
+            const messages = store.session.message[sessionID]
+            const position = messageIndex.get(sessionID)?.get(messageID)
+            return position === undefined ? undefined : messages?.[position]
+          },
+          sync(sessionID: string) {
+            return sync.run(`session.message:${sessionID}`, async () => {
+              const messages = (
+                await client.api.message.list({ sessionID, limit: 200, order: "desc" })
+              ).data.toReversed()
+              messageIndex.set(sessionID, new Map(messages.map((message, index) => [message.id, index])))
+              setStore("session", "message", sessionID, reconcile(messages))
+            })
+          },
+          invalidate(sessionID: string) {
+            sync.invalidate(`session.message:${sessionID}`)
           },
         },
         permission: {
           list(sessionID: string) {
             return store.session.permission[sessionID]
           },
-          async refresh(sessionID: string) {
-            const result = await sdk.client.v2.session.permission.list({ sessionID }, { throwOnError: true })
-            setStore("session", "permission", sessionID, result.data.data)
+          sync(sessionID: string) {
+            return sync.run(`session.permission:${sessionID}`, async () => {
+              setStore("session", "permission", sessionID, await client.api.permission.list({ sessionID }))
+            })
+          },
+          invalidate(sessionID: string) {
+            sync.invalidate(`session.permission:${sessionID}`)
           },
         },
-        question: {
-          list(sessionID: string) {
-            return store.session.question[sessionID]
+        form: {
+          list(sessionID: string, ref?: LocationRef) {
+            const forms = store.session.form[sessionID]
+            if (sessionID !== "global") return forms
+            if (!ref) return
+            const key = locationKey(ref)
+            return forms?.filter((form) => form.location && locationKey(form.location) === key)
           },
-          async refresh(sessionID: string) {
-            const result = await sdk.client.v2.session.question.list({ sessionID }, { throwOnError: true })
-            setStore("session", "question", sessionID, result.data.data)
+          sync(sessionID: string, ref?: LocationRef) {
+            const key = `session.form:${sessionID}:${sessionID === "global" ? locationKey(ref ?? defaultLocation()) : ""}`
+            return sync.run(key, async () => {
+              if (sessionID === "global") {
+                const response = await client.api.form.request.list({
+                  location: locationQuery(ref ?? defaultLocation()),
+                })
+                const location = {
+                  directory: response.location.directory,
+                  workspaceID: response.location.workspaceID,
+                }
+                const locationID = locationKey(location)
+                setStore("session", "form", sessionID, [
+                  ...(store.session.form[sessionID] ?? []).filter(
+                    (form) => form.location && locationKey(form.location) !== locationID,
+                  ),
+                  ...response.data.filter((form) => form.sessionID === "global").map((form) => ({ ...form, location })),
+                ])
+                return
+              }
+              setStore("session", "form", sessionID, await client.api.form.list({ sessionID }))
+            })
+          },
+          invalidate(sessionID: string, ref?: LocationRef) {
+            sync.invalidate(
+              `session.form:${sessionID}:${sessionID === "global" ? locationKey(ref ?? defaultLocation()) : ""}`,
+            )
           },
         },
       },
@@ -455,114 +1027,295 @@ export const { use: useData, provider: DataProvider } = createSimpleContext({
           list(projectID: string) {
             return store.project.permission[projectID]
           },
-          async refresh(projectID: string) {
-            const result = await sdk.client.v2.permission.saved.list({ projectID }, { throwOnError: true })
-            setStore("project", "permission", projectID, result.data.data)
+          sync(projectID: string) {
+            return sync.run(`project.permission:${projectID}`, async () => {
+              setStore("project", "permission", projectID, await client.api.permission.saved.list({ projectID }))
+            })
+          },
+          invalidate(projectID: string) {
+            sync.invalidate(`project.permission:${projectID}`)
           },
         },
       },
+      shell: {
+        list(location?: LocationRef) {
+          return Object.values(store.location[locationKey(location ?? defaultLocation())]?.shell ?? {})
+        },
+        get(id: string) {
+          return Object.values(store.location)
+            .map((data) => data.shell?.[id])
+            .find((shell) => shell !== undefined)
+        },
+        sync(ref?: LocationRef) {
+          const id = locationKey(ref ?? defaultLocation())
+          return sync.run(`location.shell:${id}`, async () => {
+            const response = await client.api.shell.list({ location: locationQuery(ref ?? defaultLocation()) })
+            const key = locationKey(response.location)
+            setStore("location", key, {
+              ...store.location[key],
+              shell: Object.fromEntries(response.data.map((info) => [info.id, info])),
+            })
+          })
+        },
+        invalidate(ref?: LocationRef) {
+          sync.invalidate(`location.shell:${locationKey(ref ?? defaultLocation())}`)
+        },
+      },
       location: {
+        info(ref?: LocationRef) {
+          return store.location[locationKey(ref ?? defaultLocation())]?.info
+        },
         default() {
           return defaultLocation()
         },
-        async refresh(ref?: LocationRef) {
-          const response = await sdk.client.v2.location.get({ location: locationQuery(ref) }, { throwOnError: true })
-          const location = response.data
-          const key = locationKey(location)
-          if (!store.location[key]) setStore("location", key, {})
-          if (!ref) setDefaultLocation({ directory: location.directory, workspaceID: location.workspaceID })
+        async sync(ref?: LocationRef) {
+          const current = ref ?? defaultLocation()
+          await sync.run(`location:${locationKey(current)}`, async () => {
+            const location = await client.api.location.get({ location: locationQuery(current) })
+            const key = locationKey(location)
+            if (!store.location[key]) setStore("location", key, {})
+            setStore("location", key, "info", location)
+            if (!ref) {
+              setDefaultLocation({ directory: location.directory, workspaceID: location.workspaceID })
+            }
+          })
+          const location = ref ?? defaultLocation()
+          await Promise.all([
+            result.location.agent.sync(location),
+            result.location.command.sync(location),
+            result.location.integration.sync(location),
+            result.location.mcp.server.sync(location),
+            result.location.mcp.resource.sync(location),
+            result.location.model.sync(location),
+            result.location.provider.sync(location),
+            result.location.reference.sync(location),
+            result.location.skill.sync(location),
+            result.shell.sync(location),
+            result.session.form.sync("global", location),
+          ])
+        },
+        invalidate(ref?: LocationRef) {
+          const location = ref ?? defaultLocation()
+          sync.invalidate(`location:${locationKey(location)}`)
+          result.location.agent.invalidate(location)
+          result.location.command.invalidate(location)
+          result.location.integration.invalidate(location)
+          result.location.mcp.server.invalidate(location)
+          result.location.mcp.resource.invalidate(location)
+          result.location.model.invalidate(location)
+          result.location.provider.invalidate(location)
+          result.location.reference.invalidate(location)
+          result.location.skill.invalidate(location)
+          result.shell.invalidate(location)
+          result.session.form.invalidate("global", location)
         },
         agent: {
           list(location?: LocationRef) {
             return store.location[locationKey(location ?? defaultLocation())]?.agent
           },
-          async refresh(ref?: LocationRef) {
-            const result = await sdk.client.v2.agent.list({ location: locationQuery(ref) }, { throwOnError: true })
-            const key = locationKey(result.data.location)
-            setStore("location", key, "agent", result.data.data)
+          sync(ref?: LocationRef) {
+            const id = locationKey(ref ?? defaultLocation())
+            return sync.run(`location.agent:${id}`, async () => {
+              const response = await client.api.agent.list({ location: locationQuery(ref ?? defaultLocation()) })
+              const key = locationKey(response.location)
+              setStore("location", key, { ...store.location[key], agent: response.data })
+            })
+          },
+          invalidate(ref?: LocationRef) {
+            sync.invalidate(`location.agent:${locationKey(ref ?? defaultLocation())}`)
           },
         },
         command: {
           list(location?: LocationRef) {
             return store.location[locationKey(location ?? defaultLocation())]?.command
           },
-          async refresh(ref?: LocationRef) {
-            const result = await sdk.client.v2.command.list({ location: locationQuery(ref) }, { throwOnError: true })
-            const key = locationKey(result.data.location)
-            setStore("location", key, "command", result.data.data)
+          sync(ref?: LocationRef) {
+            const id = locationKey(ref ?? defaultLocation())
+            return sync.run(`location.command:${id}`, async () => {
+              const response = await client.api.command.list({ location: locationQuery(ref ?? defaultLocation()) })
+              const key = locationKey(response.location)
+              setStore("location", key, { ...store.location[key], command: response.data })
+            })
+          },
+          invalidate(ref?: LocationRef) {
+            sync.invalidate(`location.command:${locationKey(ref ?? defaultLocation())}`)
           },
         },
         integration: {
           list(location?: LocationRef) {
             return store.location[locationKey(location ?? defaultLocation())]?.integration
           },
-          async refresh(ref?: LocationRef) {
-            const result = await sdk.client.v2.integration.list(
-              { location: locationQuery(ref) },
-              { throwOnError: true },
-            )
-            const key = locationKey(result.data.location)
-            setStore("location", key, "integration", result.data.data)
+          sync(ref?: LocationRef) {
+            const id = locationKey(ref ?? defaultLocation())
+            return sync.run(`location.integration:${id}`, async () => {
+              const response = await client.api.integration.list({ location: locationQuery(ref ?? defaultLocation()) })
+              const key = locationKey(response.location)
+              setStore("location", key, { ...store.location[key], integration: response.data })
+            })
+          },
+          invalidate(ref?: LocationRef) {
+            sync.invalidate(`location.integration:${locationKey(ref ?? defaultLocation())}`)
+          },
+        },
+        mcp: {
+          server: {
+            list(location?: LocationRef) {
+              return store.location[locationKey(location ?? defaultLocation())]?.mcp?.server
+            },
+            sync(ref?: LocationRef) {
+              const id = locationKey(ref ?? defaultLocation())
+              return sync.run(`location.mcp.server:${id}`, async () => {
+                const response = await client.api.mcp.list({ location: locationQuery(ref ?? defaultLocation()) })
+                const key = locationKey(response.location)
+                setStore("location", key, {
+                  ...store.location[key],
+                  mcp: { ...store.location[key]?.mcp, server: response.data },
+                })
+              })
+            },
+            invalidate(ref?: LocationRef) {
+              sync.invalidate(`location.mcp.server:${locationKey(ref ?? defaultLocation())}`)
+            },
+          },
+          resource: {
+            list(location?: LocationRef) {
+              return store.location[locationKey(location ?? defaultLocation())]?.mcp?.resource
+            },
+            sync(ref?: LocationRef) {
+              const id = locationKey(ref ?? defaultLocation())
+              return sync.run(`location.mcp.resource:${id}`, async () => {
+                const response = await client.api.mcp.resource.catalog({
+                  location: locationQuery(ref ?? defaultLocation()),
+                })
+                const key = locationKey(response.location)
+                setStore("location", key, {
+                  ...store.location[key],
+                  mcp: { ...store.location[key]?.mcp, resource: response.data.resources },
+                })
+              })
+            },
+            invalidate(ref?: LocationRef) {
+              sync.invalidate(`location.mcp.resource:${locationKey(ref ?? defaultLocation())}`)
+            },
           },
         },
         model: {
           list(location?: LocationRef) {
             return store.location[locationKey(location ?? defaultLocation())]?.model
           },
-          async refresh(ref?: LocationRef) {
-            const result = await sdk.client.v2.model.list({ location: locationQuery(ref) }, { throwOnError: true })
-            const key = locationKey(result.data.location)
-            setStore("location", key, "model", result.data.data)
+          sync(ref?: LocationRef) {
+            const id = locationKey(ref ?? defaultLocation())
+            return sync.run(`location.model:${id}`, async () => {
+              const response = await client.api.model.list({ location: locationQuery(ref ?? defaultLocation()) })
+              const key = locationKey(response.location)
+              setStore("location", key, { ...store.location[key], model: response.data })
+            })
+          },
+          invalidate(ref?: LocationRef) {
+            sync.invalidate(`location.model:${locationKey(ref ?? defaultLocation())}`)
           },
         },
         provider: {
           list(location?: LocationRef) {
             return store.location[locationKey(location ?? defaultLocation())]?.provider
           },
-          async refresh(ref?: LocationRef) {
-            const result = await sdk.client.v2.provider.list({ location: locationQuery(ref) }, { throwOnError: true })
-            const key = locationKey(result.data.location)
-            setStore("location", key, "provider", result.data.data)
+          sync(ref?: LocationRef) {
+            const id = locationKey(ref ?? defaultLocation())
+            return sync.run(`location.provider:${id}`, async () => {
+              const response = await client.api.provider.list({ location: locationQuery(ref ?? defaultLocation()) })
+              const key = locationKey(response.location)
+              setStore("location", key, { ...store.location[key], provider: response.data })
+            })
+          },
+          invalidate(ref?: LocationRef) {
+            sync.invalidate(`location.provider:${locationKey(ref ?? defaultLocation())}`)
           },
         },
         reference: {
           list(location?: LocationRef) {
             return store.location[locationKey(location ?? defaultLocation())]?.reference
           },
-          async refresh(ref?: LocationRef) {
-            const result = await sdk.client.v2.reference.list({ location: locationQuery(ref) }, { throwOnError: true })
-            const key = locationKey(result.data.location)
-            setStore("location", key, "reference", result.data.data)
+          sync(ref?: LocationRef) {
+            const id = locationKey(ref ?? defaultLocation())
+            return sync.run(`location.reference:${id}`, async () => {
+              const response = await client.api.reference.list({ location: locationQuery(ref ?? defaultLocation()) })
+              const key = locationKey(response.location)
+              setStore("location", key, { ...store.location[key], reference: response.data })
+            })
+          },
+          invalidate(ref?: LocationRef) {
+            sync.invalidate(`location.reference:${locationKey(ref ?? defaultLocation())}`)
           },
         },
         skill: {
           list(location?: LocationRef) {
             return store.location[locationKey(location ?? defaultLocation())]?.skill
           },
-          async refresh(ref?: LocationRef) {
-            const result = await sdk.client.v2.skill.list({ location: locationQuery(ref) }, { throwOnError: true })
-            const key = locationKey(result.data.location)
-            setStore("location", key, "skill", result.data.data)
+          sync(ref?: LocationRef) {
+            const id = locationKey(ref ?? defaultLocation())
+            return sync.run(`location.skill:${id}`, async () => {
+              const response = await client.api.skill.list({ location: locationQuery(ref ?? defaultLocation()) })
+              const key = locationKey(response.location)
+              setStore("location", key, { ...store.location[key], skill: response.data })
+            })
+          },
+          invalidate(ref?: LocationRef) {
+            sync.invalidate(`location.skill:${locationKey(ref ?? defaultLocation())}`)
           },
         },
       },
     }
+    result satisfies Plugin.Context["data"]
 
-    onMount(() => {
-      void Promise.allSettled([
-        result.location.refresh(),
-        result.location.agent.refresh(),
-        result.location.integration.refresh(),
-        result.location.model.refresh(),
-        result.location.provider.refresh(),
-        result.location.reference.refresh(),
-        result.location.command.refresh(),
-        result.location.skill.refresh(),
-      ]).then((settled) => {
-        for (const failure of settled.filter((item) => item.status === "rejected"))
-          console.error("Failed to refresh default location data", failure.reason)
-      })
+    createEffect(() => {
+      if (client.connection.status() === "connected") return
+      sync.invalidate()
     })
+
+    onCleanup(
+      client.event.listen(({ details }) => {
+        if (details.type === "server.connected") {
+          void client.api.session
+            .active()
+            .then((active) => {
+              setStore(
+                "session",
+                "active",
+                reconcile(Object.fromEntries(Object.keys(active).map((sessionID) => [sessionID, "running" as const]))),
+              )
+            })
+            .catch(() => undefined)
+          void client.api.location
+            .get({ location: locationQuery(defaultLocation()) })
+            .then((location) => {
+              const key = locationKey(location)
+              setStore("location", key, { ...store.location[key], info: location })
+              return client.api.session.list({
+                project: location.project.id,
+                limit: 50,
+                order: "desc",
+                parentID: null,
+              })
+            })
+            .then((response) => {
+              setStore(
+                "session",
+                "info",
+                produce((draft) => {
+                  for (const session of response.data) draft[session.id] = session
+                }),
+              )
+              for (const session of response.data) {
+                sync.complete(`session:${session.id}`)
+                registerSession(session.id)
+              }
+            })
+            .catch((error) => console.error("Failed to preload sessions", error))
+          return
+        }
+        handleEvent(details)
+      }),
+    )
 
     return result
   },

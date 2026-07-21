@@ -1,32 +1,24 @@
-import { useProject } from "../../context/project"
-import { useSync } from "../../context/sync"
+import { useData } from "../../context/data"
 import { createMemo, Show } from "solid-js"
 import { useTheme } from "../../context/theme"
-import { useTuiConfig } from "../../config"
-import { InstallationChannel, InstallationVersion } from "@opencode-ai/core/installation/version"
+import { useConfig } from "../../config"
 import { usePluginRuntime } from "../../plugin/runtime"
+import { PluginSlot } from "../../plugin/context"
 
 import { getScrollAcceleration } from "../../util/scroll"
-import { WorkspaceLabel } from "../../component/workspace-label"
 
 export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
   const pluginRuntime = usePluginRuntime()
-  const project = useProject()
-  const sync = useSync()
-  const { theme } = useTheme()
-  const tuiConfig = useTuiConfig()
-  const session = createMemo(() => sync.session.get(props.sessionID))
-  const workspace = () => {
-    const workspaceID = session()?.workspaceID
-    if (!workspaceID) return
-    return project.workspace.get(workspaceID)
-  }
-  const scrollAcceleration = createMemo(() => getScrollAcceleration(tuiConfig))
+  const data = useData()
+  const { themeV2 } = useTheme().contextual("elevated")
+  const config = useConfig().data
+  const session = createMemo(() => data.session.get(props.sessionID))
+  const scrollAcceleration = createMemo(() => getScrollAcceleration(config))
 
   return (
     <Show when={session()}>
       <box
-        backgroundColor={theme.backgroundPanel}
+        backgroundColor={themeV2.background()}
         width={42}
         height="100%"
         paddingTop={1}
@@ -40,8 +32,8 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
           scrollAcceleration={scrollAcceleration()}
           verticalScrollbarOptions={{
             trackOptions: {
-              backgroundColor: theme.background,
-              foregroundColor: theme.borderActive,
+              backgroundColor: themeV2.background(),
+              foregroundColor: themeV2.scrollbar(),
             },
           }}
         >
@@ -51,51 +43,22 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
               mode="single_winner"
               session_id={props.sessionID}
               title={session()!.title}
-              share_url={session()!.share?.url}
             >
               <box paddingRight={1}>
-                <text fg={theme.text}>
+                <text fg={themeV2.text()}>
                   <b>{session()!.title}</b>
                 </text>
-                <Show when={InstallationChannel !== "latest"}>
-                  <text fg={theme.textMuted}>{props.sessionID}</text>
-                </Show>
-                <Show when={session()!.workspaceID}>
-                  <text fg={theme.textMuted}>
-                    <Show
-                      when={workspace()}
-                      fallback={<WorkspaceLabel type="unknown" name={session()!.workspaceID!} status="error" icon />}
-                    >
-                      {(item) => (
-                        <WorkspaceLabel
-                          type={item().type}
-                          name={item().name}
-                          status={project.workspace.status(item().id) ?? "error"}
-                          icon
-                        />
-                      )}
-                    </Show>
-                  </text>
-                </Show>
-                <Show when={session()!.share?.url}>
-                  <text fg={theme.textMuted}>{session()!.share!.url}</text>
+                <Show when={session()!.location.workspaceID}>
+                  <text fg={themeV2.text.subdued()}>{session()!.location.workspaceID}</text>
                 </Show>
               </box>
             </pluginRuntime.Slot>
-            <pluginRuntime.Slot name="sidebar_content" session_id={props.sessionID} />
+            <PluginSlot name="sidebar.content" input={{ sessionID: props.sessionID }} />
           </box>
         </scrollbox>
 
         <box flexShrink={0} gap={1} paddingTop={1}>
-          <pluginRuntime.Slot name="sidebar_footer" mode="single_winner" session_id={props.sessionID}>
-            <text fg={theme.textMuted}>
-              <span style={{ fg: theme.success }}>•</span> <b>Open</b>
-              <span style={{ fg: theme.text }}>
-                <b>Code</b>
-              </span>{" "}
-              <span>{InstallationVersion}</span>
-            </text>
-          </pluginRuntime.Slot>
+          <PluginSlot name="sidebar.footer" />
         </box>
       </box>
     </Show>

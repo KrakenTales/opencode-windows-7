@@ -1,3 +1,5 @@
+import { stringWidth } from "./string-width"
+
 export function titlecase(str: string) {
   return str.replace(/\b\w/g, (c) => c.toUpperCase())
 }
@@ -61,6 +63,24 @@ export function duration(input: number) {
 export function truncate(str: string, len: number): string {
   if (str.length <= len) return str
   return str.slice(0, len - 1) + "…"
+}
+
+const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" })
+
+export function truncateWidth(str: string, width: number): string {
+  if (width <= 0) return ""
+  if (stringWidth(str) <= width) return str
+  if (width === 1) return "…"
+
+  const result: string[] = []
+  let used = 0
+  for (const item of graphemeSegmenter.segment(str)) {
+    const next = stringWidth(item.segment)
+    if (used + next > width - 1) break
+    result.push(item.segment)
+    used += next
+  }
+  return result.join("") + "…"
 }
 
 export function truncateLeft(str: string, len: number): string {

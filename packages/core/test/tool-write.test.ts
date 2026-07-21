@@ -17,8 +17,15 @@ import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
 import { WriteTool } from "@opencode-ai/core/tool/write"
 import { location } from "./fixture/location"
 import { tmpdir } from "./fixture/tmpdir"
+import { makeLocationNode } from "@opencode-ai/core/effect/app-node"
 import { testEffect } from "./lib/effect"
-import { toolIdentity, executeTool, settleTool, toolDefinitions } from "./lib/tool"
+import { toolIdentity, executeTool, registerToolPlugin, settleTool, toolDefinitions } from "./lib/tool"
+
+const writeToolNode = makeLocationNode({
+  name: "test/write-tool-plugin",
+  layer: Layer.effectDiscard(registerToolPlugin(WriteTool.Plugin)),
+  deps: [ToolRegistry.toolsNode, LocationMutation.node, FileMutation.node, PermissionV2.node],
+})
 
 const sessionID = SessionV2.ID.make("ses_write_tool_test")
 const assertions: PermissionV2.AssertInput[] = []
@@ -31,7 +38,15 @@ const permission = Layer.succeed(
     assert: (input) =>
       Effect.sync(() => assertions.push(input)).pipe(
         Effect.andThen(
-          input.action === denyAction ? Effect.fail(new PermissionV2.BlockedError({ rules: [] })) : Effect.void,
+          input.action === denyAction
+            ? Effect.fail(
+                new PermissionV2.BlockedError({
+                  rules: [],
+                  permission: input.action,
+                  resources: input.resources,
+                }),
+              )
+            : Effect.void,
         ),
       ),
     ask: () => Effect.die("unused"),
@@ -75,7 +90,7 @@ const withTool = <A, E, R>(directory: string, body: (registry: ToolRegistry.Inte
           ToolRegistry.toolsNode,
           LocationMutation.node,
           FileMutation.node,
-          WriteTool.node,
+          writeToolNode,
         ]),
         [
           [FSUtil.node, filesystem],
@@ -231,6 +246,40 @@ describe("WriteTool", () => {
               })
               expect(yield* Effect.promise(() => fs.readFile(target, "utf8"))).toBe("external")
               expect(writes).toEqual([canonicalTarget])
+            }),
+          ),
+        )
+      },
+      ([active, outside]) =>
+        Effect.promise(() =>
+          Promise.all([active[Symbol.asyncDispose](), outside[Symbol.asyncDispose]()]).then(() => undefined),
+        ),
+    ),
+  )
+
+  it.live("saves external directory approval at the nearest project directory", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => Promise.all([tmpdir(), tmpdir()])),
+      ([active, outside]) => {
+        reset()
+        const repo = path.join(outside.path, "repo")
+        const nested = path.join(repo, "packages", "app")
+        const target = path.join(nested, "external.txt")
+        return Effect.promise(() =>
+          Promise.all([fs.mkdir(path.join(repo, ".git"), { recursive: true }), fs.mkdir(nested, { recursive: true })]),
+        ).pipe(
+          Effect.andThen(
+            withTool(active.path, (registry) => executeTool(registry, call({ path: target, content: "external" }))),
+          ),
+          Effect.andThen(
+            Effect.gen(function* () {
+              const canonicalRepo = yield* Effect.promise(() => fs.realpath(repo))
+              const canonicalNested = yield* Effect.promise(() => fs.realpath(nested))
+              expect(assertions[0]).toMatchObject({
+                action: "external_directory",
+                resources: [path.join(canonicalNested, "*").replaceAll("\\", "/")],
+                save: [path.join(canonicalRepo, "*").replaceAll("\\", "/")],
+              })
             }),
           ),
         )

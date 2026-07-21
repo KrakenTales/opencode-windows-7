@@ -277,7 +277,7 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
         },
       }
     }),
-    "azure-cognitive-services": Effect.fnUntraced(function* () {
+    "azure-cognitive-services": Effect.fnUntraced(function* (provider: Info) {
       const resourceName = yield* dep.get("AZURE_COGNITIVE_SERVICES_RESOURCE_NAME")
       return {
         autoload: false,
@@ -285,7 +285,9 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
           return selectAzureLanguageModel(sdk, modelID, Boolean(options?.["useCompletionUrls"]))
         },
         options: {
-          baseURL: resourceName ? `https://${resourceName}.cognitiveservices.azure.com/openai` : undefined,
+          baseURL: resourceName
+            ? `https://${resourceName}.cognitiveservices.azure.com/openai${provider.options?.useDeploymentBasedUrls ? "" : "/v1"}`
+            : undefined,
         },
       }
     }),
@@ -1169,6 +1171,7 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Pr
 
 export const use = serviceUse(Service)
 
+// @ts-expect-error dead V1 consumes the removed pre-normalized ModelsDev model type.
 function cost(c: ModelsDev.Model["cost"]): Model["cost"] {
   const result: Model["cost"] = {
     input: c?.input ?? 0,
@@ -1179,6 +1182,7 @@ function cost(c: ModelsDev.Model["cost"]): Model["cost"] {
     },
   }
   if (c?.tiers) {
+    // @ts-expect-error dead V1 relies on the removed ModelsDev cost tier context.
     result.tiers = c.tiers.map((item) => ({
       input: item.input,
       output: item.output,
@@ -1202,6 +1206,7 @@ function cost(c: ModelsDev.Model["cost"]): Model["cost"] {
   return result
 }
 
+// @ts-expect-error dead V1 consumes removed provider and model types instead of snapshots.
 function fromModelsDevModel(provider: ModelsDev.Provider, model: ModelsDev.Model): Model {
   const base: Model = {
     id: ModelV2.ID.make(model.id),
@@ -1247,28 +1252,39 @@ function fromModelsDevModel(provider: ModelsDev.Provider, model: ModelsDev.Model
     variants: {},
   }
 
-  const variants = ProviderTransform.reasoningVariants(model, base) ?? ProviderTransform.variants(base)
-
   return {
     ...base,
-    variants: mapValues(variants, (v) => v),
+    variants: mapValues(ProviderTransform.variants(base), (v) => v),
   }
 }
 
+// @ts-expect-error dead V1 consumes the removed pre-normalized ModelsDev provider type.
 export function fromModelsDevProvider(provider: ModelsDev.Provider): Info {
   const models: Record<string, Model> = {}
   for (const [key, model] of Object.entries(provider.models)) {
     models[key] = fromModelsDevModel(provider, model)
+    // @ts-expect-error dead V1 expects raw model metadata inside a provider instead of normalized snapshots.
     for (const [mode, opts] of Object.entries(model.experimental?.modes ?? {})) {
+      // @ts-expect-error dead V1 expects raw model IDs inside normalized ModelsDev data.
       const id = `${model.id}-${mode}`
       const base = fromModelsDevModel(provider, model)
+      const providerOptions = (
+        opts as {
+          readonly provider?: {
+            readonly body?: Record<string, unknown>
+            readonly headers?: Record<string, string>
+          }
+        }
+      ).provider
       models[id] = {
         ...base,
         id: ModelV2.ID.make(id),
+        // @ts-expect-error dead V1 expects raw model names and mode options.
         name: `${model.name} ${mode[0].toUpperCase()}${mode.slice(1)}`,
+        // @ts-expect-error dead V1 expects raw mode costs inside normalized ModelsDev data.
         cost: opts.cost ? mergeDeep(base.cost, cost(opts.cost)) : base.cost,
-        options: modeOptions(base, opts.provider?.body),
-        headers: opts.provider?.headers ?? base.headers,
+        options: modeOptions(base, providerOptions?.body),
+        headers: providerOptions?.headers ?? base.headers,
       }
     }
   }
@@ -1363,13 +1379,13 @@ const layer = Layer.effect(
         function mergeProvider(providerID: ProviderV2.ID, provider: Partial<Info>) {
           const existing = providers[providerID]
           if (existing) {
-            // @ts-expect-error
+            // @ts-expect-error dead V1 merges partial provider records with legacy semantics.
             providers[providerID] = mergeDeep(existing, provider)
             return
           }
+          // @ts-expect-error dead V1 indexes the normalized ModelsDev snapshot array by provider ID.
           const match = database[providerID]
           if (!match) return
-          // @ts-expect-error
           providers[providerID] = mergeDeep(match, provider)
         }
 
@@ -1395,6 +1411,7 @@ const layer = Layer.effect(
           const providerID = ProviderV2.ID.make(p.id)
           if (disabled.has(providerID)) continue
 
+          // @ts-expect-error dead V1 indexes the normalized ModelsDev snapshot array by provider ID.
           const provider = database[providerID]
           if (!provider) continue
           const pluginAuth = yield* auth.get(providerID).pipe(Effect.orDie)
@@ -1416,6 +1433,7 @@ const layer = Layer.effect(
 
         // extend database from config
         for (const [providerID, provider] of configProviders) {
+          // @ts-expect-error dead V1 indexes the normalized ModelsDev snapshot array by provider ID.
           const existing = database[providerID]
           const parsed: Info = {
             id: ProviderV2.ID.make(providerID),
@@ -1433,6 +1451,7 @@ const layer = Layer.effect(
               model.provider?.npm ??
               provider.npm ??
               existingModel?.api.npm ??
+              // @ts-expect-error dead V1 indexes normalized ModelsDev snapshots for raw provider fields.
               modelsDev[providerID]?.npm ??
               "@ai-sdk/openai-compatible"
             const name = iife(() => {
@@ -1445,6 +1464,7 @@ const layer = Layer.effect(
               api: {
                 id: apiID,
                 npm: apiNpm,
+                // @ts-expect-error dead V1 indexes normalized ModelsDev snapshots for raw provider fields.
                 url: model.provider?.api ?? provider?.api ?? existingModel?.api.url ?? modelsDev[providerID]?.api ?? "",
               },
               status: model.status ?? existingModel?.status ?? "active",
@@ -1498,17 +1518,14 @@ const layer = Layer.effect(
               release_date: model.release_date ?? existingModel?.release_date ?? "",
               variants: {},
             }
-            const variants =
-              existingModel?.api.npm === parsedModel.api.npm
-                ? (existingModel.variants ?? ProviderTransform.variants(parsedModel))
-                : ProviderTransform.variants(parsedModel)
-            const merged = mergeDeep(variants, model.variants ?? {})
+            const merged = mergeDeep(ProviderTransform.variants(parsedModel), model.variants ?? {})
             parsedModel.variants = mapValues(
               pickBy(merged, (v) => !v.disabled),
               (v) => omit(v, ["disabled"]),
             )
             parsed.models[modelID] = parsedModel
           }
+          // @ts-expect-error dead V1 mutates a provider-keyed record, not normalized snapshots.
           database[providerID] = parsed
         }
 
@@ -1551,6 +1568,7 @@ const layer = Layer.effect(
           const options = yield* Effect.promise(() =>
             plugin.auth!.loader!(
               () => bridge.promise(auth.get(providerID).pipe(Effect.orDie)) as any,
+              // @ts-expect-error dead V1 indexes the normalized ModelsDev snapshot array by provider ID.
               toPublicInfo(database[plugin.auth!.provider]),
             ),
           )
@@ -1562,6 +1580,7 @@ const layer = Layer.effect(
         for (const [id, fn] of Object.entries(custom(dep))) {
           const providerID = ProviderV2.ID.make(id)
           if (disabled.has(providerID)) continue
+          // @ts-expect-error dead V1 indexes the normalized ModelsDev snapshot array by provider ID.
           const data = database[providerID]
           if (!data) {
             continue
@@ -1630,7 +1649,7 @@ const layer = Layer.effect(
             )
               delete provider.models[modelID]
 
-            if (model.variants === undefined) {
+            if (!model.variants || Object.keys(model.variants).length === 0) {
               model.variants = mapValues(ProviderTransform.variants(model), (v) => v)
             }
 

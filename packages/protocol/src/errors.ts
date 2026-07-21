@@ -1,4 +1,5 @@
 import { Schema } from "effect"
+import { Skill } from "@opencode-ai/schema/skill"
 
 export class InvalidRequestError extends Schema.TaggedErrorClass<InvalidRequestError>()(
   "InvalidRequestError",
@@ -21,6 +22,15 @@ export class ConflictError extends Schema.TaggedErrorClass<ConflictError>()(
   {
     message: Schema.String,
     resource: Schema.optional(Schema.String),
+  },
+  { httpApiStatus: 409 },
+) {}
+
+export class SessionBusyError extends Schema.TaggedErrorClass<SessionBusyError>()(
+  "SessionBusyError",
+  {
+    sessionID: Schema.String,
+    message: Schema.String,
   },
   { httpApiStatus: 409 },
 ) {}
@@ -71,6 +81,42 @@ export class MessageNotFoundError extends Schema.TaggedErrorClass<MessageNotFoun
   { httpApiStatus: 404 },
 ) {}
 
+export class SkillNotFoundError extends Schema.TaggedErrorClass<SkillNotFoundError>()(
+  "SkillNotFoundError",
+  {
+    skill: Skill.ID,
+    message: Schema.String,
+  },
+  { httpApiStatus: 404 },
+) {}
+
+export class McpServerNotFoundError extends Schema.TaggedErrorClass<McpServerNotFoundError>()(
+  "McpServerNotFoundError",
+  {
+    server: Schema.String,
+    message: Schema.String,
+  },
+  { httpApiStatus: 404 },
+) {}
+
+export class CommandNotFoundError extends Schema.TaggedErrorClass<CommandNotFoundError>()(
+  "CommandNotFoundError",
+  {
+    command: Schema.String,
+    message: Schema.String,
+  },
+  { httpApiStatus: 404 },
+) {}
+
+export class CommandEvaluationError extends Schema.TaggedErrorClass<CommandEvaluationError>()(
+  "CommandEvaluationError",
+  {
+    command: Schema.String,
+    message: Schema.String,
+  },
+  { httpApiStatus: 500 },
+) {}
+
 export class InvalidCursorError extends Schema.TaggedErrorClass<InvalidCursorError>()(
   "InvalidCursorError",
   { message: Schema.String },
@@ -95,6 +141,33 @@ export class QuestionNotFoundError extends Schema.TaggedErrorClass<QuestionNotFo
   { httpApiStatus: 404 },
 ) {}
 
+export class FormNotFoundError extends Schema.TaggedErrorClass<FormNotFoundError>()(
+  "FormNotFoundError",
+  {
+    id: Schema.String,
+    message: Schema.String,
+  },
+  { httpApiStatus: 404 },
+) {}
+
+export class FormAlreadySettledError extends Schema.TaggedErrorClass<FormAlreadySettledError>()(
+  "FormAlreadySettledError",
+  {
+    id: Schema.String,
+    message: Schema.String,
+  },
+  { httpApiStatus: 409 },
+) {}
+
+export class FormInvalidAnswerError extends Schema.TaggedErrorClass<FormInvalidAnswerError>()(
+  "FormInvalidAnswerError",
+  {
+    id: Schema.String,
+    message: Schema.String,
+  },
+  { httpApiStatus: 400 },
+) {}
+
 export class ForbiddenError extends Schema.TaggedErrorClass<ForbiddenError>()(
   "ForbiddenError",
   { message: Schema.String },
@@ -105,6 +178,15 @@ export class PtyNotFoundError extends Schema.TaggedErrorClass<PtyNotFoundError>(
   "PtyNotFoundError",
   {
     ptyID: Schema.String,
+    message: Schema.String,
+  },
+  { httpApiStatus: 404 },
+) {}
+
+export class ShellNotFoundError extends Schema.TaggedErrorClass<ShellNotFoundError>()(
+  "ShellNotFoundError",
+  {
+    id: Schema.String,
     message: Schema.String,
   },
   { httpApiStatus: 404 },

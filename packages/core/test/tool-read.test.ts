@@ -19,8 +19,25 @@ import { ToolRegistry } from "@opencode-ai/core/tool/registry"
 import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
 import { ReadTool } from "@opencode-ai/core/tool/read"
 import { ReadToolFileSystem } from "@opencode-ai/core/tool/read-filesystem"
+import { makeLocationNode } from "@opencode-ai/core/effect/app-node"
+import { SessionInstructions } from "@opencode-ai/core/session/instructions"
 import { testEffect } from "./lib/effect"
-import { toolIdentity, executeTool, settleTool, toolDefinitions } from "./lib/tool"
+import { toolIdentity, executeTool, registerToolPlugin, settleTool, toolDefinitions } from "./lib/tool"
+
+const readToolNode = makeLocationNode({
+  name: "test/read-tool-plugin",
+  layer: Layer.effectDiscard(registerToolPlugin(ReadTool.Plugin)),
+  deps: [
+    ToolRegistry.toolsNode,
+    ReadToolFileSystem.node,
+    LocationMutation.node,
+    Image.node,
+    PermissionV2.node,
+    SessionInstructions.node,
+    FSUtil.node,
+    Location.node,
+  ],
+})
 
 const assertions: PermissionV2.AssertInput[] = []
 const missingPath = "__missing_read_target__.txt"
@@ -64,7 +81,19 @@ const permission = Layer.succeed(
     assert: (input) =>
       Effect.sync(() => {
         assertions.push(input)
-      }).pipe(Effect.andThen(allow ? Effect.void : Effect.fail(new PermissionV2.BlockedError({ rules: [] })))),
+      }).pipe(
+        Effect.andThen(
+          allow
+            ? Effect.void
+            : Effect.fail(
+                new PermissionV2.BlockedError({
+                  rules: [],
+                  permission: input.action,
+                  resources: input.resources,
+                }),
+              ),
+        ),
+      ),
     ask: () => Effect.die("unused"),
     reply: () => Effect.die("unused"),
     get: () => Effect.die("unused"),
@@ -130,7 +159,7 @@ const unavailableImage = Layer.succeed(
   Image.Service.of({ normalize: () => Effect.fail(new Image.ResizerUnavailableError()) }),
 )
 const readLayer = (imageLayer: Layer.Layer<Image.Service>) =>
-  AppNodeBuilder.build(LayerNode.group([ToolRegistry.node, ToolRegistry.toolsNode, ReadTool.node]), [
+  AppNodeBuilder.build(LayerNode.group([ToolRegistry.node, ToolRegistry.toolsNode, readToolNode]), [
     [ReadToolFileSystem.node, reader],
     [PermissionV2.node, permission],
     [Config.node, config],
@@ -262,6 +291,9 @@ describe("ReadTool", () => {
         name: "pixel.png",
         mime: "image/png",
         encoding: "base64",
+        // Image base64 is carried by the content file item only; structured is slimmed
+        // so the original bytes are never persisted twice.
+        content: "",
       })
       expect(settled.output?.content).toMatchObject([
         { type: "text", text: "Image read successfully" },
@@ -335,7 +367,7 @@ describe("ReadTool", () => {
     }),
   )
 
-  it.effect("rejects invalid image data returned by the filesystem", () =>
+  it.effect("drops undecodable image data at settlement", () =>
     Effect.gen(function* () {
       readResult = {
         uri: "file:///truncated.png",
@@ -352,11 +384,17 @@ describe("ReadTool", () => {
           ...toolIdentity,
           call: { type: "tool-call", id: "call-truncated-image", name: "read", input: { path: "truncated.png" } },
         }),
-      ).toEqual({ type: "error", value: "Image could not be decoded: truncated.png" })
+      ).toEqual({
+        type: "content",
+        value: [
+          { type: "text", text: "Image read successfully" },
+          { type: "text", text: "[1 image omitted: could not be decoded.]" },
+        ],
+      })
     }),
   )
 
-  it.effect("rejects oversized images when resizing is disabled", () =>
+  it.effect("drops oversized images at settlement when resizing is disabled", () =>
     Effect.gen(function* () {
       const photon = yield* Effect.promise(() => import("@silvia-odwyer/photon-node"))
       const source = new photon.PhotonImage(new Uint8Array(Array.from({ length: 16 * 4 }, () => 255)), 16, 1)
@@ -380,14 +418,20 @@ describe("ReadTool", () => {
         }),
       ]
       const registry = yield* ToolRegistry.Service
-      const result = yield* executeTool(registry, {
-        sessionID,
-        ...toolIdentity,
-        call: { type: "tool-call", id: "call-wide-image", name: "read", input: { path: "wide.png" } },
-      })
 
-      expect(result.type).toBe("error")
-      if (result.type === "error") expect(result.value).toContain("exceeding configured limits 4x2000")
+      expect(
+        yield* executeTool(registry, {
+          sessionID,
+          ...toolIdentity,
+          call: { type: "tool-call", id: "call-wide-image", name: "read", input: { path: "wide.png" } },
+        }),
+      ).toEqual({
+        type: "content",
+        value: [
+          { type: "text", text: "Image read successfully" },
+          { type: "text", text: "[1 image omitted: could not be resized below the image size limit.]" },
+        ],
+      })
     }),
   )
 
@@ -431,7 +475,7 @@ describe("ReadTool", () => {
     }),
   )
 
-  it.effect("enforces max base64 bytes after resize attempts", () =>
+  it.effect("drops images that cannot fit max base64 bytes after resize attempts", () =>
     Effect.gen(function* () {
       const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
       readResult = {
@@ -452,14 +496,20 @@ describe("ReadTool", () => {
         }),
       ]
       const registry = yield* ToolRegistry.Service
-      const result = yield* executeTool(registry, {
-        sessionID,
-        ...toolIdentity,
-        call: { type: "tool-call", id: "call-max-bytes", name: "read", input: { path: "pixel.png" } },
-      })
 
-      expect(result.type).toBe("error")
-      if (result.type === "error") expect(result.value).toContain("/1 bytes")
+      expect(
+        yield* executeTool(registry, {
+          sessionID,
+          ...toolIdentity,
+          call: { type: "tool-call", id: "call-max-bytes", name: "read", input: { path: "pixel.png" } },
+        }),
+      ).toEqual({
+        type: "content",
+        value: [
+          { type: "text", text: "Image read successfully" },
+          { type: "text", text: "[1 image omitted: could not be resized below the image size limit.]" },
+        ],
+      })
     }),
   )
 

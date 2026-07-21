@@ -1,5 +1,86 @@
 import { expect, test } from "bun:test"
+import { LLMClient, LLMEvent, Model, type LLMRequest } from "@opencode-ai/ai"
+import { OpenAIChat } from "@opencode-ai/ai/protocols"
+import { Config } from "@opencode-ai/core/config"
+import { Database } from "@opencode-ai/core/database/database"
+import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
+import { llmClient } from "@opencode-ai/core/effect/app-node-platform"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { EventV2 } from "@opencode-ai/core/event"
+import { EventTable } from "@opencode-ai/core/event/sql"
 import { SessionCompaction } from "@opencode-ai/core/session/compaction"
+import { SessionEvent } from "@opencode-ai/core/session/event"
+import { SessionMessage } from "@opencode-ai/core/session/message"
+import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { SessionRunnerModel } from "@opencode-ai/core/session/runner/model"
+import { SessionTable } from "@opencode-ai/core/session/sql"
+import { SessionStore } from "@opencode-ai/core/session/store"
+import { SessionV2 } from "@opencode-ai/core/session"
+import { Project } from "@opencode-ai/core/project"
+import { ProjectTable } from "@opencode-ai/core/project/sql"
+import { Flag } from "@opencode-ai/core/flag/flag"
+import { InstallationVersion } from "@opencode-ai/core/installation/version"
+import { AbsolutePath } from "@opencode-ai/core/schema"
+import { Money } from "@opencode-ai/schema/money"
+import { DateTime, Effect, Fiber, Layer, Stream } from "effect"
+import { asc, eq } from "drizzle-orm"
+import { testEffect } from "./lib/effect"
+
+let requests: LLMRequest[] = []
+const model = Model.make({
+  id: "summary-model",
+  provider: "test",
+  route: OpenAIChat.route.with({ limits: { context: 10_000, output: 1_000 } }),
+})
+const cost = [
+  {
+    input: Money.USDPerMillionTokens.make(1),
+    output: Money.USDPerMillionTokens.make(2),
+    cache: {
+      read: Money.USDPerMillionTokens.make(0.1),
+      write: Money.USDPerMillionTokens.make(0.5),
+    },
+  },
+]
+const client = Layer.mock(LLMClient.Service)({
+  prepare: () => Effect.die("unused"),
+  stream: (request: LLMRequest) => {
+    requests.push(request)
+    return Stream.make(
+      LLMEvent.textDelta({ id: "summary", text: "manual summary" }),
+      LLMEvent.stepFinish({
+        index: 0,
+        reason: "stop",
+        usage: {
+          inputTokens: 15,
+          outputTokens: 6,
+          nonCachedInputTokens: 10,
+          cacheReadInputTokens: 3,
+          cacheWriteInputTokens: 2,
+          reasoningTokens: 2,
+        },
+      }),
+      LLMEvent.finish({
+        reason: "stop",
+      }),
+    )
+  },
+  generate: () => Effect.die("unused"),
+})
+const config = Layer.mock(Config.Service)({ entries: () => Effect.succeed([]) })
+const models = Layer.mock(SessionRunnerModel.Service)({
+  resolve: () => Effect.succeed(SessionRunnerModel.resolved(model, undefined, cost)),
+})
+const it = testEffect(
+  AppNodeBuilder.build(
+    LayerNode.group([Database.node, EventV2.node, SessionProjector.node, SessionStore.node, SessionCompaction.node]),
+    [
+      [llmClient, client],
+      [Config.node, config],
+      [SessionRunnerModel.node, models],
+    ],
+  ),
+)
 
 test("compaction prompt preserves detailed work state and relevant files", () => {
   const prompt = SessionCompaction.buildPrompt({ context: ["conversation history"] })
@@ -25,3 +106,113 @@ test("compaction describes tool media without embedding base64", () => {
   expect(serialized).toBe("Image read successfully\n[Attached image/png: pixel.png]")
   expect(serialized).not.toContain(base64)
 })
+
+test("compaction prompt requires the checkpoint headings in order", () => {
+  const prompt = SessionCompaction.buildPrompt({ context: ["Conversation history"] })
+  expect(prompt.match(/^#{2,3} .+$/gm)).toEqual([
+    "## Objective",
+    "## Important Details",
+    "## Work State",
+    "### Completed",
+    "### Active",
+    "### Blocked",
+    "## Next Move",
+    "## Relevant Files",
+  ])
+  expect(prompt).toContain("one or two brief sentences")
+  expect(prompt).toContain("constraints/preferences, decisions and why")
+  expect(prompt).toContain("immediate concrete action")
+  expect(prompt).toContain("next action if known")
+  expect(prompt).toContain("Keep every section, even when empty.")
+})
+
+it.effect("manual compaction summarizes short context instead of no-op", () =>
+  Effect.gen(function* () {
+    requests = []
+    const db = (yield* Database.Service).db
+    const compaction = yield* SessionCompaction.Service
+    const events = yield* EventV2.Service
+    const store = yield* SessionStore.Service
+    const sessionID = SessionV2.ID.make("ses_manual_compaction")
+    const parentID = SessionV2.ID.make("ses_manual_compaction_parent")
+    const userMessage = {
+      id: SessionMessage.ID.create(),
+      type: "user" as const,
+      text: "Manual compaction should include this short conversation.",
+      time: { created: DateTime.makeUnsafe(0) },
+    }
+    yield* db
+      .insert(ProjectTable)
+      .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+      .onConflictDoNothing()
+      .run()
+      .pipe(Effect.orDie)
+    yield* db
+      .insert(SessionTable)
+      .values({
+        id: sessionID,
+        project_id: Project.ID.global,
+        parent_id: parentID,
+        slug: "manual-compaction",
+        directory: "/project",
+        title: "Manual compaction",
+        version: "test",
+      })
+      .run()
+      .pipe(Effect.orDie)
+
+    const session = yield* store
+      .get(sessionID)
+      .pipe(
+        Effect.flatMap((session) =>
+          session ? Effect.succeed(session) : Effect.die("manual compaction test session missing"),
+        ),
+      )
+
+    const delta = yield* events
+      .subscribe(SessionEvent.Compaction.Delta)
+      .pipe(Stream.take(1), Stream.runCollect, Effect.forkScoped)
+    yield* Effect.yieldNow
+    expect(
+      yield* compaction.compactManual({
+        session,
+        messages: [userMessage],
+        inputID: SessionMessage.ID.make("msg_manual_compaction"),
+      }),
+    ).toEqual({ status: "completed" })
+    expect(Array.from(yield* Fiber.join(delta)).map((event) => event.data.text)).toEqual(["manual summary"])
+
+    expect(requests).toHaveLength(1)
+    expect(requests[0]?.http?.headers).toEqual({
+      "x-session-affinity": sessionID,
+      "X-Session-Id": sessionID,
+      "x-parent-session-id": parentID,
+      "User-Agent": `opencode/${InstallationVersion}`,
+      "x-opencode-project": Project.ID.global,
+      "x-opencode-session": sessionID,
+      "x-opencode-client": Flag.OPENCODE_CLIENT,
+    })
+    expect(requests[0]?.generation).toBeUndefined()
+    expect(JSON.stringify(requests[0]?.messages)).toContain("Manual compaction should include this short conversation.")
+    expect(yield* store.context(sessionID)).toMatchObject([
+      { type: "compaction", reason: "manual", summary: "manual summary", recent: "" },
+    ])
+    expect(yield* store.get(sessionID)).toMatchObject({
+      cost: 0.0000233,
+      tokens: { input: 10, output: 4, reasoning: 2, cache: { read: 3, write: 2 } },
+    })
+    expect(
+      yield* db
+        .select({ type: EventTable.type })
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, sessionID))
+        .orderBy(asc(EventTable.seq))
+        .all()
+        .pipe(Effect.orDie),
+    ).toEqual([
+      { type: EventV2.versionedType(SessionEvent.Compaction.Started.type, 1) },
+      { type: EventV2.versionedType(SessionEvent.UsageRecorded.type, 1) },
+      { type: EventV2.versionedType(SessionEvent.Compaction.Ended.type, 1) },
+    ])
+  }),
+)

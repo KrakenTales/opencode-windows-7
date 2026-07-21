@@ -1,7 +1,4 @@
 const dict: Record<string, string> = {
-  "session.todo.title": "Todos",
-  "session.todo.collapse": "Collapse todos",
-  "session.todo.expand": "Expand todos",
   "session.revertDock.summary.one": "{{count}} rolled back message",
   "session.revertDock.summary.other": "{{count}} rolled back messages",
   "session.revertDock.collapse": "Collapse rolled back messages",

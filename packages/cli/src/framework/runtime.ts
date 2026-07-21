@@ -1,7 +1,10 @@
-import * as Effect from "effect/Effect"
-import * as Command from "effect/unstable/cli/Command"
+import { Effect, FileSystem, Scope } from "effect"
+import { Command } from "effect/unstable/cli"
 import { Spec } from "./spec"
-import { Daemon } from "../services/daemon"
+import { Global } from "@opencode-ai/core/global"
+import { Updater } from "../services/updater"
+import { Config } from "../config"
+import { Npm } from "@opencode-ai/core/npm"
 
 export type Input<Value> =
   Value extends Spec.Node<infer _Name, infer Command, infer _Commands>
@@ -10,11 +13,29 @@ export type Input<Value> =
       ? Input
       : never
 
-type RuntimeHandler = (input: unknown) => Effect.Effect<void, unknown, Daemon.Service>
+type RuntimeHandler = (
+  input: unknown,
+) => Effect.Effect<
+  void,
+  unknown,
+  FileSystem.FileSystem | Global.Service | Npm.Service | Updater.Service | Config.Service | Scope.Scope
+>
 type Loader<Node extends Spec.Any> = () => Promise<{
-  default: (input: Input<Node>) => Effect.Effect<void, any, Daemon.Service>
+  default: (
+    input: Input<Node>,
+  ) => Effect.Effect<
+    void,
+    any,
+    FileSystem.FileSystem | Global.Service | Npm.Service | Updater.Service | Config.Service | Scope.Scope
+  >
 }>
-type ProvidedCommand = Command.Command<string, unknown, unknown, unknown, Daemon.Service>
+type ProvidedCommand = Command.Command<
+  string,
+  unknown,
+  unknown,
+  unknown,
+  FileSystem.FileSystem | Global.Service | Npm.Service | Updater.Service | Config.Service | Scope.Scope
+>
 
 export type Handlers<Node extends Spec.Any> = keyof Node["commands"] extends never
   ? Loader<Node>

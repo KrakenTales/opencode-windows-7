@@ -3,10 +3,10 @@ import { describe, expect, test } from "bun:test"
 import { RGBA } from "@opentui/core"
 import { testRender } from "@opentui/solid"
 import type { JSX } from "solid-js"
+import { onMount, type ParentProps } from "solid-js"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
-import { KVProvider } from "../../../src/context/kv"
 import { ThemeProvider } from "../../../src/context/theme"
-import { TuiConfigProvider } from "../../../src/config"
+import { ConfigProvider } from "../../../src/config"
 import { DiffViewerFileTree } from "../../../src/feature-plugins/system/diff-viewer-file-tree"
 import { TestTuiContexts } from "../../fixture/tui-environment"
 import {
@@ -28,42 +28,33 @@ const theme = {
 
 describe("DiffViewerFileTree", () => {
   test.skip("renders sorted hierarchical file rows", async () => {
-    const app = await testRender(
-      () =>
-        withTheme(() => (
-          <DiffViewerFileTree
-            width={32}
-            files={[
-              { file: "z-file.ts" },
-              { file: "b/file.ts" },
-              { file: "a/zeta.ts" },
-              { file: "b/alpha.ts" },
-              { file: "a/alpha.ts" },
-            ]}
-            loading={false}
-            error={undefined}
-            theme={theme}
-            focused={true}
-          />
-        )),
-      { width: 40, height: 20 },
+    const lines = visibleLines(
+      await renderFrame(() => (
+        <DiffViewerFileTree
+          width={32}
+          files={[
+            { file: "z-file.ts" },
+            { file: "b/file.ts" },
+            { file: "a/zeta.ts" },
+            { file: "b/alpha.ts" },
+            { file: "a/alpha.ts" },
+          ]}
+          loading={false}
+          error={undefined}
+          theme={theme}
+          focused={true}
+        />
+      )),
     )
 
-    try {
-      await renderOnceSettled(app)
-      const lines = visibleLines(app.captureCharFrame())
-
-      expect(lines).toEqual([
-        "▾ a",
-        "│  ├─ alpha.ts               ?",
-        "│  └─ zeta.ts                ?",
-        "├─ ▾ b",
-        "│  ├─ alpha.ts               ?",
-        "│  └─ file.ts                ?",
-      ])
-    } finally {
-      app.renderer.destroy()
-    }
+    expect(lines).toEqual([
+      "▾ a",
+      "│  ├─ alpha.ts               ?",
+      "│  └─ zeta.ts                ?",
+      "├─ ▾ b",
+      "│  ├─ alpha.ts               ?",
+      "│  └─ file.ts                ?",
+    ])
   })
 
   test("keeps loading and error quiet while rendering an empty settled state", async () => {
@@ -153,41 +144,33 @@ describe("DiffViewerFileTree", () => {
 })
 
 async function renderFrame(component: () => JSX.Element) {
-  const app = await testRender(() => withTheme(component), { width: 40, height: 10 })
+  const mounted = Promise.withResolvers<void>()
+  const app = await testRender(() => withTheme(component, mounted.resolve), { width: 40, height: 10 })
   try {
-    await renderOnceSettled(app)
-    return await captureSettledFrame(app)
+    await mounted.promise
+    await app.renderOnce()
+    await app.renderOnce()
+    return app.captureCharFrame()
   } finally {
     app.renderer.destroy()
   }
 }
 
-async function renderOnceSettled(app: Awaited<ReturnType<typeof testRender>>) {
-  await app.renderOnce()
-  await new Promise((resolve) => setTimeout(resolve, 25))
-  await app.renderOnce()
-}
-
-async function captureSettledFrame(app: Awaited<ReturnType<typeof testRender>>) {
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const frame = app.captureCharFrame()
-    if (frame.trim().length > 0) return frame
-    await new Promise((resolve) => setTimeout(resolve, 25))
-    await app.renderOnce()
-  }
-  return app.captureCharFrame()
-}
-
-function withTheme(component: () => JSX.Element) {
+function withTheme(component: () => JSX.Element, onReady = () => {}) {
   return (
     <TestTuiContexts>
-      <TuiConfigProvider config={createTuiResolvedConfig()}>
-        <KVProvider>
-          <ThemeProvider mode="dark">{component()}</ThemeProvider>
-        </KVProvider>
-      </TuiConfigProvider>
+      <ConfigProvider config={createTuiResolvedConfig()}>
+        <ThemeProvider mode="dark">
+          <Ready onReady={onReady}>{component()}</Ready>
+        </ThemeProvider>
+      </ConfigProvider>
     </TestTuiContexts>
   )
+}
+
+function Ready(props: ParentProps<{ onReady: () => void }>) {
+  onMount(props.onReady)
+  return props.children
 }
 
 function visibleLines(frame: string) {

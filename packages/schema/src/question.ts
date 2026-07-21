@@ -1,11 +1,11 @@
-export * as Question from "./question"
+export * as Question from "./question.js"
 
 import { Schema } from "effect"
-import { optional } from "./schema"
-import { define, inventory } from "./event"
-import { ascending } from "./identifier"
-import { SessionID } from "./session-id"
-import { statics } from "./schema"
+import { optional } from "./schema.js"
+import { ephemeral, inventory } from "./event.js"
+import { ascending } from "./identifier.js"
+import { SessionID } from "./session-id.js"
+import { statics } from "./schema.js"
 
 export const ID = Schema.String.check(Schema.isStartsWith("que")).pipe(
   Schema.brand("QuestionV2.ID"),
@@ -67,8 +67,8 @@ export const Reply = Schema.Struct({
 }).annotate({ identifier: "QuestionV2.Reply" })
 export interface Reply extends Schema.Schema.Type<typeof Reply> {}
 
-const Asked = define({ type: "question.v2.asked", schema: Request.fields })
-const Replied = define({
+const Asked = ephemeral({ type: "question.v2.asked", schema: Request.fields })
+const Replied = ephemeral({
   type: "question.v2.replied",
   schema: {
     sessionID: SessionID,
@@ -76,7 +76,7 @@ const Replied = define({
     answers: Schema.Array(Answer),
   },
 })
-const Rejected = define({
+const Rejected = ephemeral({
   type: "question.v2.rejected",
   schema: {
     sessionID: SessionID,

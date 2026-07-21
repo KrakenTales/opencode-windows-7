@@ -10,16 +10,17 @@ import type {
   TuiAttentionSoundPack,
   TuiAttentionSoundPackInfo,
 } from "@opencode-ai/plugin/tui"
-import { AttentionSoundName, type TuiConfig } from "./config"
+import { AttentionSoundName, type Config } from "./config"
 import { Schema } from "effect"
 import stripAnsi from "strip-ansi"
 import * as TuiAudio from "./audio"
-import defaultSoundPath from "@opencode-ai/ui/audio/bip-bop-01.mp3" with { type: "file" }
-import questionSoundPath from "@opencode-ai/ui/audio/bip-bop-03.mp3" with { type: "file" }
-import permissionSoundPath from "@opencode-ai/ui/audio/staplebops-06.mp3" with { type: "file" }
-import errorSoundPath from "@opencode-ai/ui/audio/nope-03.mp3" with { type: "file" }
-import doneSoundPath from "@opencode-ai/ui/audio/bip-bop-01.mp3" with { type: "file" }
-import subagentDoneSoundPath from "@opencode-ai/ui/audio/yup-01.mp3" with { type: "file" }
+import {
+  defaultSoundPath,
+  questionSoundPath,
+  permissionSoundPath,
+  errorSoundPath,
+  subagentDoneSoundPath,
+} from "#attention-sounds"
 
 type FocusState = "unknown" | "focused" | "blurred"
 
@@ -38,9 +39,8 @@ type TuiAttentionHost = TuiAttention & {
   dispose(): void
 }
 
-const DEFAULT_TITLE = "opencode"
+const DEFAULT_TITLE = "OpenCode"
 const DEFAULT_PACK_ID = "opencode.default"
-const KV_SOUND_PACK = "attention_sound_pack"
 const TITLE_LIMIT = 80
 const MESSAGE_LIMIT = 240
 const BUILTIN_PACK: RegisteredSoundPack = {
@@ -52,7 +52,7 @@ const BUILTIN_PACK: RegisteredSoundPack = {
     question: questionSoundPath,
     permission: permissionSoundPath,
     error: errorSoundPath,
-    done: doneSoundPath,
+    done: defaultSoundPath,
     subagent_done: subagentDoneSoundPath,
   },
 }
@@ -80,7 +80,7 @@ function clampVolume(volume: number) {
   return Math.min(1, Math.max(0, volume))
 }
 
-function soundVolume(input: TuiAttentionNotifyInput, config: Pick<TuiConfig.Resolved, "attention">) {
+function soundVolume(input: TuiAttentionNotifyInput, config: Pick<Config.Resolved, "attention">) {
   if (!config.attention.sound) return
   if (input.sound === false) return
   if (input.sound === undefined) return clampVolume(config.attention.volume)
@@ -113,7 +113,9 @@ function focusSkip(when: TuiAttentionWhen, focus: FocusState) {
 
 export function createTuiAttention(input: {
   renderer: AttentionRenderer
-  config: Pick<TuiConfig.Resolved, "attention">
+  config: Pick<Config.Resolved, "attention">
+  update?: Config.Interface["update"]
+  /** @deprecated Ignored. Sound-pack persistence uses CLI config. */
   kv?: TuiKV
   audio?: Pick<typeof TuiAudio, "loadSoundFile" | "play">
 }): TuiAttentionHost {
@@ -134,8 +136,7 @@ export function createTuiAttention(input: {
   input.renderer.on("blur", onBlur)
 
   function configuredPackID() {
-    const stored = input.kv?.get<string | undefined>(KV_SOUND_PACK, undefined)
-    return activePackID ?? stored ?? input.config.attention.sound_pack
+    return activePackID ?? input.config.attention.sound_pack
   }
 
   function currentPack() {
@@ -234,7 +235,12 @@ export function createTuiAttention(input: {
         const pack = packs.get(id)
         if (!pack) return false
         activePackID = pack.id
-        if (options?.persist) input.kv?.set(KV_SOUND_PACK, pack.id)
+        if (options?.persist)
+          void input
+            .update?.((draft) => {
+              draft.attention = { ...draft.attention, sound_pack: pack.id }
+            })
+            .catch(() => {})
         return true
       },
       current() {
