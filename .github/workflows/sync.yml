@@ -30,7 +30,7 @@ jobs:
           if [ -n "${{ inputs.version }}" ]; then
             echo "tag=v${{ inputs.version }}" >> "$GITHUB_OUTPUT"
           else
-            TAG=$(gh release list --repo anomalyco/opencode --limit 100 --json tagName --jq '[.[].tagName | select(test("^v[0-9]+\.[0-9]+\.[0-9]+$"))] | first')
+            TAG=$(gh release list --repo anomalyco/opencode --limit 100 --json tagName --jq '[.[].tagName | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))] | first')
             echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           fi
 
