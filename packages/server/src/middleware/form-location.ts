@@ -1,33 +1,27 @@
-import { Database } from "@opencode-ai/core/database/database"
-import { Location } from "@opencode-ai/core/location"
-import { LocationServiceMap } from "@opencode-ai/core/location-services"
-import { AbsolutePath } from "@opencode-ai/core/schema"
-import { SessionV2 } from "@opencode-ai/core/session"
-import { SessionTable } from "@opencode-ai/core/session/sql"
-import { WorkspaceV2 } from "@opencode-ai/core/workspace"
-import { InvalidRequestError, SessionNotFoundError } from "@opencode-ai/protocol/errors"
-import { eq } from "drizzle-orm"
-import { Effect, Layer, Schema } from "effect"
-import { HttpRouter, HttpServerRequest } from "effect/unstable/http"
-import { HttpApiMiddleware } from "effect/unstable/httpapi"
-import { requestRef, type LocationServices } from "../location"
+import { Instance } from "@opencode/core/instance/service"
+import { LocationServiceMap } from "@opencode/core/location-services"
+import { Session } from "@opencode/core/session"
+import { LocationNotFoundError, InvalidRequestError, SessionNotFoundError } from "@opencode/protocol/errors"
+import { Effect, Layer } from "effect"
+import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http"
+import { HttpApiMiddleware } from "effect/http-api"
+import { locationErrors, requestRef, sessionInfo, type LocationServices } from "../location"
 
 export class FormLocationMiddleware extends HttpApiMiddleware.Service<
   FormLocationMiddleware,
   { provides: LocationServices }
 >()("@opencode/HttpApiFormLocation", {
-  error: [InvalidRequestError, SessionNotFoundError],
+  error: [InvalidRequestError, SessionNotFoundError, LocationNotFoundError],
 }) {}
-
-const decodeSessionID = Schema.decodeUnknownEffect(SessionV2.ID)
 
 export const formLocationLayer = Layer.effect(
   FormLocationMiddleware,
   Effect.gen(function* () {
-    const { db } = yield* Database.Service
+    const sessions = yield* Session.Service
+    const instances = yield* Instance.Service
     const locations = yield* LocationServiceMap.Service
 
-    return FormLocationMiddleware.of((effect) =>
+    return FormLocationMiddleware.of((effect, options) =>
       Effect.gen(function* () {
         const route = yield* HttpRouter.RouteContext
         if (route.params.sessionID === "global") {
@@ -35,41 +29,15 @@ export const formLocationLayer = Layer.effect(
           // the session row lookup because some MCP elicitations cannot currently be attributed to
           // a real session. Keep this undocumented and remove once elicitations carry session ownership.
           const request = yield* HttpServerRequest.HttpServerRequest
-          return yield* effect.pipe(Effect.provide(locations.get(requestRef(request))))
+          return yield* effect.pipe(Effect.provide(locations.get(requestRef(request))), locationErrors)
         }
 
-        const sessionID = yield* decodeSessionID(route.params.sessionID).pipe(
-          Effect.mapError(
-            () =>
-              new InvalidRequestError({
-                message: "Invalid session ID",
-                field: "sessionID",
-              }),
-          ),
-        )
-        const row = yield* db
-          .select({ directory: SessionTable.directory, workspaceID: SessionTable.workspace_id })
-          .from(SessionTable)
-          .where(eq(SessionTable.id, sessionID))
-          .get()
-          .pipe(Effect.orDie)
-        if (!row) {
-          return yield* new SessionNotFoundError({
-            sessionID,
-            message: `Session not found: ${sessionID}`,
-          })
-        }
-
-        return yield* effect.pipe(
-          Effect.provide(
-            locations.get(
-              Location.Ref.make({
-                directory: AbsolutePath.make(row.directory),
-                workspaceID: row.workspaceID ? WorkspaceV2.ID.make(row.workspaceID) : undefined,
-              }),
-            ),
-          ),
-        )
+        const session = yield* sessionInfo(sessions, route.params.sessionID)
+        // Forms live in memory, so a Session without live capabilities has none pending. Listing must
+        // not boot its Location: clients poll whole subagent trees, including deleted worktrees.
+        if (options.endpoint.identifier === "session.form.list" && instances.live && !(yield* instances.live(session)))
+          return HttpServerResponse.jsonUnsafe({ data: [] })
+        return yield* effect.pipe(instances.provide(session), locationErrors)
       }),
     )
   }),

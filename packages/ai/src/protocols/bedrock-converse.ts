@@ -1,35 +1,39 @@
 import { Effect, Schema } from "effect"
-import { Route } from "../route/client"
-import { Endpoint } from "../route/endpoint"
-import { Protocol } from "../route/protocol"
+import { Base64 } from "effect/encoding"
+import { Route } from "../route/client.js"
+import { Endpoint } from "../route/endpoint.js"
+import { Protocol } from "../route/protocol.js"
 import {
-  LLMError,
+  AIError,
   LLMEvent,
   Usage,
   type CacheHint,
   type FinishReason,
-  type JsonSchema,
+  type FinishReasonDetails,
   type LLMRequest,
-  type ModelToolSchemaCompatibility,
+  type LanguageModel,
   type ProviderMetadata,
+  type ProviderOptions,
   type ReasoningPart,
   type ToolCallPart,
   type ToolDefinition,
   type ToolResultPart,
-} from "../schema"
-import { BedrockEventStream } from "./bedrock-event-stream"
-import { classifyProviderFailure } from "../provider-error"
-import { JsonObject, optionalArray, ProviderShared } from "./shared"
-import { BedrockAuth } from "./utils/bedrock-auth"
-import { BedrockCache } from "./utils/bedrock-cache"
-import { BedrockMedia } from "./utils/bedrock-media"
-import { Lifecycle } from "./utils/lifecycle"
-import { ToolSchemaProjection } from "./utils/tool-schema"
-import { ToolStream } from "./utils/tool-stream"
+} from "../schema/index.js"
+import { BedrockEventStream } from "./bedrock-event-stream.js"
+import { classifyProviderFailure } from "../provider-error.js"
+import { JsonObject, optionalArray, ProviderShared } from "./shared.js"
+import { BedrockAuth } from "./utils/bedrock-auth.js"
+import { BedrockCache } from "./utils/bedrock-cache.js"
+import { BedrockMedia } from "./utils/bedrock-media.js"
+import { claudeVersion, supportsThinkingBlockBinding, THINKING_BINDING_BETA } from "./utils/claude-model.js"
+import { Lifecycle } from "./utils/lifecycle.js"
+import { MistralToolID } from "./utils/mistral-tool-id.js"
+import { ToolStream } from "./utils/tool-stream.js"
+import { concatBytes } from "../utils/bytes.js"
 
 const ADAPTER = "bedrock-converse"
 
-export type { Credentials as BedrockCredentials } from "./utils/bedrock-auth"
+export type { Credentials as BedrockCredentials } from "./utils/bedrock-auth.js"
 
 // =============================================================================
 // Request Body Schema
@@ -52,6 +56,7 @@ const BedrockToolResultContentItem = Schema.Union([
   Schema.Struct({ text: Schema.String }),
   Schema.Struct({ json: Schema.Unknown }),
   BedrockMedia.ImageBlock,
+  BedrockMedia.DocumentBlock,
 ])
 
 const BedrockToolResultBlock = Schema.Struct({
@@ -64,14 +69,15 @@ const BedrockToolResultBlock = Schema.Struct({
 type BedrockToolResultBlock = Schema.Schema.Type<typeof BedrockToolResultBlock>
 
 const BedrockReasoningBlock = Schema.Struct({
-  reasoningContent: Schema.Struct({
-    reasoningText: Schema.optional(
-      Schema.Struct({
+  reasoningContent: Schema.Union([
+    Schema.Struct({
+      reasoningText: Schema.Struct({
         text: Schema.String,
         signature: Schema.optional(Schema.String),
       }),
-    ),
-  }),
+    }),
+    Schema.Struct({ redactedContent: Schema.String }),
+  ]),
 })
 
 const BedrockUserBlock = Schema.Union([
@@ -103,7 +109,7 @@ type BedrockSystemBlock = Schema.Schema.Type<typeof BedrockSystemBlock>
 const BedrockToolSpec = Schema.Struct({
   toolSpec: Schema.Struct({
     name: Schema.String,
-    description: Schema.String,
+    description: Schema.optional(Schema.String),
     inputSchema: Schema.Struct({
       json: JsonObject,
     }),
@@ -119,6 +125,12 @@ const BedrockToolChoice = Schema.Union([
   Schema.Struct({ any: Schema.Struct({}) }),
   Schema.Struct({ tool: Schema.Struct({ name: Schema.String }) }),
 ])
+
+// Value sets from the Converse API reference. Unknown values pass through for forward compatibility.
+const ServiceTierType = ProviderShared.knownString<"priority" | "default" | "flex" | "reserved">()
+const GuardrailTrace = ProviderShared.knownString<"enabled" | "disabled" | "enabled_full">()
+const GuardrailStreamProcessingMode = ProviderShared.knownString<"sync" | "async">()
+const TextFormatType = ProviderShared.knownString<"json_schema">()
 
 const BedrockBodyFields = {
   modelId: Schema.String,
@@ -139,6 +151,30 @@ const BedrockBodyFields = {
     }),
   ),
   additionalModelRequestFields: Schema.optional(JsonObject),
+  serviceTier: Schema.optional(Schema.Struct({ type: ServiceTierType })),
+  guardrailConfig: Schema.optional(
+    Schema.Struct({
+      guardrailIdentifier: Schema.String,
+      guardrailVersion: Schema.String,
+      trace: Schema.optional(GuardrailTrace),
+      streamProcessingMode: Schema.optional(GuardrailStreamProcessingMode),
+    }),
+  ),
+  outputConfig: Schema.optional(
+    Schema.Struct({
+      textFormat: Schema.Struct({
+        type: TextFormatType,
+        structure: Schema.Struct({
+          jsonSchema: Schema.Struct({
+            schema: Schema.String,
+            name: Schema.optional(Schema.String),
+            description: Schema.optional(Schema.String),
+          }),
+        }),
+      }),
+    }),
+  ),
+  requestMetadata: Schema.optional(Schema.Record(Schema.String, Schema.String)),
 }
 const BedrockConverseBody = Schema.Struct(BedrockBodyFields)
 export type BedrockConverseBody = Schema.Schema.Type<typeof BedrockConverseBody>
@@ -151,6 +187,12 @@ const BedrockUsageSchema = Schema.Struct({
   cacheWriteInputTokens: Schema.optional(Schema.Number),
 })
 type BedrockUsageSchema = Schema.Schema.Type<typeof BedrockUsageSchema>
+
+const BedrockStreamException = Schema.Struct({
+  message: Schema.optional(Schema.String),
+  originalMessage: Schema.optional(Schema.String),
+  originalStatusCode: Schema.optional(Schema.Number),
+})
 
 // Streaming event shape — the AWS event stream wraps each JSON payload by its
 // `:event-type` header (e.g. `messageStart`, `contentBlockDelta`). We
@@ -179,6 +221,11 @@ const BedrockEvent = Schema.Struct({
             Schema.Struct({
               text: Schema.optional(Schema.String),
               signature: Schema.optional(Schema.String),
+              // Blob fields in Bedrock's JSON event stream are base64 strings.
+              redactedContent: Schema.optional(Schema.String),
+              // Vercel's Bedrock provider exposes the same delta under
+              // Anthropic's shorter `data` spelling.
+              data: Schema.optional(Schema.String),
             }),
           ),
         }),
@@ -198,33 +245,25 @@ const BedrockEvent = Schema.Struct({
       metrics: Schema.optional(Schema.Unknown),
     }),
   ),
-  internalServerException: Schema.optional(Schema.Struct({ message: Schema.String })),
-  modelStreamErrorException: Schema.optional(Schema.Struct({ message: Schema.String })),
-  validationException: Schema.optional(Schema.Struct({ message: Schema.String })),
-  throttlingException: Schema.optional(Schema.Struct({ message: Schema.String })),
-  serviceUnavailableException: Schema.optional(Schema.Struct({ message: Schema.String })),
+  exception: Schema.optional(Schema.Struct({ type: Schema.String, details: BedrockStreamException })),
 })
 type BedrockEvent = Schema.Schema.Type<typeof BedrockEvent>
 
 // =============================================================================
 // Request Lowering
 // =============================================================================
-const lowerToolSpec = (tool: ToolDefinition, inputSchema: JsonSchema): BedrockToolSpec => ({
+const lowerToolSpec = (tool: ToolDefinition): BedrockToolSpec => ({
   toolSpec: {
     name: tool.name,
-    description: tool.description,
-    inputSchema: { json: inputSchema },
+    ...(tool.description.trim().length > 0 ? { description: tool.description } : {}),
+    inputSchema: { json: tool.inputSchema },
   },
 })
 
-const lowerTools = (
-  compatibility: ModelToolSchemaCompatibility | undefined,
-  breakpoints: BedrockCache.Breakpoints,
-  tools: ReadonlyArray<ToolDefinition>,
-): BedrockTool[] => {
+const lowerTools = (breakpoints: BedrockCache.Breakpoints, tools: ReadonlyArray<ToolDefinition>): BedrockTool[] => {
   const result: BedrockTool[] = []
   for (const tool of tools) {
-    result.push(lowerToolSpec(tool, ToolSchemaProjection.modelCompatibility(tool.inputSchema, compatibility)))
+    result.push(lowerToolSpec(tool))
     const cachePoint = BedrockCache.block(breakpoints, tool.cache)
     if (cachePoint) result.push(cachePoint)
   }
@@ -248,25 +287,40 @@ const lowerToolChoice = (toolChoice: NonNullable<LLMRequest["toolChoice"]>) =>
     tool: (name) => ({ tool: { name } }) as const,
   })
 
-const bedrockMetadata = (metadata: Record<string, unknown>): ProviderMetadata => ({ bedrock: metadata })
+const providerMetadata = (key: string, metadata: Record<string, unknown>): ProviderMetadata => ({ [key]: metadata })
 
-const reasoningSignature = (part: ReasoningPart) => {
-  const bedrock = part.providerMetadata?.bedrock
-  return (
-    part.encrypted ??
-    (ProviderShared.isRecord(bedrock) && typeof bedrock.signature === "string" ? bedrock.signature : undefined)
+const reasoningSignature = (part: ReasoningPart, providerMetadataKey: string) => {
+  const metadata = part.providerMetadata?.[providerMetadataKey]
+  if (part.encrypted !== undefined) return part.encrypted
+  if (typeof metadata?.signature === "string") return metadata.signature
+}
+
+const reasoningRedactedData = (part: ReasoningPart, providerMetadataKey: string) => {
+  const metadata = part.providerMetadata?.[providerMetadataKey]
+  if (typeof metadata?.redactedData === "string") return metadata.redactedData
+}
+
+const removeEmptyToolInputKeys = (input: unknown): unknown => {
+  if (Array.isArray(input)) return input.map(removeEmptyToolInputKeys)
+  if (!ProviderShared.isRecord(input)) return input
+  return Object.fromEntries(
+    Object.entries(input).flatMap(([key, value]) => (key === "" ? [] : [[key, removeEmptyToolInputKeys(value)]])),
   )
 }
 
-const lowerToolCall = (part: ToolCallPart): BedrockToolUseBlock => ({
+const lowerToolCall = (part: ToolCallPart, normalizeID: (id: string) => string): BedrockToolUseBlock => ({
   toolUse: {
-    toolUseId: part.id,
-    name: part.name,
-    input: part.input,
+    toolUseId: normalizeID(part.id),
+    // Models can emit names that Converse rejects when replayed in history.
+    name: part.name.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64) || "_",
+    input: removeEmptyToolInputKeys(part.input),
   },
 })
 
-const lowerToolResultContent = Effect.fn("BedrockConverse.lowerToolResultContent")(function* (part: ToolResultPart) {
+const lowerToolResultContent = Effect.fnUntraced(function* (
+  part: ToolResultPart,
+  documentNames: Set<string>,
+) {
   if (part.result.type === "text" || part.result.type === "error")
     return [{ text: ProviderShared.toolResultText(part) }]
   if (part.result.type === "json") return [{ json: part.result.value }]
@@ -277,36 +331,51 @@ const lowerToolResultContent = Effect.fn("BedrockConverse.lowerToolResultContent
       content.push({ text: item.text })
       continue
     }
-    const media = yield* BedrockMedia.lower({
-      type: "media",
-      mediaType: item.mime,
-      data: item.uri,
-      filename: item.name,
-    })
-    if (!("image" in media))
-      return yield* ProviderShared.invalidRequest("Bedrock Converse only supports image media in tool results")
-    content.push(media)
+    const media = yield* BedrockMedia.lower(ProviderShared.toolFileMedia(item), documentNames)
+    content.push(...media)
   }
   return content
 })
 
-const lowerToolResult = Effect.fn("BedrockConverse.lowerToolResult")(function* (part: ToolResultPart) {
+const lowerToolResult = Effect.fnUntraced(function* (
+  part: ToolResultPart,
+  documentNames: Set<string>,
+  normalizeID: (id: string) => string,
+) {
   return {
     toolResult: {
-      toolUseId: part.id,
-      content: yield* lowerToolResultContent(part),
+      toolUseId: normalizeID(part.id),
+      content: yield* lowerToolResultContent(part, documentNames),
       status: part.result.type === "error" ? "error" : "success",
     },
   } satisfies BedrockToolResultBlock
 })
 
-const lowerMessages = Effect.fn("BedrockConverse.lowerMessages")(function* (
+// Keep Claude and Nova tool-result images inline; put other models' images beside the result.
+const keepToolImagesInline = (id: string) => id.includes("anthropic.claude-") || id.includes("amazon.nova-")
+
+const lowerMessages = Effect.fnUntraced(function* (
   request: LLMRequest,
   breakpoints: BedrockCache.Breakpoints,
 ) {
   const messages: BedrockMessage[] = []
+  const documentNames = new Set<string>()
+  // Mistral can reject replay IDs even when they satisfy Converse's broader ID syntax.
+  const normalizeID = request.model.id.includes("mistral.") ? MistralToolID.normalizer(request) : (id: string) => id
+  const providerMetadataKey = request.model.route.providerMetadataKey ?? request.model.provider
+  const hoistImages = !keepToolImagesInline(request.model.id)
+  // Bedrock expects parallel tool results before any images hoisted beside them.
+  const pendingImages: BedrockMedia.ImageBlock[] = []
+  const flushImages = () => {
+    if (pendingImages.length === 0) return
+    const previous = messages.at(-1)
+    if (previous?.role === "user")
+      messages[messages.length - 1] = { role: "user", content: [...previous.content, ...pendingImages] }
+    pendingImages.length = 0
+  }
 
   for (const message of request.messages) {
+    if (message.role !== "tool") flushImages()
     if (message.role === "system") {
       const part = yield* ProviderShared.wrappedSystemUpdate("Bedrock Converse", message)
       const content = textWithCache(breakpoints, part.text, part.cache)
@@ -327,11 +396,14 @@ const lowerMessages = Effect.fn("BedrockConverse.lowerMessages")(function* (
           continue
         }
         if (part.type === "media") {
-          content.push(yield* BedrockMedia.lower(part))
+          content.push(...(yield* BedrockMedia.lower(part, documentNames)))
           continue
         }
       }
-      messages.push({ role: "user", content })
+      const previous = messages.at(-1)
+      if (previous?.role === "user")
+        messages[messages.length - 1] = { role: "user", content: [...previous.content, ...content] }
+      else messages.push({ role: "user", content })
       continue
     }
 
@@ -349,19 +421,27 @@ const lowerMessages = Effect.fn("BedrockConverse.lowerMessages")(function* (
           continue
         }
         if (part.type === "reasoning") {
-          content.push({
-            reasoningContent: {
-              reasoningText: { text: part.text, signature: reasoningSignature(part) },
-            },
-          })
+          const signature = reasoningSignature(part, providerMetadataKey)
+          const redactedData = reasoningRedactedData(part, providerMetadataKey)
+          if (signature === undefined && redactedData !== undefined) {
+            content.push({ reasoningContent: { redactedContent: redactedData } })
+            continue
+          }
+          if (signature === undefined || signature.trim().length === 0) {
+            // Interrupted streams and model switches can leave unsigned reasoning.
+            // Preserve readable history as text rather than replay invalid reasoningContent.
+            if (part.text.trim().length > 0) content.push(...textWithCache(breakpoints, part.text, part.cache))
+            continue
+          }
+          content.push({ reasoningContent: { reasoningText: { text: part.text, signature } } })
           continue
         }
         if (part.type === "tool-call") {
-          content.push(lowerToolCall(part))
+          content.push(lowerToolCall(part, normalizeID))
           continue
         }
       }
-      messages.push({ role: "assistant", content })
+      if (content.length > 0) messages.push({ role: "assistant", content })
       continue
     }
 
@@ -369,60 +449,231 @@ const lowerMessages = Effect.fn("BedrockConverse.lowerMessages")(function* (
     for (const part of message.content) {
       if (!ProviderShared.supportsContent(part, ["tool-result"]))
         return yield* ProviderShared.unsupportedContent("Bedrock Converse", "tool", ["tool-result"])
-      content.push(yield* lowerToolResult(part))
+      const result = yield* lowerToolResult(part, documentNames, normalizeID)
+      const images: BedrockMedia.ImageBlock[] = hoistImages
+        ? result.toolResult.content.filter((item) => "image" in item)
+        : []
+      const nonImageContent = result.toolResult.content.filter((item) => !("image" in item))
+      content.push(
+        images.length === 0
+          ? result
+          : {
+              toolResult: {
+                ...result.toolResult,
+                content: nonImageContent.length > 0 ? nonImageContent : [{ text: "See attached image." }],
+              },
+            },
+      )
+      pendingImages.push(...images)
       const cachePoint = BedrockCache.block(breakpoints, part.cache)
       if (cachePoint) content.push(cachePoint)
     }
-    messages.push({ role: "user", content })
+    const previous = messages.at(-1)
+    if (previous?.role === "user")
+      messages[messages.length - 1] = { role: "user", content: [...previous.content, ...content] }
+    else messages.push({ role: "user", content })
   }
 
+  flushImages()
   return messages
 })
 
 // System prompts share the cache-point convention: emit the text block, then
 // optionally a positional `cachePoint` marker.
-const lowerSystem = (
-  breakpoints: BedrockCache.Breakpoints,
-  system: ReadonlyArray<LLMRequest["system"][number]>,
-): BedrockSystemBlock[] => system.flatMap((part) => textWithCache(breakpoints, part.text, part.cache))
+const lowerSystem = (breakpoints: BedrockCache.Breakpoints, system: ReadonlyArray<LLMRequest["system"][number]>) => {
+  const content = system
+    .filter((part) => part.text.length > 0)
+    .flatMap((part) => textWithCache(breakpoints, part.text, part.cache))
+  return content.length === 0 ? undefined : content
+}
+
+// Nova 2 rejects `maxTokens` at high reasoning effort, where its output can exceed the field's maximum. Other models
+// that take `reasoningConfig`, such as Grok on Bedrock, accept it.
+const isNova2 = (model: LanguageModel) => /\bamazon\.nova-2-/.test(model.id)
+const isHighReasoningEffort = Schema.is(
+  Schema.Struct({
+    additionalModelRequestFields: Schema.Struct({
+      reasoningConfig: Schema.Struct({ maxReasoningEffort: Schema.Literal("high") }),
+    }),
+  }),
+)
+
+// Claude 4.6+ pairs effort with adaptive thinking; earlier Claude models take effort beside a manual budget.
+const supportsAdaptiveThinking = (model: LanguageModel) => {
+  const version = claudeVersion(model.id)
+  return version !== undefined && (version.major > 4 || (version.major === 4 && version.minor >= 6))
+}
+
+const effortFields = (model: LanguageModel, effort: string) => {
+  if (model.id.includes("anthropic")) return { output_config: { effort } }
+  // gpt-oss takes the flat chat-completions spelling; newer OpenAI and xAI models take the Responses one.
+  if (model.id.includes("openai.gpt-oss")) return { reasoning_effort: effort }
+  if (model.id.includes("openai.") || model.id.includes("xai.")) return { reasoning: { effort } }
+  return { reasoningConfig: { type: "enabled", maxReasoningEffort: effort } }
+}
+
+const Options = Schema.Struct({
+  /** Claude thinking. `adaptive` and `disabled` apply to Claude models only. */
+  thinking: Schema.optional(
+    Schema.Union([
+      Schema.Struct({ type: Schema.Literal("enabled"), budgetTokens: Schema.Number }),
+      Schema.Struct({
+        type: Schema.Literal("adaptive"),
+        display: Schema.optional(ProviderShared.knownString<"summarized" | "omitted">()),
+      }),
+      Schema.Struct({ type: Schema.Literal("disabled") }),
+    ]),
+  ),
+  /** Reasoning effort, sent in the field each model family reads. */
+  effort: Schema.optional(ProviderShared.knownString<"low" | "medium" | "high" | "xhigh" | "max">()),
+  serviceTier: Schema.optional(ServiceTierType),
+  /** Constrains the response text to a JSON schema. */
+  outputFormat: Schema.optional(
+    Schema.Struct({
+      type: TextFormatType,
+      schema: JsonObject,
+      name: Schema.optional(Schema.String),
+      description: Schema.optional(Schema.String),
+    }),
+  ),
+  guardrail: Schema.optional(
+    Schema.Struct({
+      identifier: Schema.String,
+      version: Schema.String,
+      trace: Schema.optional(GuardrailTrace),
+      streamProcessingMode: Schema.optional(GuardrailStreamProcessingMode),
+    }),
+  ),
+  /** Key-value pairs for filtering invocation logs. */
+  requestMetadata: Schema.optional(Schema.Record(Schema.String, Schema.String)),
+})
+/** Caller-facing provider options; unknown keys are accepted and ignored. */
+export type OptionsInput = ProviderOptions & typeof Options.Encoded
+const decodeOptions = ProviderShared.validateWith(Schema.decodeUnknownEffect(Options))
+// Claude on Bedrock requires the thinking budget below `maxTokens`, with a minimum of 1,024.
+const MIN_THINKING_BUDGET = 1_024
+
+const isThinkingDisabled = Schema.is(
+  Schema.Struct({
+    additionalModelRequestFields: Schema.Struct({
+      thinking: Schema.Struct({ type: Schema.Literals(["disabled", "between_tools"]) }),
+    }),
+  }),
+)
+
+// Claude 5.1+ binds each thinking signature to the prefix above it. Ask Bedrock to drop the affected blocks instead of
+// failing when that prefix changes. `http.body` overlays this field by field, so callers can still override it.
+const applyThinkingBindingDefault = (request: LLMRequest, thinking: Readonly<Record<string, unknown>> | undefined) => {
+  if (thinking?.type === "disabled" || isThinkingDisabled(request.http?.body)) return thinking
+  if (!supportsThinkingBlockBinding(request.model)) return thinking
+  return {
+    ...(thinking ?? { type: "adaptive" as const }),
+    block_binding: { prefix_mismatch_behavior: "drop_block" },
+  }
+}
 
 const fromRequest = Effect.fn("BedrockConverse.fromRequest")(function* (request: LLMRequest) {
   const toolChoice = request.toolChoice ? yield* lowerToolChoice(request.toolChoice) : undefined
+  const flattened = ProviderShared.flattenToolRequest(request)
   const generation = request.generation
+  const options = yield* decodeOptions(request.providerOptions ?? {})
+  const maxTokens =
+    isNova2(request.model) && (options.effort === "high" || isHighReasoningEffort(request.http?.body))
+      ? undefined
+      : generation?.maxTokens
+  const thinking = applyThinkingBindingDefault(
+    request,
+    (() => {
+      if (options.thinking?.type === "enabled")
+        return {
+          type: "enabled",
+          budget_tokens: ProviderShared.fitThinkingBudget(
+            options.thinking.budgetTokens,
+            maxTokens,
+            MIN_THINKING_BUDGET,
+          ),
+        }
+      if (options.thinking !== undefined) return options.thinking
+      if (options.effort !== undefined && supportsAdaptiveThinking(request.model)) return { type: "adaptive" }
+    })(),
+  )
+  const additionalModelRequestFields = {
+    ...(generation?.topK === undefined ? {} : { top_k: generation.topK }),
+    ...(thinking === undefined ? {} : { thinking }),
+    ...(options.effort === undefined ? {} : effortFields(request.model, options.effort)),
+    // Converse takes Anthropic betas in the body, and Bedrock rejects `block_binding` without this one.
+    ...(thinking?.block_binding === undefined ? {} : { anthropic_beta: [THINKING_BINDING_BETA] }),
+  }
   // Bedrock-Claude shares Anthropic's 4-breakpoint cap. Spend the budget in
   // tools → system → messages order to favour the highest-impact prefixes.
-  const breakpoints = BedrockCache.breakpoints()
-  const toolConfig =
-    request.tools.length > 0 && request.toolChoice?.type !== "none"
-      ? { tools: lowerTools(request.model.compatibility?.toolSchema, breakpoints, request.tools), toolChoice }
-      : undefined
-  const system = request.system.length === 0 ? undefined : lowerSystem(breakpoints, request.system)
-  const messages = yield* lowerMessages(request, breakpoints)
+  const breakpoints = BedrockCache.breakpoints(request.model)
+  const toolConfig = (() => {
+    if (flattened.tools.length === 0) return undefined
+    return {
+      tools: lowerTools(breakpoints, flattened.tools),
+      // Converse has no native "none". Keep definitions stable for prompt
+      // caching and omit only the unsupported choice.
+      toolChoice,
+    }
+  })()
+  const system = lowerSystem(breakpoints, request.system)
+  const messages = yield* lowerMessages(flattened.request, breakpoints)
   if (breakpoints.dropped > 0) {
     yield* Effect.logWarning(
       `Bedrock Converse: dropped ${breakpoints.dropped} cache breakpoint(s); the API allows at most ${BedrockCache.BEDROCK_BREAKPOINT_CAP} per request.`,
     )
   }
+  const inferenceConfig = (() => {
+    if (
+      maxTokens === undefined &&
+      generation?.temperature === undefined &&
+      generation?.topP === undefined &&
+      (generation?.stop === undefined || generation.stop.length === 0)
+    )
+      return undefined
+    return {
+      maxTokens,
+      temperature: generation?.temperature,
+      topP: generation?.topP,
+      stopSequences: generation?.stop,
+    }
+  })()
   return {
     modelId: request.model.id,
     messages,
     system,
-    inferenceConfig:
-      generation?.maxTokens === undefined &&
-      generation?.temperature === undefined &&
-      generation?.topP === undefined &&
-      (generation?.stop === undefined || generation.stop.length === 0)
+    inferenceConfig,
+    toolConfig,
+    // Converse's base inferenceConfig has no topK, thinking or effort; models accept them
+    // as model-specific fields, so they go through additionalModelRequestFields.
+    additionalModelRequestFields:
+      Object.keys(additionalModelRequestFields).length === 0 ? undefined : additionalModelRequestFields,
+    serviceTier: options.serviceTier === undefined ? undefined : { type: options.serviceTier },
+    guardrailConfig:
+      options.guardrail === undefined
         ? undefined
         : {
-            maxTokens: generation?.maxTokens,
-            temperature: generation?.temperature,
-            topP: generation?.topP,
-            stopSequences: generation?.stop,
+            guardrailIdentifier: options.guardrail.identifier,
+            guardrailVersion: options.guardrail.version,
+            trace: options.guardrail.trace,
+            streamProcessingMode: options.guardrail.streamProcessingMode,
           },
-    toolConfig,
-    // Converse's base inferenceConfig has no topK; Anthropic/Nova accept it
-    // as a model-specific field, so it goes through additionalModelRequestFields.
-    additionalModelRequestFields: generation?.topK === undefined ? undefined : { top_k: generation.topK },
+    outputConfig:
+      options.outputFormat === undefined
+        ? undefined
+        : {
+            textFormat: {
+              type: options.outputFormat.type,
+              structure: {
+                jsonSchema: {
+                  schema: ProviderShared.encodeJson(options.outputFormat.schema),
+                  name: options.outputFormat.name,
+                  description: options.outputFormat.description,
+                },
+              },
+            },
+          },
+    requestMetadata: options.requestMetadata,
   }
 })
 
@@ -431,41 +682,47 @@ const fromRequest = Effect.fn("BedrockConverse.fromRequest")(function* (request:
 // =============================================================================
 const mapFinishReason = (reason: string): FinishReason => {
   if (reason === "end_turn" || reason === "stop_sequence") return "stop"
-  if (reason === "max_tokens") return "length"
+  if (reason === "max_tokens" || reason === "model_context_window_exceeded") return "length"
   if (reason === "tool_use") return "tool-calls"
   if (reason === "content_filtered" || reason === "guardrail_intervened") return "content-filter"
   return "unknown"
 }
 
-// AWS Bedrock Converse reports `inputTokens` (inclusive total) with
-// `cacheReadInputTokens` and `cacheWriteInputTokens` as subsets. Pass
-// the total through and derive the non-cached breakdown. Bedrock does
-// not break reasoning out of `outputTokens` for any current model.
-const mapUsage = (usage: BedrockUsageSchema | undefined): Usage | undefined => {
+// AWS reports inputTokens separately from cache reads and writes.
+// Bedrock does not break reasoning out of outputTokens for current models.
+const mapUsage = (usage: BedrockUsageSchema | undefined, providerMetadataKey: string): Usage | undefined => {
   if (!usage) return undefined
-  const cacheTotal = (usage.cacheReadInputTokens ?? 0) + (usage.cacheWriteInputTokens ?? 0)
-  const nonCached = ProviderShared.subtractTokens(usage.inputTokens, cacheTotal)
+  const inputTokens = ProviderShared.sumTokens(
+    usage.inputTokens,
+    usage.cacheReadInputTokens,
+    usage.cacheWriteInputTokens,
+  )
   return new Usage({
-    inputTokens: usage.inputTokens,
+    inputTokens,
     outputTokens: usage.outputTokens,
-    nonCachedInputTokens: nonCached,
+    nonCachedInputTokens: usage.inputTokens,
     cacheReadInputTokens: usage.cacheReadInputTokens,
     cacheWriteInputTokens: usage.cacheWriteInputTokens,
-    totalTokens: ProviderShared.totalTokens(usage.inputTokens, usage.outputTokens, usage.totalTokens),
-    providerMetadata: { bedrock: usage },
+    totalTokens: ProviderShared.totalTokens(inputTokens, usage.outputTokens, usage.totalTokens),
+    providerMetadata: { [providerMetadataKey]: usage },
   })
 }
 
 interface ParserState {
+  readonly providerMetadataKey: string
   readonly tools: ToolStream.State<number>
   // Bedrock splits the finish into `messageStop` (carries `stopReason`) and
-  // `metadata` (carries usage). Hold the terminal event in state so `onHalt`
-  // can emit exactly one finish after both chunks have had a chance to arrive.
-  readonly pendingFinish: { readonly reason: FinishReason; readonly usage?: Usage } | undefined
+  // `metadata` (carries usage). Hold both in state so `onHalt` can emit exactly
+  // one finish after both chunks have had a chance to arrive.
+  readonly finishReason: FinishReasonDetails | undefined
+  readonly usage: Usage | undefined
   readonly hasToolCalls: boolean
   readonly lifecycle: Lifecycle.State
   readonly reasoningSignatures: Readonly<Record<number, string>>
+  readonly reasoningRedactedContent: Readonly<Record<number, Uint8Array[]>>
 }
+
+const encodeRedactedContent = (chunks: ReadonlyArray<Uint8Array>) => Base64.encode(concatBytes(chunks))
 
 const step = (state: ParserState, event: BedrockEvent) =>
   Effect.gen(function* () {
@@ -512,30 +769,63 @@ const step = (state: ParserState, event: BedrockEvent) =>
       const index = event.contentBlockDelta.contentBlockIndex
       const reasoning = event.contentBlockDelta.delta.reasoningContent
       const events: LLMEvent[] = []
+      const redactedChunk = yield* (() => {
+        if (reasoning.redactedContent === undefined) return Effect.succeed(undefined)
+        return Effect.fromResult(Base64.decode(reasoning.redactedContent)).pipe(
+          Effect.mapError((cause) =>
+            ProviderShared.eventError(
+              ADAPTER,
+              "Bedrock Converse reasoningContent.redactedContent contains invalid base64 data",
+              undefined,
+              cause,
+            ),
+          ),
+        )
+      })()
+      const redactedChunks = state.reasoningRedactedContent[index] ?? []
+      if (redactedChunk !== undefined) redactedChunks.push(redactedChunk)
+      const metadata = (() => {
+        if (reasoning.signature) return providerMetadata(state.providerMetadataKey, { signature: reasoning.signature })
+        if (redactedChunk === undefined && reasoning.data !== undefined)
+          return providerMetadata(state.providerMetadataKey, { redactedData: reasoning.data })
+      })()
+      const lifecycle = (() => {
+        if (reasoning.text !== undefined || metadata !== undefined)
+          return Lifecycle.reasoningDelta(state.lifecycle, events, `reasoning-${index}`, reasoning.text ?? "", metadata)
+        if (redactedChunk !== undefined) return Lifecycle.reasoningStart(state.lifecycle, events, `reasoning-${index}`)
+        return state.lifecycle
+      })()
+      const reasoningRedactedContent = (() => {
+        if (redactedChunk !== undefined) return { ...state.reasoningRedactedContent, [index]: redactedChunks }
+        if (reasoning.data === undefined) return state.reasoningRedactedContent
+        return Object.fromEntries(
+          Object.entries(state.reasoningRedactedContent).filter(([key]) => key !== String(index)),
+        )
+      })()
+      const reasoningSignatures = (() => {
+        if (!reasoning.signature) return state.reasoningSignatures
+        return { ...state.reasoningSignatures, [index]: reasoning.signature }
+      })()
       return [
         {
           ...state,
-          lifecycle: reasoning.text
-            ? Lifecycle.reasoningDelta(state.lifecycle, events, `reasoning-${index}`, reasoning.text)
-            : state.lifecycle,
-          reasoningSignatures: reasoning.signature
-            ? { ...state.reasoningSignatures, [index]: reasoning.signature }
-            : state.reasoningSignatures,
+          lifecycle,
+          reasoningSignatures,
+          reasoningRedactedContent,
         },
         events,
       ] as const
     }
 
     if (event.contentBlockDelta?.delta?.toolUse) {
-      const index = event.contentBlockDelta.contentBlockIndex
-      const result = ToolStream.appendExisting(
-        ADAPTER,
+      // A delta for a block that is not open, whether it already stopped or never
+      // started, has nothing to attach to and is dropped.
+      const result = ToolStream.append(
         state.tools,
-        index,
+        event.contentBlockDelta.contentBlockIndex,
         event.contentBlockDelta.delta.toolUse.input,
-        "Bedrock Converse tool delta is missing its tool call",
       )
-      if (ToolStream.isError(result)) return yield* result
+      if (!result) return [state, []] as const
       const events: LLMEvent[] = []
       const lifecycle = result.events.length ? Lifecycle.stepStart(state.lifecycle, events) : state.lifecycle
       events.push(...result.events)
@@ -547,16 +837,24 @@ const step = (state: ParserState, event: BedrockEvent) =>
       const result = yield* ToolStream.finish(ADAPTER, state.tools, index)
       const events: LLMEvent[] = []
       const resultEvents = result.events ?? []
-      const lifecycle = resultEvents.length
-        ? Lifecycle.stepStart(state.lifecycle, events)
-        : Lifecycle.reasoningEnd(
-            Lifecycle.textEnd(state.lifecycle, events, `text-${index}`),
-            events,
-            `reasoning-${index}`,
-            state.reasoningSignatures[index]
-              ? bedrockMetadata({ signature: state.reasoningSignatures[index] })
-              : undefined,
-          )
+      const lifecycle = (() => {
+        if (resultEvents.length) return Lifecycle.stepStart(state.lifecycle, events)
+        const metadata = (() => {
+          const signature = state.reasoningSignatures[index]
+          if (signature) return providerMetadata(state.providerMetadataKey, { signature })
+          const redactedContent = state.reasoningRedactedContent[index]
+          if (redactedContent)
+            return providerMetadata(state.providerMetadataKey, {
+              redactedData: encodeRedactedContent(redactedContent),
+            })
+        })()
+        return Lifecycle.reasoningEnd(
+          Lifecycle.textEnd(state.lifecycle, events, `text-${index}`),
+          events,
+          `reasoning-${index}`,
+          metadata,
+        )
+      })()
       events.push(...resultEvents)
       return [
         {
@@ -569,42 +867,56 @@ const step = (state: ParserState, event: BedrockEvent) =>
           reasoningSignatures: Object.fromEntries(
             Object.entries(state.reasoningSignatures).filter(([key]) => key !== String(index)),
           ),
+          reasoningRedactedContent: Object.fromEntries(
+            Object.entries(state.reasoningRedactedContent).filter(([key]) => key !== String(index)),
+          ),
         },
         events,
       ] as const
     }
 
     if (event.messageStop) {
+      if (
+        event.messageStop.stopReason === "malformed_model_output" ||
+        event.messageStop.stopReason === "malformed_tool_use"
+      )
+        return yield* ProviderShared.eventError(
+          ADAPTER,
+          `Bedrock Converse stopped with ${event.messageStop.stopReason}`,
+          ProviderShared.encodeJson(event),
+        )
       return [
         {
           ...state,
-          pendingFinish: { reason: mapFinishReason(event.messageStop.stopReason), usage: state.pendingFinish?.usage },
+          finishReason: {
+            normalized: mapFinishReason(event.messageStop.stopReason),
+            raw: event.messageStop.stopReason,
+          },
         },
         [],
       ] as const
     }
 
     if (event.metadata) {
-      const usage = mapUsage(event.metadata.usage)
-      return [{ ...state, pendingFinish: { reason: state.pendingFinish?.reason ?? "stop", usage } }, []] as const
+      const usage = mapUsage(event.metadata.usage, state.providerMetadataKey) ?? state.usage
+      return [
+        {
+          ...state,
+          usage,
+        },
+        [],
+      ] as const
     }
 
-    const exception = (
-      [
-        ["internalServerException", event.internalServerException],
-        ["modelStreamErrorException", event.modelStreamErrorException],
-        ["serviceUnavailableException", event.serviceUnavailableException],
-        ["throttlingException", event.throttlingException],
-        ["validationException", event.validationException],
-      ] as const
-    ).find((entry) => entry[1] !== undefined)
-    if (exception) {
-      return yield* new LLMError({
-        module: ADAPTER,
-        method: "stream",
+    if (event.exception) {
+      const message =
+        event.exception.details.message ?? event.exception.details.originalMessage ?? "Bedrock Converse stream error"
+      const body = ProviderShared.encodeJson(event)
+      return yield* new AIError({
         reason: classifyProviderFailure({
-          message: exception[1]?.message ?? "Bedrock Converse stream error",
-          code: exception[0],
+          message,
+          status: event.exception.details.originalStatusCode,
+          rawBody: body,
         }),
       })
     }
@@ -614,18 +926,34 @@ const step = (state: ParserState, event: BedrockEvent) =>
 
 const framing = BedrockEventStream.framing(ADAPTER)
 
-const onHalt = (state: ParserState): ReadonlyArray<LLMEvent> =>
-  state.pendingFinish
-    ? (() => {
-        const events: LLMEvent[] = []
-        Lifecycle.finish(state.lifecycle, events, {
-          reason:
-            state.pendingFinish.reason === "stop" && state.hasToolCalls ? "tool-calls" : state.pendingFinish.reason,
-          usage: state.pendingFinish.usage,
-        })
-        return events
-      })()
-    : []
+const onHalt = (state: ParserState): ReadonlyArray<LLMEvent> => {
+  if (!state.finishReason) return []
+  const normalized = (() => {
+    if (state.finishReason.normalized === "stop" && state.hasToolCalls) return "tool-calls"
+    return state.finishReason.normalized
+  })()
+  const events: LLMEvent[] = []
+  const lifecycle = Object.entries(state.reasoningRedactedContent).reduce((current, [index, chunks]) => {
+    const signature = state.reasoningSignatures[Number(index)]
+    return Lifecycle.reasoningEnd(
+      current,
+      events,
+      `reasoning-${index}`,
+      providerMetadata(
+        state.providerMetadataKey,
+        signature ? { signature } : { redactedData: encodeRedactedContent(chunks) },
+      ),
+    )
+  }, state.lifecycle)
+  Lifecycle.finish(lifecycle, events, {
+    reason: {
+      ...state.finishReason,
+      normalized,
+    },
+    usage: state.usage,
+  })
+  return events
+}
 
 // =============================================================================
 // Protocol And Bedrock Route
@@ -641,16 +969,19 @@ export const protocol = Protocol.make({
     from: fromRequest,
   },
   stream: {
-    event: BedrockEvent,
-    initial: () => ({
+    event: BedrockEventStream.Frame.pipe(Schema.decodeTo(BedrockEvent)),
+    initial: (request) => ({
+      providerMetadataKey: request.model.route.providerMetadataKey ?? request.model.provider,
       tools: ToolStream.empty<number>(),
-      pendingFinish: undefined,
+      finishReason: undefined,
+      usage: undefined,
       hasToolCalls: false,
       lifecycle: Lifecycle.initial(),
       reasoningSignatures: {},
+      reasoningRedactedContent: {},
     }),
     step,
-    onHalt,
+    onHalt: (state) => Effect.succeed(onHalt(state)),
   },
 })
 
@@ -669,6 +1000,4 @@ export const route = Route.make({
   framing,
 })
 
-export const sigV4Auth = BedrockAuth.sigV4
-
-export * as BedrockConverse from "./bedrock-converse"
+export * as BedrockConverse from "./bedrock-converse.js"

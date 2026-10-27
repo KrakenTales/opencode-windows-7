@@ -1,22 +1,25 @@
-import { Config, Effect, Redacted } from "effect"
-import { Headers } from "effect/unstable/http"
-import { AuthenticationReason, InvalidRequestReason, LLMError, type HttpOptions } from "../schema"
+import { Config, Effect, Option, Redacted } from "effect"
+import { Headers } from "effect/http"
+import { AuthenticationError, AIError, type HttpOptions } from "../schema/index.js"
 
 export class MissingCredentialError extends Error {
   readonly _tag = "MissingCredentialError"
 
-  constructor(readonly source: string) {
-    super(`Missing auth credential: ${source}`)
+  constructor(
+    readonly source: string,
+    message = `Missing auth credential: ${source}`,
+  ) {
+    super(message)
   }
 }
 
 export type CredentialError = MissingCredentialError | Config.ConfigError
-export type AuthError = CredentialError | LLMError
+export type AuthError = CredentialError | AIError
 type Secret = string | Redacted.Redacted | Config.Config<string | Redacted.Redacted>
 
 export interface AuthInput {
   readonly request: { readonly http?: HttpOptions }
-  readonly method: "POST" | "GET"
+  readonly method: "POST" | "GET" | "PUT" | "DELETE"
   readonly url: string
   readonly body: string
   readonly headers: Headers.Headers
@@ -36,9 +39,6 @@ export interface Definition {
   readonly orElse: (that: Definition) => Definition
   readonly pipe: <A>(f: (self: Definition) => A) => A
 }
-
-export const isAuth = (input: unknown): input is Definition =>
-  typeof input === "object" && input !== null && "apply" in input && typeof input.apply === "function"
 
 const credential = (load: Effect.Effect<Redacted.Redacted, CredentialError>): Credential => {
   const self: Credential = {
@@ -89,7 +89,14 @@ export const optional = (secret: Secret | undefined, source = "optional value") 
     ? credential(Effect.fail(new MissingCredentialError(source)))
     : credentialFromSecret(secret, source)
 
-export const config = (name: string) => credentialFromSecret(Config.redacted(name), name)
+export const config = (name: string) =>
+  credential(
+    Effect.gen(function* () {
+      const secret = yield* Config.option(Config.Redacted(name))
+      if (Option.isSome(secret) && Redacted.value(secret.value) !== "") return secret.value
+      return yield* Effect.fail(new MissingCredentialError(name, `${name} is not set`))
+    }),
+  )
 
 export const effect = (load: Effect.Effect<Redacted.Redacted, CredentialError>) => credential(load)
 
@@ -100,7 +107,7 @@ export const headers = (input: Headers.Input) =>
 
 export const remove = (name: string) => auth((input) => Effect.succeed(Headers.remove(input.headers, name)))
 
-export const custom = (apply: (input: AuthInput) => Effect.Effect<Headers.Headers, LLMError>) => auth(apply)
+export const custom = (apply: (input: AuthInput) => Effect.Effect<Headers.Headers, AIError>) => auth(apply)
 
 export const passthrough = none
 
@@ -113,8 +120,6 @@ export function bearer(source: Secret | Credential): Definition
 export function bearer(source: Secret | Credential) {
   return credentialInput(source).bearer()
 }
-
-export const apiKey = bearer
 
 export function header(name: string): (source: Secret | Credential) => Definition
 export function header(name: string, source: Secret | Credential): Definition
@@ -134,23 +139,26 @@ export function bearerHeader(name: string, source?: Secret | Credential) {
   return render(source)
 }
 
-const toLLMError = (error: AuthError): LLMError => {
-  if (error instanceof MissingCredentialError || error instanceof Config.ConfigError) {
-    return new LLMError({
-      module: "Auth",
-      method: "apply",
-      reason:
-        error instanceof MissingCredentialError
-          ? new AuthenticationReason({ message: error.message, kind: "missing" })
-          : new InvalidRequestReason({ message: `Failed to resolve auth config: ${error.message}` }),
-    })
-  }
-  return error
+/** `Authorization: <scheme> <secret>` for providers whose scheme is not `Bearer`, such as fal's `Key`. */
+export function scheme(name: string): (source: Secret | Credential) => Definition
+export function scheme(name: string, source: Secret | Credential): Definition
+export function scheme(name: string, source?: Secret | Credential) {
+  const render = (input: Secret | Credential) =>
+    fromCredential(credentialInput(input), (secret) => ({ authorization: `${name} ${secret}` }))
+  if (source === undefined) return render
+  return render(source)
+}
+
+const toAIError = (error: AuthError): AIError => {
+  if (error instanceof AIError) return error
+  const message =
+    error instanceof MissingCredentialError ? error.message : `Failed to resolve auth config: ${error.message}`
+  return new AIError({ reason: new AuthenticationError({ message, cause: error }) })
 }
 
 export const toEffect =
   (input: Definition) =>
-  (authInput: AuthInput): Effect.Effect<Headers.Headers, LLMError> =>
-    input.apply(authInput).pipe(Effect.mapError(toLLMError))
+  (authInput: AuthInput): Effect.Effect<Headers.Headers, AIError> =>
+    input.apply(authInput).pipe(Effect.mapError(toAIError))
 
-export * as Auth from "./auth"
+export * as Auth from "./auth.js"

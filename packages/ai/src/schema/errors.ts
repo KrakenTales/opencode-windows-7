@@ -1,145 +1,171 @@
 import { Schema } from "effect"
-import { ModelID, ProviderID, ProviderMetadata, RouteID } from "./ids"
+import { NonNegativeInt } from "@opencode/schema"
+import { Tool } from "@opencode/schema/tool"
+import { ModelID, ProviderID, RouteID } from "./ids.js"
 
-export const ProviderFailureClassification = Schema.Literal("context-overflow")
+export const ProviderFailureClassification = Schema.Literals(["context-overflow", "payload-too-large"])
 export type ProviderFailureClassification = typeof ProviderFailureClassification.Type
 
-export class HttpRequestDetails extends Schema.Class<HttpRequestDetails>("LLM.HttpRequestDetails")({
-  method: Schema.String,
+export class HttpContext extends Schema.Class<HttpContext>("AI.HttpContext")({
   url: Schema.String,
+  status: Schema.Int.check(Schema.isBetween({ minimum: 100, maximum: 599 })),
   headers: Schema.Record(Schema.String, Schema.String),
 }) {}
 
-export class HttpResponseDetails extends Schema.Class<HttpResponseDetails>("LLM.HttpResponseDetails")({
-  status: Schema.Number,
-  headers: Schema.Record(Schema.String, Schema.String),
-}) {}
-
-export class HttpRateLimitDetails extends Schema.Class<HttpRateLimitDetails>("LLM.HttpRateLimitDetails")({
-  retryAfterMs: Schema.optional(Schema.Number),
+export class HttpRateLimitDetails extends Schema.Class<HttpRateLimitDetails>("AI.HttpRateLimitDetails")({
+  retryAfterMs: Schema.optional(NonNegativeInt),
   limit: Schema.optional(Schema.Record(Schema.String, Schema.String)),
   remaining: Schema.optional(Schema.Record(Schema.String, Schema.String)),
   reset: Schema.optional(Schema.Record(Schema.String, Schema.String)),
 }) {}
 
-export class HttpContext extends Schema.Class<HttpContext>("LLM.HttpContext")({
-  request: HttpRequestDetails,
-  response: Schema.optional(HttpResponseDetails),
-  body: Schema.optional(Schema.String),
-  bodyTruncated: Schema.optional(Schema.Boolean),
-  requestId: Schema.optional(Schema.String),
-  rateLimit: Schema.optional(HttpRateLimitDetails),
-}) {}
-
-export class InvalidRequestReason extends Schema.Class<InvalidRequestReason>("LLM.Error.InvalidRequest")({
-  _tag: Schema.tag("InvalidRequest"),
+const ReasonFields = {
   message: Schema.String,
-  parameter: Schema.optional(Schema.String),
-  classification: Schema.optional(ProviderFailureClassification),
-  providerMetadata: Schema.optional(ProviderMetadata),
+  // Preserve the complete original response or triggering event before decoding narrows it.
+  body: Schema.optional(Schema.String),
   http: Schema.optional(HttpContext),
+  cause: Schema.optional(Schema.Defect({ includeStack: true })),
+}
+
+export class InvalidRequestError extends Schema.TaggedError<InvalidRequestError>("AI.Error.InvalidRequest")(
+  "InvalidRequest",
+  {
+    ...ReasonFields,
+    parameter: Schema.optional(Schema.String),
+    classification: Schema.optional(ProviderFailureClassification),
+  },
+) {}
+
+/**
+ * A caller-requested operation the selected route does not implement, such as
+ * explicit compaction on a route without a compact endpoint. Detected locally
+ * before any network I/O, so unlike transport or provider-output failures it
+ * never carries HTTP context from a provider round-trip.
+ */
+export class UnsupportedOperationError extends Schema.TaggedError<UnsupportedOperationError>(
+  "AI.Error.UnsupportedOperation",
+)("UnsupportedOperation", {
+  ...ReasonFields,
+  operation: Schema.String,
+  provider: Schema.optional(ProviderID),
+  route: Schema.optional(RouteID),
 }) {}
 
-export class NoRouteReason extends Schema.Class<NoRouteReason>("LLM.Error.NoRoute")({
-  _tag: Schema.tag("NoRoute"),
+/**
+ * Provider settings that are missing, conflicting, or unsupported, such as
+ * Azure without `resourceName` or `baseURL`. Thrown synchronously while a
+ * provider facade or package entrypoint configures a model, before any
+ * request exists, so it is not an `AIError` reason.
+ */
+export class ProviderConfigurationError extends Schema.TaggedError<ProviderConfigurationError>(
+  "AI.Error.ProviderConfiguration",
+)("ProviderConfiguration", {
+  provider: ProviderID,
+  message: Schema.String,
+}) {}
+
+export class NoRouteError extends Schema.TaggedError<NoRouteError>("AI.Error.NoRoute")("NoRoute", {
+  ...ReasonFields,
   route: RouteID,
   provider: ProviderID,
   model: ModelID,
-}) {
-  get message() {
-    return `No LLM route for ${this.provider}/${this.model} using ${this.route}`
-  }
-}
-
-export class AuthenticationReason extends Schema.Class<AuthenticationReason>("LLM.Error.Authentication")({
-  _tag: Schema.tag("Authentication"),
-  message: Schema.String,
-  kind: Schema.Literals(["missing", "invalid", "expired", "insufficient-permissions", "unknown"]),
-  providerMetadata: Schema.optional(ProviderMetadata),
-  http: Schema.optional(HttpContext),
 }) {}
 
-export class RateLimitReason extends Schema.Class<RateLimitReason>("LLM.Error.RateLimit")({
-  _tag: Schema.tag("RateLimit"),
-  message: Schema.String,
-  retryAfterMs: Schema.optional(Schema.Number),
+export class AuthenticationError extends Schema.TaggedError<AuthenticationError>("AI.Error.Authentication")(
+  "Authentication",
+  ReasonFields,
+) {}
+
+export class RateLimitError extends Schema.TaggedError<RateLimitError>("AI.Error.RateLimit")("RateLimit", {
+  ...ReasonFields,
+  retryAfterMs: Schema.optional(NonNegativeInt),
   rateLimit: Schema.optional(HttpRateLimitDetails),
-  providerMetadata: Schema.optional(ProviderMetadata),
-  http: Schema.optional(HttpContext),
 }) {}
 
-export class QuotaExceededReason extends Schema.Class<QuotaExceededReason>("LLM.Error.QuotaExceeded")({
-  _tag: Schema.tag("QuotaExceeded"),
-  message: Schema.String,
-  providerMetadata: Schema.optional(ProviderMetadata),
-  http: Schema.optional(HttpContext),
-}) {}
+export class QuotaExceededError extends Schema.TaggedError<QuotaExceededError>("AI.Error.QuotaExceeded")(
+  "QuotaExceeded",
+  {
+    ...ReasonFields,
+    retryAfterMs: Schema.optional(NonNegativeInt),
+  },
+) {}
 
-export class ContentPolicyReason extends Schema.Class<ContentPolicyReason>("LLM.Error.ContentPolicy")({
-  _tag: Schema.tag("ContentPolicy"),
-  message: Schema.String,
-  providerMetadata: Schema.optional(ProviderMetadata),
-  http: Schema.optional(HttpContext),
-}) {}
+export class ContentPolicyError extends Schema.TaggedError<ContentPolicyError>("AI.Error.ContentPolicy")(
+  "ContentPolicy",
+  ReasonFields,
+) {}
 
-export class ProviderInternalReason extends Schema.Class<ProviderInternalReason>("LLM.Error.ProviderInternal")({
-  _tag: Schema.tag("ProviderInternal"),
-  message: Schema.String,
-  status: Schema.optional(Schema.Number),
-  retryAfterMs: Schema.optional(Schema.Number),
-  providerMetadata: Schema.optional(ProviderMetadata),
-  http: Schema.optional(HttpContext),
-}) {}
+export class ProviderInternalError extends Schema.TaggedError<ProviderInternalError>("AI.Error.ProviderInternal")(
+  "ProviderInternal",
+  {
+    ...ReasonFields,
+    retryAfterMs: Schema.optional(NonNegativeInt),
+  },
+) {}
 
-export class TransportReason extends Schema.Class<TransportReason>("LLM.Error.Transport")({
-  _tag: Schema.tag("Transport"),
-  message: Schema.String,
-  kind: Schema.optional(Schema.String),
+export const TransportType = Schema.Literals(["http", "websocket"])
+export type TransportType = typeof TransportType.Type
+
+export const TransportOperation = Schema.Literals(["request", "read", "write"])
+export type TransportOperation = typeof TransportOperation.Type
+
+export class TransportError extends Schema.TaggedError<TransportError>("AI.Error.Transport")("Transport", {
+  ...ReasonFields,
+  transport: TransportType,
+  operation: TransportOperation,
+  code: Schema.optional(Schema.String),
   url: Schema.optional(Schema.String),
-  http: Schema.optional(HttpContext),
+  phase: Schema.optional(
+    Schema.Literals(["prepare", "queue", "connect", "send", "receive", "decode", "complete", "fallback", "close"]),
+  ),
+  delivery: Schema.optional(Schema.Literals(["not-sent", "rejected", "ambiguous", "accepted"])),
+  recovery: Schema.optional(
+    Schema.Literals(["retry-connect", "retry-full", "rotate-and-retry-full", "fallback-http", "fail"]),
+  ),
 }) {}
 
-export class InvalidProviderOutputReason extends Schema.Class<InvalidProviderOutputReason>(
-  "LLM.Error.InvalidProviderOutput",
-)({
-  _tag: Schema.tag("InvalidProviderOutput"),
-  message: Schema.String,
+export class InvalidProviderOutputError extends Schema.TaggedError<InvalidProviderOutputError>(
+  "AI.Error.InvalidProviderOutput",
+)("InvalidProviderOutput", {
+  ...ReasonFields,
+  classification: Schema.optional(Schema.Literals(["incomplete-stream"])),
   route: Schema.optional(Schema.String),
-  raw: Schema.optional(Schema.String),
-  providerMetadata: Schema.optional(ProviderMetadata),
 }) {}
 
-export class UnknownProviderReason extends Schema.Class<UnknownProviderReason>("LLM.Error.UnknownProvider")({
-  _tag: Schema.tag("UnknownProvider"),
-  message: Schema.String,
-  status: Schema.optional(Schema.Number),
-  providerMetadata: Schema.optional(ProviderMetadata),
-  http: Schema.optional(HttpContext),
+export class UnknownProviderError extends Schema.TaggedError<UnknownProviderError>("AI.Error.UnknownProvider")(
+  "UnknownProvider",
+  ReasonFields,
+) {}
+
+/** A caller-supplied deadline elapsed, such as `Generation.await` polling past its `Poll.timeout`. */
+export class TimeoutError extends Schema.TaggedError<TimeoutError>("AI.Error.Timeout")("Timeout", {
+  ...ReasonFields,
+  timeoutMs: Schema.optional(NonNegativeInt),
 }) {}
 
-export const LLMErrorReason = Schema.Union([
-  InvalidRequestReason,
-  NoRouteReason,
-  AuthenticationReason,
-  RateLimitReason,
-  QuotaExceededReason,
-  ContentPolicyReason,
-  ProviderInternalReason,
-  TransportReason,
-  InvalidProviderOutputReason,
-  UnknownProviderReason,
+export const AIErrorReason = Schema.Union([
+  InvalidRequestError,
+  UnsupportedOperationError,
+  NoRouteError,
+  AuthenticationError,
+  RateLimitError,
+  QuotaExceededError,
+  ContentPolicyError,
+  ProviderInternalError,
+  TransportError,
+  InvalidProviderOutputError,
+  UnknownProviderError,
+  TimeoutError,
 ]).pipe(Schema.toTaggedUnion("_tag"))
-export type LLMErrorReason = Schema.Schema.Type<typeof LLMErrorReason>
+export type AIErrorReason = Schema.Schema.Type<typeof AIErrorReason>
 
-export class LLMError extends Schema.TaggedErrorClass<LLMError>()("LLM.Error", {
-  module: Schema.String,
-  method: Schema.String,
-  reason: LLMErrorReason,
+export class AIError extends Schema.TaggedError<AIError>()("AI.Error", {
+  reason: AIErrorReason,
 }) {
   override readonly cause = this.reason
 
-  override get message() {
-    return `${this.module}.${this.method}: ${this.reason.message}`
+  override get message(): string {
+    return this.reason.message
   }
 }
 
@@ -152,8 +178,4 @@ export class LLMError extends Schema.TaggedErrorClass<LLMError>()("LLM.Error", {
  * Anything thrown or yielded by a handler that is not a `ToolFailure` is
  * treated as a defect and fails the stream.
  */
-export class ToolFailure extends Schema.TaggedErrorClass<ToolFailure>()("LLM.ToolFailure", {
-  message: Schema.String,
-  error: Schema.optional(Schema.Defect()),
-  metadata: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
-}) {}
+export class ToolFailure extends Tool.Error {}

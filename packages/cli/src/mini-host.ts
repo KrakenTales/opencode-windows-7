@@ -1,11 +1,10 @@
-import type { MiniFrontendInput } from "@opencode-ai/tui/mini"
-import { createModelPreferenceRepository } from "@opencode-ai/tui/model-preference"
-import { Flag } from "@opencode-ai/core/flag/flag"
-import { Global } from "@opencode-ai/core/global"
+import type { MiniFrontendInput } from "@opencode/tui/mini"
+import { createModelPreferenceRepository } from "@opencode/tui/model-preference"
 import fs from "node:fs"
 import { readFile } from "node:fs/promises"
 import path from "node:path"
 import { ReadStream } from "node:tty"
+import { OPENCODE_VERSION } from "./version"
 
 export const INTERACTIVE_INPUT_ERROR = "opencode mini requires a controlling terminal for input"
 
@@ -130,19 +129,16 @@ export async function usingInteractiveStdin<T>(
 export function createMiniHost(input: {
   terminal: InteractiveStdin
   directory: string
-  paths?: { home: string; state: string; log: string }
+  paths: { home: string; state: string; log: string }
 }): MiniHost {
-  const paths = input.paths ?? {
-    home: Global.Path.home,
-    state: Global.Path.state,
-    log: Global.Path.log,
-  }
+  const paths = input.paths
   const diagnostics = {
     pid: process.pid,
     cwd: input.directory,
     argv: process.argv.slice(2),
   }
   return {
+    version: OPENCODE_VERSION,
     terminal: { stdin: input.terminal.stdin },
     platform: process.platform,
     stdout: {
@@ -155,7 +151,7 @@ export function createMiniHost(input: {
     },
     editor: {
       async open(options) {
-        const { openEditor } = await import("@opencode-ai/tui/editor")
+        const { openEditor } = await import("@opencode/tui/editor")
         return openEditor(options)
       },
     },
@@ -165,7 +161,7 @@ export function createMiniHost(input: {
       sigusr2: signal("SIGUSR2"),
     },
     startup: {
-      showTiming: Flag.OPENCODE_SHOW_TTFD,
+      showTiming: ["1", "true"].includes(process.env.OPENCODE_SHOW_TTFD?.toLowerCase() ?? ""),
       now: () => performance.now(),
     },
     diagnostics: {

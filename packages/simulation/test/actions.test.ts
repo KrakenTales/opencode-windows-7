@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test"
-import { BoxRenderable, TextRenderable } from "@opentui/core"
+import { BoxRenderable, ImageRenderable, NativeImage, TextRenderable } from "@opentui/core"
 import { Effect } from "effect"
-import { createHarness, execute, type Harness, matches, snapshot, state } from "../src/frontend/actions"
+import { capture, createHarness, execute, type Harness, matches, snapshot, state } from "../src/frontend/actions"
 import { SimulationRenderer } from "../src/frontend/renderer"
 import { SimulationSemantics } from "../src/frontend/semantics"
 
@@ -12,6 +12,18 @@ test("matches literal screen text", () => {
   expect(matches(harness, "[ready].*")).toBe(true)
   expect(matches(harness, "OpenCode.*ready")).toBe(false)
   expect(matches(harness, "opencode")).toBe(false)
+})
+
+test("omits an absent focused renderable from state", () => {
+  const harness = {
+    renderer: {
+      root: { getChildren: () => [] },
+      currentFocusedRenderable: undefined,
+      currentFocusedEditor: undefined,
+    },
+  } as unknown as Harness
+
+  expect(state(harness)).toEqual({ focused: { editor: false }, elements: [] })
 })
 
 test("normalizes named keys for OpenTUI", async () => {
@@ -43,6 +55,61 @@ test("normalizes named keys for OpenTUI", async () => {
   ])
 })
 
+test("headless input mirrors the configured kitty keyboard protocol", async () => {
+  await Effect.runPromise(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const renderer = yield* SimulationRenderer.create({ useKittyKeyboard: {} })
+        const harness = createHarness(renderer)
+        let key: { readonly name: string; readonly source: string } | undefined
+        renderer.keyInput.once("keypress", (event) => {
+          key = event
+        })
+
+        yield* execute(harness, { type: "ui.press", key: "escape" })
+
+        expect(key).toMatchObject({ name: "escape", source: "kitty" })
+      }),
+    ),
+  )
+})
+
+test("captures image pixels and their terminal placement", async () => {
+  await Effect.runPromise(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const renderer = yield* SimulationRenderer.create({ width: 20, height: 10 })
+        const image = NativeImage.fromRgba(
+          Uint8Array.from([255, 0, 0, 255, 0, 0, 255, 255]),
+          2,
+          1,
+        )
+        renderer.root.add(new ImageRenderable(renderer, {
+          source: image,
+          position: "absolute",
+          left: 2,
+          top: 1,
+          width: 2,
+          height: 1,
+          fit: "fill",
+        }))
+
+        const frame = yield* capture(createHarness(renderer))
+
+        expect(frame.images).toEqual([{
+          x: 2,
+          y: 1,
+          width: 2,
+          height: 1,
+          pixelWidth: 2,
+          pixelHeight: 1,
+          rgba: "/wAA/wAA//8=",
+        }])
+      }),
+    ),
+  )
+})
+
 test("clicks a target at relative coordinates through descendant text", async () => {
   await Effect.runPromise(
     Effect.scoped(
@@ -67,6 +134,47 @@ test("clicks a target at relative coordinates through descendant text", async ()
         renderer.root.remove(button)
         const error = yield* execute(harness, { type: "ui.click", target: button.num, x: 1, y: 0 }).pipe(Effect.flip)
         expect(error.message).toContain("click target is stale or unavailable")
+      }),
+    ),
+  )
+})
+
+test("mouse input drives native hover, drag, buttons and scrolling at absolute coordinates", async () => {
+  await Effect.runPromise(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const renderer = yield* SimulationRenderer.create({})
+        const events: Array<{ type: string; x: number; y: number; button: number }> = []
+        const button = new BoxRenderable(renderer, {
+          position: "absolute",
+          left: 10,
+          top: 5,
+          width: 15,
+          height: 3,
+          onMouse: (event) => events.push({ type: event.type, x: event.x, y: event.y, button: event.button }),
+        })
+        renderer.root.add(button)
+        const harness = createHarness(renderer)
+        yield* Effect.promise(() => harness.renderOnce())
+        yield* execute(harness, { type: "ui.mouse", params: { action: "move", x: 11, y: 6 } })
+        yield* execute(harness, { type: "ui.mouse", params: { action: "move", x: 12, y: 6 } })
+        expect(events.map((event) => event.type)).toContain("over")
+        expect(events).toContainEqual(expect.objectContaining({ type: "move", x: 12, y: 6 }))
+        yield* execute(harness, { type: "ui.mouse", params: { action: "down", x: 12, y: 6, button: "right" } })
+        yield* execute(harness, { type: "ui.mouse", params: { action: "move", x: 13, y: 6 } })
+        yield* execute(harness, { type: "ui.mouse", params: { action: "up", x: 13, y: 6, button: "right" } })
+        expect(events).toContainEqual(expect.objectContaining({ type: "down", button: 2 }))
+        expect(events).toContainEqual(expect.objectContaining({ type: "drag", x: 13, y: 6 }))
+        expect(events).toContainEqual(expect.objectContaining({ type: "up", x: 13, y: 6, button: 2 }))
+        expect(harness.mockMouse.getPressedButtons()).toEqual([])
+        yield* execute(harness, { type: "ui.mouse", params: { action: "scroll", x: 12, y: 6, direction: "down" } })
+        expect(events.map((event) => event.type)).toContain("scroll")
+        yield* execute(harness, { type: "ui.mouse", params: { action: "move", x: 1, y: 1 } })
+        expect(events.map((event) => event.type)).toContain("out")
+        const error = yield* execute(harness, { type: "ui.mouse", params: { action: "move", x: 100, y: 40 } }).pipe(
+          Effect.flip,
+        )
+        expect(error.message).toContain("within the terminal viewport")
       }),
     ),
   )

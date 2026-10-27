@@ -1,8 +1,8 @@
-import type { ModelApi, ProviderApi } from "./api/api.js"
+import type { WebsearchApi } from "./api/api.js"
+
+export type { RpcApi, RpcClient } from "./rpc.js"
+export type { SelectedEvent } from "../shared-events.js"
 
 export type * from "./api/api.js"
 
-export interface CatalogApi<E = never> {
-  readonly provider: ProviderApi<E>
-  readonly model: ModelApi<E>
-}
+export type WebSearchApi<E = never> = WebsearchApi<E>

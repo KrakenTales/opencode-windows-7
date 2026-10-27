@@ -1,8 +1,21 @@
 import { Schema } from "effect"
-import { ContentBlockID, FinishReason, ProtocolID, ProviderMetadata, RouteID, ToolCallID } from "./ids"
-import { ModelSchema } from "./options"
-import { Message, ToolCallPart, ToolOutput, ToolResultPart, ToolResultValue, type ContentPart } from "./messages"
-import { ProviderFailureClassification } from "./errors"
+import { LLM } from "@opencode/schema/llm"
+import { ContentBlockID, ToolCallID } from "./ids.js"
+import {
+  Message,
+  CompactionPart,
+  ToolCallPart,
+  ToolOutput,
+  ToolResultPart,
+  ToolResultValue,
+  type ContentPart,
+} from "./messages.js"
+import { ProviderMetadata } from "./options.js"
+import { ProviderFailureClassification } from "./errors.js"
+import { Media } from "../media.js"
+
+export const FinishReason = LLM.FinishReason
+export type FinishReason = Schema.Schema.Type<typeof FinishReason>
 
 /**
  * Token usage reported by an LLM provider.
@@ -34,21 +47,24 @@ import { ProviderFailureClassification } from "./errors"
  *
  * **Semantics by provider**:
  *
- * - OpenAI Chat / Responses / Gemini / Bedrock: provider reports inclusive
+ * - OpenAI Chat / Responses / Gemini: provider reports inclusive
  *   `inputTokens` and an inclusive `outputTokens`; mapper subtracts to
  *   derive the breakdown.
- * - Anthropic: provider reports the breakdown natively (`input_tokens` is
- *   non-cached only); mapper sums to derive the inclusive `inputTokens`.
- *   Anthropic does *not* break extended-thinking out of `output_tokens`, so
- *   `reasoningTokens` is `undefined` and `outputTokens` carries the
- *   combined total — a documented limitation of the Anthropic API.
+ * - Anthropic and Bedrock report the input breakdown natively: Anthropic's
+ *   `input_tokens` and Bedrock's `inputTokens` are non-cached only. Their
+ *   mappers sum the breakdown to derive the inclusive `inputTokens`.
+ *   Anthropic's `outputTokens` includes extended thinking. Newer responses
+ *   expose that subset as `output_tokens_details.thinking_tokens`, which maps
+ *   to `reasoningTokens`; older responses leave it undefined.
  *
  * `providerMetadata` always carries the provider's raw usage payload —
  * keyed by provider name (`{ openai: ... }`, `{ anthropic: ... }`, etc.)
  * — for fields we don't normalize and for billing-level audit trails.
  * Matches the same escape-hatch field on `LLMEvent`.
  */
-export class Usage extends Schema.Class<Usage>("LLM.Usage")({
+export class Usage extends Schema.Class<Usage>("AI.Usage")({
+  /** Effective input size of the final message iteration, when reported; not billed totals. */
+  contextTokens: Schema.optional(Schema.Number),
   inputTokens: Schema.optional(Schema.Number),
   outputTokens: Schema.optional(Schema.Number),
   nonCachedInputTokens: Schema.optional(Schema.Number),
@@ -56,10 +72,16 @@ export class Usage extends Schema.Class<Usage>("LLM.Usage")({
   cacheWriteInputTokens: Schema.optional(Schema.Number),
   reasoningTokens: Schema.optional(Schema.Number),
   totalTokens: Schema.optional(Schema.Number),
+  /**
+   * USD the endpoint says it charged for this request, as OpenRouter, LiteLLM and OpenCode Zen report it in
+   * `usage.cost`. `0` is authoritative: the request was free or a subscription covered it. Absent, callers price the
+   * tokens themselves.
+   */
+  cost: Schema.optional(Schema.Number),
   providerMetadata: Schema.optional(ProviderMetadata),
 }) {
   /**
-   * Visible output tokens — `outputTokens` minus `reasoningTokens`, clamped
+   * Non-reasoning output tokens (including compaction summaries) — `outputTokens` minus `reasoningTokens`, clamped
    * to zero. The one place subtraction happens in this contract; the clamp
    * means a provider reporting `reasoningTokens > outputTokens` produces a
    * harmless zero rather than a negative that crashes downstream schemas.
@@ -74,6 +96,59 @@ export class Usage extends Schema.Class<Usage>("LLM.Usage")({
 }
 
 export type UsageInput = Usage | ConstructorParameters<typeof Usage>[0]
+
+/**
+ * Usage reported by media routes. Providers bill images, video, speech, and transcription in different units, so
+ * each response carries the unit it was actually metered in instead of forcing everything into tokens.
+ */
+export const MediaUsage = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("tokens"),
+    input: Schema.optional(Schema.Number),
+    output: Schema.optional(Schema.Number),
+    total: Schema.optional(Schema.Number),
+    details: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+  }),
+  Schema.Struct({ type: Schema.Literal("seconds"), seconds: Schema.Number }),
+  Schema.Struct({ type: Schema.Literal("characters"), characters: Schema.Number }),
+  Schema.Struct({ type: Schema.Literal("credits"), credits: Schema.Number }),
+  Schema.Struct({ type: Schema.Literal("compute"), seconds: Schema.Number }),
+])
+  .pipe(Schema.toTaggedUnion("type"))
+  .annotate({ identifier: "AI.MediaUsage" })
+export type MediaUsage = Schema.Schema.Type<typeof MediaUsage>
+
+/** Token usage from a provider's counts. A usage object without any count is no usage, so it returns undefined. */
+export const tokenUsage = (counts: {
+  readonly input?: number
+  readonly output?: number
+  readonly total?: number
+  readonly details?: Record<string, unknown>
+}): MediaUsage | undefined =>
+  counts.input === undefined && counts.output === undefined && counts.total === undefined
+    ? undefined
+    : { type: "tokens", ...counts }
+
+/** A replacement context window, not an assistant message to append to prior history. */
+export class CompactionResponse extends Schema.Class<CompactionResponse>("LLM.CompactionResponse")({
+  replacement: Schema.Array(Message),
+  usage: Schema.optional(Usage),
+}) {}
+
+/** A checkpoint only; retained history and replacement-window construction belong to the caller. */
+export class CompactionCheckpointResponse extends Schema.Class<CompactionCheckpointResponse>(
+  "LLM.CompactionCheckpointResponse",
+)({
+  checkpoint: CompactionPart.pipe(
+    Schema.refine(
+      (part): part is CompactionPart & { readonly encrypted: string; readonly text?: never } =>
+        part.encrypted !== undefined && part.encrypted.length > 0,
+      { message: "A checkpoint response requires encrypted compaction content" },
+    ),
+  ),
+  responseID: Schema.String.check(Schema.isPattern(/\S/)),
+  usage: Schema.optional(Usage),
+}) {}
 
 export const StepStart = Schema.Struct({
   type: Schema.tag("step-start"),
@@ -99,6 +174,8 @@ export type TextDelta = Schema.Schema.Type<typeof TextDelta>
 export const TextEnd = Schema.Struct({
   type: Schema.tag("text-end"),
   id: ContentBlockID,
+  /** Authoritative complete value; replaces accumulated deltas when present. */
+  text: Schema.optional(Schema.String),
   providerMetadata: Schema.optional(ProviderMetadata),
 }).annotate({ identifier: "LLM.Event.TextEnd" })
 export type TextEnd = Schema.Schema.Type<typeof TextEnd>
@@ -121,6 +198,8 @@ export type ReasoningDelta = Schema.Schema.Type<typeof ReasoningDelta>
 export const ReasoningEnd = Schema.Struct({
   type: Schema.tag("reasoning-end"),
   id: ContentBlockID,
+  /** Authoritative complete value; replaces accumulated deltas when present. */
+  text: Schema.optional(Schema.String),
   providerMetadata: Schema.optional(ProviderMetadata),
 }).annotate({ identifier: "LLM.Event.ReasoningEnd" })
 export type ReasoningEnd = Schema.Schema.Type<typeof ReasoningEnd>
@@ -129,6 +208,7 @@ export const ToolInputStart = Schema.Struct({
   type: Schema.tag("tool-input-start"),
   id: ToolCallID,
   name: Schema.String,
+  namespace: Schema.optional(Schema.String),
   providerExecuted: Schema.optional(Schema.Boolean),
   providerMetadata: Schema.optional(ProviderMetadata),
 }).annotate({ identifier: "LLM.Event.ToolInputStart" })
@@ -138,7 +218,10 @@ export const ToolInputDelta = Schema.Struct({
   type: Schema.tag("tool-input-delta"),
   id: ToolCallID,
   name: Schema.String,
+  namespace: Schema.optional(Schema.String),
   text: Schema.String,
+  /** Best-effort parse of all input fragments received through this delta. */
+  input: Schema.optional(Schema.Unknown),
 }).annotate({ identifier: "LLM.Event.ToolInputDelta" })
 export type ToolInputDelta = Schema.Schema.Type<typeof ToolInputDelta>
 
@@ -146,6 +229,7 @@ export const ToolInputEnd = Schema.Struct({
   type: Schema.tag("tool-input-end"),
   id: ToolCallID,
   name: Schema.String,
+  namespace: Schema.optional(Schema.String),
   providerMetadata: Schema.optional(ProviderMetadata),
 }).annotate({ identifier: "LLM.Event.ToolInputEnd" })
 export type ToolInputEnd = Schema.Schema.Type<typeof ToolInputEnd>
@@ -155,6 +239,7 @@ export const ToolInputError = Schema.Struct({
   type: Schema.tag("tool-input-error"),
   id: ToolCallID,
   name: Schema.String,
+  namespace: Schema.optional(Schema.String),
   raw: Schema.String,
 }).annotate({ identifier: "LLM.Event.ToolInputError" })
 export type ToolInputError = Schema.Schema.Type<typeof ToolInputError>
@@ -163,6 +248,7 @@ export const ToolCall = Schema.Struct({
   type: Schema.tag("tool-call"),
   id: ToolCallID,
   name: Schema.String,
+  namespace: Schema.optional(Schema.String),
   input: Schema.Unknown,
   providerExecuted: Schema.optional(Schema.Boolean),
   providerMetadata: Schema.optional(ProviderMetadata),
@@ -173,6 +259,7 @@ export const ToolResult = Schema.Struct({
   type: Schema.tag("tool-result"),
   id: ToolCallID,
   name: Schema.String,
+  namespace: Schema.optional(Schema.String),
   result: ToolResultValue,
   output: Schema.optional(ToolOutput),
   providerExecuted: Schema.optional(Schema.Boolean),
@@ -184,16 +271,27 @@ export const ToolError = Schema.Struct({
   type: Schema.tag("tool-error"),
   id: ToolCallID,
   name: Schema.String,
+  namespace: Schema.optional(Schema.String),
   message: Schema.String,
   error: Schema.optional(Schema.Defect()),
   providerMetadata: Schema.optional(ProviderMetadata),
 }).annotate({ identifier: "LLM.Event.ToolError" })
 export type ToolError = Schema.Schema.Type<typeof ToolError>
 
+export const FinishReasonDetails = Schema.Struct({
+  normalized: FinishReason,
+  raw: Schema.optional(Schema.String),
+  /** The provider's policy area for a content-filter finish, such as `cyber`. */
+  category: Schema.optional(Schema.String),
+  /** The provider's human-readable reason for a content-filter finish. */
+  explanation: Schema.optional(Schema.String),
+}).annotate({ identifier: "LLM.FinishReasonDetails" })
+export type FinishReasonDetails = Schema.Schema.Type<typeof FinishReasonDetails>
+
 export const StepFinish = Schema.Struct({
   type: Schema.tag("step-finish"),
   index: Schema.Number,
-  reason: FinishReason,
+  reason: FinishReasonDetails,
   usage: Schema.optional(Usage),
   providerMetadata: Schema.optional(ProviderMetadata),
 }).annotate({ identifier: "LLM.Event.StepFinish" })
@@ -201,11 +299,19 @@ export type StepFinish = Schema.Schema.Type<typeof StepFinish>
 
 export const Finish = Schema.Struct({
   type: Schema.tag("finish"),
-  reason: FinishReason,
+  reason: FinishReasonDetails,
   usage: Schema.optional(Usage),
   providerMetadata: Schema.optional(ProviderMetadata),
 }).annotate({ identifier: "LLM.Event.Finish" })
 export type Finish = Schema.Schema.Type<typeof Finish>
+
+/** A generated media asset (image, audio, …) emitted by the model as first-class output rather than a tool result. */
+export const MediaEvent = Schema.Struct({
+  type: Schema.tag("media"),
+  media: Media.AssetSchema,
+  providerMetadata: Schema.optional(ProviderMetadata),
+}).annotate({ identifier: "LLM.Event.Media" })
+export type MediaEvent = Schema.Schema.Type<typeof MediaEvent>
 
 export const ProviderErrorEvent = Schema.Struct({
   type: Schema.tag("provider-error"),
@@ -215,7 +321,15 @@ export const ProviderErrorEvent = Schema.Struct({
 }).annotate({ identifier: "LLM.Event.ProviderError" })
 export type ProviderErrorEvent = Schema.Schema.Type<typeof ProviderErrorEvent>
 
+/** One provider frame as received, emitted before the events parsed from it when the request sets `includeRaw`. */
+export const RawEvent = Schema.Struct({
+  type: Schema.tag("raw"),
+  data: Schema.Unknown,
+}).annotate({ identifier: "LLM.Event.Raw" })
+export type RawEvent = Schema.Schema.Type<typeof RawEvent>
+
 const llmEventTagged = Schema.Union([
+  CompactionPart,
   StepStart,
   TextStart,
   TextDelta,
@@ -230,9 +344,11 @@ const llmEventTagged = Schema.Union([
   ToolCall,
   ToolResult,
   ToolError,
+  MediaEvent,
   StepFinish,
   Finish,
   ProviderErrorEvent,
+  RawEvent,
 ]).pipe(Schema.toTaggedUnion("type"))
 
 type WithID<Event extends { readonly id: unknown }, ID> = Omit<Event, "type" | "id"> & { readonly id: ID | string }
@@ -249,6 +365,7 @@ const toolCallID = (value: ToolCallID | string) => ToolCallID.make(value)
  * `events.filter(LLMEvent.guards["tool-call"])`.
  */
 export const LLMEvent = Object.assign(llmEventTagged, {
+  compaction: CompactionPart.make,
   stepStart: StepStart.make,
   textStart: (input: WithID<TextStart, ContentBlockID>) => TextStart.make({ ...input, id: contentBlockID(input.id) }),
   textDelta: (input: WithID<TextDelta, ContentBlockID>) => TextDelta.make({ ...input, id: contentBlockID(input.id) }),
@@ -274,6 +391,7 @@ export const LLMEvent = Object.assign(llmEventTagged, {
       output: input.output === undefined ? undefined : ToolOutput.make(input.output.structured, input.output.content),
     }),
   toolError: (input: WithID<ToolError, ToolCallID>) => ToolError.make({ ...input, id: toolCallID(input.id) }),
+  media: MediaEvent.make,
   stepFinish: (input: WithUsage<StepFinish>) =>
     StepFinish.make({
       ...input,
@@ -285,7 +403,9 @@ export const LLMEvent = Object.assign(llmEventTagged, {
       usage: input.usage === undefined ? undefined : Usage.from(input.usage),
     }),
   providerError: ProviderErrorEvent.make,
+  raw: RawEvent.make,
   is: {
+    compaction: llmEventTagged.guards.compaction,
     stepStart: llmEventTagged.guards["step-start"],
     textStart: llmEventTagged.guards["text-start"],
     textDelta: llmEventTagged.guards["text-delta"],
@@ -300,47 +420,41 @@ export const LLMEvent = Object.assign(llmEventTagged, {
     toolCall: llmEventTagged.guards["tool-call"],
     toolResult: llmEventTagged.guards["tool-result"],
     toolError: llmEventTagged.guards["tool-error"],
+    media: llmEventTagged.guards.media,
     stepFinish: llmEventTagged.guards["step-finish"],
     finish: llmEventTagged.guards.finish,
     providerError: llmEventTagged.guards["provider-error"],
+    raw: llmEventTagged.guards.raw,
   },
 })
 export type LLMEvent = Schema.Schema.Type<typeof llmEventTagged>
 
-export class PreparedRequest extends Schema.Class<PreparedRequest>("LLM.PreparedRequest")({
-  id: Schema.String,
-  route: RouteID,
-  protocol: ProtocolID,
-  model: ModelSchema,
-  body: Schema.Unknown,
-  metadata: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
-}) {}
-
-/**
- * A `PreparedRequest` whose `body` is typed as `Body`. Use with the generic
- * on `LLMClient.prepare<Body>(...)` when the caller knows which route their
- * request will resolve to and wants its native shape statically exposed
- * (debug UIs, request previews, plan rendering).
- *
- * The runtime body is identical — the route still emits `body: unknown` — so
- * this is a type-level assertion the caller makes about what they expect to
- * find. The prepare runtime does not validate the assertion.
- */
-export type PreparedRequestOf<Body> = Omit<PreparedRequest, "body"> & {
-  readonly body: Body
+/** Joins deltas per fragment, letting an authoritative end value replace that fragment's accumulated deltas. */
+const joinFragments = (
+  events: ReadonlyArray<LLMEvent>,
+  isDelta: (event: LLMEvent) => event is LLMEvent & { id: string; text: string },
+  isEnd: (event: LLMEvent) => event is LLMEvent & { id: string; text?: string },
+) => {
+  const order: string[] = []
+  const parts = new Map<string, string>()
+  for (const event of events) {
+    if (isDelta(event)) {
+      if (!parts.has(event.id)) order.push(event.id)
+      parts.set(event.id, (parts.get(event.id) ?? "") + event.text)
+    }
+    if (isEnd(event) && event.text !== undefined) {
+      if (!parts.has(event.id)) order.push(event.id)
+      parts.set(event.id, event.text)
+    }
+  }
+  return order.map((id) => parts.get(id)).join("")
 }
 
 const responseText = (events: ReadonlyArray<LLMEvent>) =>
-  events
-    .filter(LLMEvent.is.textDelta)
-    .map((event) => event.text)
-    .join("")
+  joinFragments(events, LLMEvent.is.textDelta, LLMEvent.is.textEnd)
 
 const responseReasoning = (events: ReadonlyArray<LLMEvent>) =>
-  events
-    .filter(LLMEvent.is.reasoningDelta)
-    .map((event) => event.text)
-    .join("")
+  joinFragments(events, LLMEvent.is.reasoningDelta, LLMEvent.is.reasoningEnd)
 
 const responseUsage = (events: ReadonlyArray<LLMEvent>) =>
   events.reduce<Usage | undefined>(
@@ -356,6 +470,7 @@ interface ContentAssembly {
 
 interface ToolInputAssembly {
   readonly name: string
+  readonly namespace?: string
   readonly text: string
   readonly providerMetadata?: ProviderMetadata
 }
@@ -364,7 +479,7 @@ interface ResponseState {
   readonly events: ReadonlyArray<LLMEvent>
   readonly message: Message
   readonly usage?: Usage
-  readonly finishReason?: FinishReason
+  readonly finishReason?: FinishReasonDetails
   readonly textParts: Readonly<Record<string, ContentAssembly>>
   readonly reasoningParts: Readonly<Record<string, ContentAssembly>>
   readonly toolInputs: Readonly<Record<string, ToolInputAssembly>>
@@ -392,7 +507,7 @@ const appendEvent = (state: ResponseState, event: LLMEvent): ResponseState => {
     return {
       ...state,
       events,
-      finishReason: state.finishReason ?? "error",
+      finishReason: state.finishReason ?? { normalized: "error" },
     }
   }
   return {
@@ -447,10 +562,11 @@ const reduceTextDelta = (state: ResponseState, event: TextDelta): ResponseState 
 const reduceTextEnd = (state: ResponseState, event: TextEnd): ResponseState => {
   const current = state.textParts[event.id]
   if (!current) return state
+  const text = event.text ?? current.text
   const providerMetadata = event.providerMetadata ?? current.providerMetadata
   return {
-    ...replaceContent(state, current.contentIndex, textContent(current.text, providerMetadata)),
-    textParts: { ...state.textParts, [event.id]: { ...current, providerMetadata } },
+    ...replaceContent(state, current.contentIndex, textContent(text, providerMetadata)),
+    textParts: { ...state.textParts, [event.id]: { ...current, text, providerMetadata } },
   }
 }
 
@@ -480,10 +596,11 @@ const reduceReasoningDelta = (state: ResponseState, event: ReasoningDelta): Resp
 const reduceReasoningEnd = (state: ResponseState, event: ReasoningEnd): ResponseState => {
   const current = state.reasoningParts[event.id]
   if (!current) return state
+  const text = event.text ?? current.text
   const providerMetadata = event.providerMetadata ?? current.providerMetadata
   return {
-    ...replaceContent(state, current.contentIndex, reasoningContent(current.text, providerMetadata)),
-    reasoningParts: { ...state.reasoningParts, [event.id]: { ...current, providerMetadata } },
+    ...replaceContent(state, current.contentIndex, reasoningContent(text, providerMetadata)),
+    reasoningParts: { ...state.reasoningParts, [event.id]: { ...current, text, providerMetadata } },
   }
 }
 
@@ -491,12 +608,17 @@ const reduceToolInputStart = (state: ResponseState, event: ToolInputStart): Resp
   ...state,
   toolInputs: {
     ...state.toolInputs,
-    [event.id]: { name: event.name, text: "", providerMetadata: event.providerMetadata },
+    [event.id]: {
+      name: event.name,
+      namespace: event.namespace,
+      text: "",
+      providerMetadata: event.providerMetadata,
+    },
   },
 })
 
 const reduceToolInputDelta = (state: ResponseState, event: ToolInputDelta): ResponseState => {
-  const current = state.toolInputs[event.id] ?? { name: event.name, text: "" }
+  const current = state.toolInputs[event.id] ?? { name: event.name, namespace: event.namespace, text: "" }
   return {
     ...state,
     toolInputs: { ...state.toolInputs, [event.id]: { ...current, text: current.text + event.text } },
@@ -504,7 +626,7 @@ const reduceToolInputDelta = (state: ResponseState, event: ToolInputDelta): Resp
 }
 
 const reduceToolInputEnd = (state: ResponseState, event: ToolInputEnd): ResponseState => {
-  const current = state.toolInputs[event.id] ?? { name: event.name, text: "" }
+  const current = state.toolInputs[event.id] ?? { name: event.name, namespace: event.namespace, text: "" }
   return {
     ...state,
     toolInputs: {
@@ -512,6 +634,7 @@ const reduceToolInputEnd = (state: ResponseState, event: ToolInputEnd): Response
       [event.id]: {
         ...current,
         name: event.name,
+        namespace: event.namespace,
         providerMetadata: event.providerMetadata ?? current.providerMetadata,
       },
     },
@@ -522,6 +645,7 @@ const toolCallContent = (event: ToolCall): ContentPart =>
   ToolCallPart.make({
     id: event.id,
     name: event.name,
+    namespace: event.namespace,
     input: event.input,
     ...(event.providerExecuted === undefined ? {} : { providerExecuted: event.providerExecuted }),
     ...(event.providerMetadata === undefined ? {} : { providerMetadata: event.providerMetadata }),
@@ -531,6 +655,7 @@ const toolResultContent = (event: ToolResult): ContentPart =>
   ToolResultPart.make({
     id: event.id,
     name: event.name,
+    namespace: event.namespace,
     result: event.result,
     ...(event.providerExecuted === undefined ? {} : { providerExecuted: event.providerExecuted }),
     ...(event.providerMetadata === undefined ? {} : { providerMetadata: event.providerMetadata }),
@@ -542,8 +667,11 @@ const reduceToolCall = (state: ResponseState, event: ToolCall): ResponseState =>
 }
 
 const reduceResponseState = (state: ResponseState, event: LLMEvent): ResponseState => {
+  if (event.type === "raw") return state
   const next = appendEvent(state, event)
   switch (event.type) {
+    case "compaction":
+      return appendContent(next, event)
     case "text-start":
       return ensureText(next, event.id, event.providerMetadata)
     case "text-delta":
@@ -570,6 +698,13 @@ const reduceResponseState = (state: ResponseState, event: LLMEvent): ResponseSta
       return reduceToolCall(next, event)
     case "tool-result":
       return appendContent(next, toolResultContent(event))
+    case "media":
+      return appendContent(
+        next,
+        event.providerMetadata === undefined
+          ? { type: "media", media: event.media }
+          : { type: "media", media: event.media, providerMetadata: event.providerMetadata },
+      )
     default:
       return next
   }
@@ -579,14 +714,14 @@ export class LLMResponse extends Schema.Class<LLMResponse>("LLM.Response")({
   message: Message,
   events: Schema.Array(LLMEvent),
   usage: Schema.optional(Usage),
-  finishReason: FinishReason,
+  finishReason: FinishReasonDetails,
 }) {
-  /** Concatenated assistant text assembled from streamed `text-delta` events. */
+  /** Concatenated assistant text; each fragment's `text-end` value replaces its accumulated deltas when present. */
   get text() {
     return responseText(this.events)
   }
 
-  /** Concatenated reasoning text assembled from streamed `reasoning-delta` events. */
+  /** Concatenated reasoning text; each fragment's `reasoning-end` value replaces its accumulated deltas when present. */
   get reasoning() {
     return responseReasoning(this.events)
   }

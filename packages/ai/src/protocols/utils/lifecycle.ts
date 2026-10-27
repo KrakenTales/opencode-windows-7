@@ -1,4 +1,4 @@
-import { LLMEvent, type FinishReason, type ProviderMetadata, type Usage } from "../../schema"
+import { LLMEvent, type FinishReasonDetails, type ProviderMetadata, type Usage } from "../../schema/index.js"
 
 export interface State {
   readonly stepStarted: boolean
@@ -14,14 +14,23 @@ export const stepStart = (state: State, events: LLMEvent[]): State => {
   return { ...state, stepStarted: true }
 }
 
-export const textDelta = (state: State, events: LLMEvent[], id: string, text: string): State => {
+export const textStart = (state: State, events: LLMEvent[], id: string, providerMetadata?: ProviderMetadata): State => {
+  if (state.text.has(id)) return state
   const stepped = stepStart(state, events)
-  if (stepped.text.has(id)) {
-    events.push(LLMEvent.textDelta({ id, text }))
-    return stepped
-  }
-  events.push(LLMEvent.textStart({ id }), LLMEvent.textDelta({ id, text }))
+  events.push(LLMEvent.textStart({ id, providerMetadata }))
   return { ...stepped, text: new Set([...stepped.text, id]) }
+}
+
+export const textDelta = (
+  state: State,
+  events: LLMEvent[],
+  id: string,
+  text: string,
+  providerMetadata?: ProviderMetadata,
+): State => {
+  const started = textStart(state, events, id)
+  events.push(LLMEvent.textDelta({ id, text, providerMetadata }))
+  return started
 }
 
 export const reasoningStart = (
@@ -53,22 +62,31 @@ export const reasoningEnd = (
   events: LLMEvent[],
   id: string,
   providerMetadata?: ProviderMetadata,
+  /** Authoritative complete value; replaces accumulated deltas when present. */
+  text?: string,
 ): State => {
   if (!state.reasoning.has(id)) return state
   const stepped = stepStart(state, events)
-  events.push(LLMEvent.reasoningEnd({ id, providerMetadata }))
+  events.push(LLMEvent.reasoningEnd({ id, text, providerMetadata }))
   const reasoning = new Set(stepped.reasoning)
   reasoning.delete(id)
   return { ...stepped, reasoning }
 }
 
-export const textEnd = (state: State, events: LLMEvent[], id: string, providerMetadata?: ProviderMetadata): State => {
+export const textEnd = (
+  state: State,
+  events: LLMEvent[],
+  id: string,
+  providerMetadata?: ProviderMetadata,
+  /** Authoritative complete value; replaces accumulated deltas when present. */
+  text?: string,
+): State => {
   if (!state.text.has(id)) return state
   const stepped = stepStart(state, events)
-  events.push(LLMEvent.textEnd({ id, providerMetadata }))
-  const text = new Set(stepped.text)
-  text.delete(id)
-  return { ...stepped, text }
+  events.push(LLMEvent.textEnd({ id, text, providerMetadata }))
+  const open = new Set(stepped.text)
+  open.delete(id)
+  return { ...stepped, text: open }
 }
 
 const closeOpenBlocks = (state: State, events: LLMEvent[]): State => {
@@ -81,7 +99,7 @@ export const finish = (
   state: State,
   events: LLMEvent[],
   input: {
-    readonly reason: FinishReason
+    readonly reason: FinishReasonDetails
     readonly usage?: Usage
     readonly providerMetadata?: ProviderMetadata
   },
@@ -99,4 +117,4 @@ export const finish = (
   return { ...stepped, stepStarted: false }
 }
 
-export * as Lifecycle from "./lifecycle"
+export * as Lifecycle from "./lifecycle.js"

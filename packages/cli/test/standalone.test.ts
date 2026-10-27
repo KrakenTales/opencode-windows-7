@@ -1,16 +1,23 @@
 import { expect, test } from "bun:test"
 import path from "node:path"
+import { tmpdir } from "../../core/test/fixture/tmpdir"
+import { isolatedEnv } from "./fixture/environment"
 
 test("standalone server exits when its owner is killed", async () => {
+  // Windows can hold the server's files briefly after it exits; the fixture retries removal on EBUSY.
+  await using root = await tmpdir("opencode-cli-standalone-")
   const owner = Bun.spawn([process.execPath, path.join(import.meta.dir, "fixture/standalone-owner.ts")], {
     cwd: path.join(import.meta.dir, ".."),
-    env: { ...process.env, OPENCODE_SERVER_USERNAME: "custom" },
+    env: isolatedEnv(root.path, { OPENCODE_SERVER_USERNAME: "custom" }),
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
   })
-  const line = await Promise.race([readLine(owner.stdout), Bun.sleep(10_000).then(() => undefined)])
-  const [rawPID, url, status] = line?.split(" ") ?? []
+  const line = await Promise.race([
+    readLine(owner.stdout, "STANDALONE_READY "),
+    Bun.sleep(10_000).then(() => undefined),
+  ])
+  const [, rawPID, url, status] = line?.split(" ") ?? []
   const pid = Number(rawPID)
 
   try {
@@ -25,11 +32,12 @@ test("standalone server exits when its owner is killed", async () => {
     expect(await waitForExit(pid)).toBe(true)
   } finally {
     owner.kill("SIGKILL")
+    await owner.exited
     if (running(pid)) process.kill(pid, "SIGKILL")
   }
 })
 
-async function readLine(stream: ReadableStream<Uint8Array>) {
+async function readLine(stream: ReadableStream<Uint8Array>, prefix: string) {
   const reader = stream.getReader()
   const decoder = new TextDecoder()
   const chunks: string[] = []
@@ -38,14 +46,14 @@ async function readLine(stream: ReadableStream<Uint8Array>) {
     if (result.done) break
     chunks.push(decoder.decode(result.value, { stream: true }))
     const output = chunks.join("")
-    const newline = output.indexOf("\n")
-    if (newline !== -1) {
+    const line = output.split("\n").find((line) => line.startsWith(prefix))
+    if (line) {
       reader.releaseLock()
-      return output.slice(0, newline)
+      return line
     }
   }
   reader.releaseLock()
-  return chunks.join("") + decoder.decode()
+  return (chunks.join("") + decoder.decode()).split("\n").find((line) => line.startsWith(prefix))
 }
 
 async function waitForExit(pid: number, attempts = 100): Promise<boolean> {

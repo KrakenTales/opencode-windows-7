@@ -1,23 +1,82 @@
 import { describe, expect, test } from "bun:test"
-import { CacheHint, LLM, LLMResponse } from "../src"
-import * as OpenAIChat from "../src/protocols/openai-chat"
-import * as OpenAIResponses from "../src/protocols/openai-responses"
-import { LLMRequest, Message, Model, ToolCallPart, ToolChoice, ToolDefinition, ToolResultPart } from "../src/schema"
+import { Effect, Schema, Stream } from "effect"
+import { CacheHint, LLM, LLMEvent, LLMResponse, ToolEntry, ToolNamespace } from "../src/effect.js"
+import { OpenAI } from "../src/providers.js"
+import * as OpenAIChat from "../src/protocols/openai-chat.js"
+import * as OpenAIResponses from "../src/protocols/openai-responses.js"
+import {
+  GenerationOptions,
+  LLMRequest,
+  Message,
+  LanguageModel,
+  ToolCallPart,
+  ToolChoice,
+  ToolDefinition,
+  ToolResultPart,
+} from "../src/schema/index.js"
+import { fixedResponse } from "./lib/http.js"
+import { sseEvents } from "./lib/sse.js"
 
 const chatRoute = OpenAIChat.route
 const responsesRoute = OpenAIResponses.route
 
 describe("llm constructors", () => {
+  test("normalizes recursive tool namespaces", () => {
+    const request = LLM.request({
+      model: LanguageModel.make({ id: "fake-model", provider: "fake", route: responsesRoute }),
+      tools: [
+        {
+          type: "namespace",
+          name: "crm",
+          description: "Customer management",
+          tools: [
+            { name: "lookup", description: "Look up a customer", inputSchema: { type: "object" } },
+            {
+              type: "namespace",
+              name: "orders",
+              tools: [{ name: "list", description: "List orders", inputSchema: { type: "object" } }],
+            },
+          ],
+        },
+      ],
+    })
+
+    expect(request.tools[0]).toEqual({
+      type: "namespace",
+      name: "crm",
+      description: "Customer management",
+      tools: [
+        expect.objectContaining({ type: "tool", name: "lookup" }),
+        {
+          type: "namespace",
+          name: "orders",
+          description: undefined,
+          tools: [expect.objectContaining({ type: "tool", name: "list" })],
+        },
+      ],
+    })
+    expect(request.tools[0]).toEqual(
+      ToolNamespace.make({
+        name: "crm",
+        description: "Customer management",
+        tools: request.tools[0]!.type === "namespace" ? request.tools[0].tools : [],
+      }),
+    )
+    expect(Schema.decodeUnknownSync(ToolEntry)(Schema.encodeUnknownSync(ToolEntry)(request.tools[0]))).toEqual(
+      request.tools[0],
+    )
+  })
+
   test("builds canonical schema classes from ergonomic input", () => {
     const request = LLM.request({
       id: "req_1",
-      model: Model.make({ id: "fake-model", provider: "fake", route: chatRoute }),
+      model: LanguageModel.make({ id: "fake-model", provider: "fake", route: chatRoute }),
       system: "You are concise.",
       prompt: "Say hello.",
     })
 
     expect(request).toBeInstanceOf(LLMRequest)
-    expect(request.model).toBeInstanceOf(Model)
+    expect(request.model).toBeInstanceOf(LanguageModel)
     expect(request.messages[0]).toBeInstanceOf(Message)
     expect(request.system).toEqual([{ type: "text", text: "You are concise." }])
     expect(request.messages[0]?.content).toEqual([{ type: "text", text: "Say hello." }])
@@ -28,11 +87,11 @@ describe("llm constructors", () => {
   test("updates requests without spreading schema class instances", () => {
     const base = LLM.request({
       id: "req_1",
-      model: Model.make({ id: "fake-model", provider: "fake", route: chatRoute }),
+      model: LanguageModel.make({ id: "fake-model", provider: "fake", route: chatRoute }),
       prompt: "Say hello.",
     })
-    const updated = LLM.updateRequest(base, {
-      generation: { maxTokens: 20 },
+    const updated = LLMRequest.update(base, {
+      generation: GenerationOptions.make({ maxTokens: 20 }),
       messages: [...base.messages, Message.assistant("Hi.")],
     })
 
@@ -45,23 +104,23 @@ describe("llm constructors", () => {
 
   test("keeps request options separate from route defaults", () => {
     const request = LLM.request({
-      model: Model.make({
+      model: LanguageModel.make({
         id: "fake-model",
         provider: "fake",
         route: chatRoute.with({
           generation: { maxTokens: 100, temperature: 1 },
-          providerOptions: { openai: { store: false, metadata: { model: true } } },
+          providerOptions: { store: false, metadata: { model: true } },
           http: { body: { metadata: { model: true } }, headers: { "x-shared": "model" }, query: { model: "1" } },
         }),
       }),
       prompt: "Say hello.",
       generation: { temperature: 0 },
-      providerOptions: { openai: { store: true, metadata: { request: true } } },
+      providerOptions: { store: true, metadata: { request: true } },
       http: { body: { metadata: { request: true } }, headers: { "x-shared": "request" }, query: { request: "1" } },
     })
 
     expect(request.generation).toEqual({ temperature: 0 })
-    expect(request.providerOptions).toEqual({ openai: { store: true, metadata: { request: true } } })
+    expect(request.providerOptions).toEqual({ store: true, metadata: { request: true } })
     expect(request.http).toEqual({
       body: { metadata: { request: true } },
       headers: { "x-shared": "request" },
@@ -72,7 +131,7 @@ describe("llm constructors", () => {
   test("updates canonical requests from the request datatype", () => {
     const base = LLM.request({
       id: "req_1",
-      model: Model.make({ id: "fake-model", provider: "fake", route: chatRoute }),
+      model: LanguageModel.make({ id: "fake-model", provider: "fake", route: chatRoute }),
       prompt: "Say hello.",
     })
     const updated = LLMRequest.update(base, { messages: [...base.messages, Message.assistant("Hi.")] })
@@ -85,47 +144,45 @@ describe("llm constructors", () => {
   })
 
   test("updates canonical models from the model datatype", () => {
-    const base = Model.make({
+    const base = LanguageModel.make({
       id: "fake-model",
       provider: "fake",
       route: chatRoute,
     })
-    const updated = Model.update(base, {
+    const updated = LanguageModel.update(base, {
       route: responsesRoute,
       defaults: { generation: { maxTokens: 20 } },
-      compatibility: { toolSchema: "gemini" },
+      compatibility: { sanitizer: "gemini", requireFinishReason: false },
     })
-    const updatedInput = Model.input(updated)
+    const updatedInput = LanguageModel.input(updated)
 
-    expect(updated).toBeInstanceOf(Model)
+    expect(updated).toBeInstanceOf(LanguageModel)
     expect(String(updated.id)).toBe("fake-model")
     expect(updated.route).toBe(responsesRoute)
     expect(updated.defaults?.generation).toEqual({ maxTokens: 20 })
-    expect(updated.compatibility).toEqual({ toolSchema: "gemini" })
+    expect(updated.compatibility).toEqual({ sanitizer: "gemini", requireFinishReason: false })
     expect(updatedInput.defaults).toBe(updated.defaults)
     expect(updatedInput.compatibility).toBe(updated.compatibility)
     expect(String(updatedInput.provider)).toBe("fake")
-    expect(Model.update(updated, {})).toBe(updated)
+    expect(LanguageModel.update(updated, {})).toBe(updated)
   })
 
   test("carries model defaults and compatibility through route model selection", () => {
     const model = chatRoute.model({
       id: "kimi-k2",
       defaults: {
-        limits: { context: 128_000, output: 8_192 },
         generation: { maxTokens: 1_024, stop: ["END"] },
-        providerOptions: { openai: { parallelToolCalls: false } },
+        providerOptions: { parallelToolCalls: false },
         http: { body: { extra_body: true } },
       },
-      compatibility: { toolSchema: "moonshot" },
+      compatibility: { sanitizer: "moonshot" },
     })
     const request = LLM.request({ model, prompt: "Say hello." })
 
-    expect(request.model.defaults?.limits).toEqual({ context: 128_000, output: 8_192 })
     expect(request.model.defaults?.generation).toEqual({ maxTokens: 1_024, stop: ["END"] })
-    expect(request.model.defaults?.providerOptions).toEqual({ openai: { parallelToolCalls: false } })
+    expect(request.model.defaults?.providerOptions).toEqual({ parallelToolCalls: false })
     expect(request.model.defaults?.http).toEqual({ body: { extra_body: true } })
-    expect(request.model.compatibility).toEqual({ toolSchema: "moonshot" })
+    expect(request.model.compatibility).toEqual({ sanitizer: "moonshot" })
     expect(request.generation).toBeUndefined()
     expect(request.providerOptions).toBeUndefined()
     expect(request.http).toBeUndefined()
@@ -146,7 +203,7 @@ describe("llm constructors", () => {
     expect(ToolChoice.make("required")).toEqual(new ToolChoice({ type: "required" }))
     expect(
       LLM.request({
-        model: Model.make({
+        model: LanguageModel.make({
           id: "fake-model",
           provider: "fake",
           route: chatRoute,
@@ -172,7 +229,7 @@ describe("llm constructors", () => {
       { type: "text", text: "Use parameterized SQL.", cache: new CacheHint({ type: "ephemeral" }) },
     ])
     const request = LLM.request({
-      model: Model.make({ id: "fake-model", provider: "fake", route: chatRoute }),
+      model: LanguageModel.make({ id: "fake-model", provider: "fake", route: chatRoute }),
       system: "Initial operator prompt.",
       messages: [Message.user("Review this."), update],
     })
@@ -186,12 +243,32 @@ describe("llm constructors", () => {
     expect(request.messages.map((message) => message.role)).toEqual(["user", "system"])
   })
 
+  test("generates and streams from input or a prebuilt request", async () => {
+    const model = OpenAI.configure({ apiKey: "test", baseURL: "https://openai.test/v1" }).chat("gpt-4o-mini")
+    const layer = fixedResponse(
+      sseEvents({ choices: [{ delta: { content: "Hello" } }] }, { choices: [{ delta: {}, finish_reason: "stop" }] }),
+    )
+    const input = { model, prompt: "Say hello." }
+    const request = LLM.request(input)
+    const generated = await Effect.runPromise(LLM.generate(input).pipe(Effect.provide(layer)))
+    const generatedFromRequest = await Effect.runPromise(LLM.generate(request).pipe(Effect.provide(layer)))
+    expect(generated.text).toBe("Hello")
+    expect(generatedFromRequest.text).toBe(generated.text)
+
+    const streamed = await Effect.runPromise(LLM.stream(input).pipe(Stream.runCollect, Effect.provide(layer)))
+    const streamedFromRequest = await Effect.runPromise(
+      LLM.stream(request).pipe(Stream.runCollect, Effect.provide(layer)),
+    )
+    expect(Array.from(streamed).some(LLMEvent.is.textDelta)).toBe(true)
+    expect(streamedFromRequest).toEqual(streamed)
+  })
+
   test("extracts output text from response events", () => {
     expect(
       LLMResponse.text({
         events: [
           { type: "text-delta", id: "text-0", text: "hi" },
-          { type: "finish", reason: "stop" },
+          { type: "finish", reason: { normalized: "stop" } },
         ],
       }),
     ).toBe("hi")

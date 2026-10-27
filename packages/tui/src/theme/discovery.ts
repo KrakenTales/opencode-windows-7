@@ -1,21 +1,12 @@
 import { readdir, readFile } from "node:fs/promises"
 import path from "node:path"
 
-export function themeDirectories(config: string, cwd: string) {
-  const directories: string[] = []
-  for (let current = cwd; ; current = path.dirname(current)) {
-    directories.push(path.join(current, ".opencode"))
-    if (path.dirname(current) === current) break
-  }
-  return [config, ...directories.reverse()]
-}
-
 export async function discoverThemes(directories: string[]) {
   const result: Record<string, unknown> = {}
   for (const directory of directories) {
     const themeDirectory = path.join(directory, "themes")
     const entries = await readdir(themeDirectory, { withFileTypes: true }).catch((error: unknown) => {
-      if (error && typeof error === "object" && Reflect.get(error, "code") === "ENOENT") return []
+      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return []
       return Promise.reject(error)
     })
     const files = entries

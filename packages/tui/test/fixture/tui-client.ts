@@ -1,4 +1,4 @@
-import { OpenCode, type OpenCodeEvent } from "@opencode-ai/client"
+import { OpenCode, type OpenCodeEvent } from "@opencode/client"
 
 export const worktree = "/tmp/opencode"
 export const directory = `${worktree}/packages/tui`
@@ -93,41 +93,85 @@ export function createFetch(override?: FetchHandler, events?: ReturnType<typeof 
     if (url.pathname === "/experimental/console") return json({ consoleManagedProviders: [], switchableOrgCount: 0 })
     if (url.pathname === "/experimental/capabilities") return json({ backgroundSubagents: true })
     if (url.pathname === "/path") return json({ home: "", state: "", config: "", worktree, directory })
-    if (url.pathname === "/api/location") return json({ directory, project: { id: "proj_test", directory: worktree } })
+    if (url.pathname === "/api/info")
+      return json({ version: "test", pid: 0, urls: [], paths: { tmp: "/tmp" }, capabilities: { persistentPty: true } })
+    if (url.pathname === "/api/location")
+      return json({ directory, project: { id: "proj_test", directory: worktree, canonical: worktree } })
+    if (url.pathname === "/api/plugin")
+      return json({
+        location: { directory, project: { id: "proj_test", directory: worktree, canonical: worktree } },
+        data: [],
+      })
+    if (url.pathname === "/api/vcs")
+      return json({
+        location: { directory, project: { id: "proj_test", directory: worktree, canonical: worktree } },
+        data: { branch: { current: "main", default: "main" } },
+      })
     if (url.pathname === "/api/fs/list")
-      return json({ location: { directory, project: { id: "proj_test", directory: worktree } }, data: [] })
-    if (url.pathname === "/api/project/current") return json({ id: "proj_test", directory: worktree })
-    if (url.pathname === "/api/project/proj_test/directories") return json([{ directory: worktree }])
+      return json({
+        location: { directory, project: { id: "proj_test", directory: worktree, canonical: worktree } },
+        data: [],
+      })
+    if (url.pathname === "/api/project") return json([])
+    if (url.pathname === "/api/worktree") {
+      if (request.method === "GET") return json([{ directory: worktree }])
+      if (request.method === "POST") return json({ directory: `${worktree}/created` })
+      return new Response(null, { status: 204 })
+    }
+    if (url.pathname === "/api/worktree/refresh") return new Response(null, { status: 204 })
     if (url.pathname === "/api/shell")
-      return json({ location: { directory, project: { id: "proj_test", directory: worktree } }, data: [] })
+      return json({
+        location: { directory, project: { id: "proj_test", directory: worktree, canonical: worktree } },
+        data: [],
+      })
     if (url.pathname === "/api/mcp")
-      return json({ location: { directory, project: { id: "proj_test", directory: worktree } }, data: [] })
+      return json({
+        location: { directory, project: { id: "proj_test", directory: worktree, canonical: worktree } },
+        data: [],
+      })
     if (url.pathname === "/api/mcp/resource")
       return json({
-        location: { directory, project: { id: "proj_test", directory: worktree } },
+        location: { directory, project: { id: "proj_test", directory: worktree, canonical: worktree } },
         data: { resources: [], templates: [] },
       })
     if (url.pathname === "/api/session") return json({ data: [], cursor: {} })
+    if (url.pathname === "/api/config") return json([])
     if (url.pathname === "/api/session/active") return json({ data: {} })
+    if (request.method === "POST" && /^\/api\/session\/[^/]+\/model$/.test(url.pathname))
+      return new Response(null, { status: 204 })
     if (url.pathname === "/api/permission/request")
+      return json({
+        location: { directory, project: { id: "proj_test", directory: worktree, canonical: worktree } },
+        data: [],
+      })
+    if (url.pathname === "/api/form")
       return json({ location: { directory, project: { id: "proj_test", directory: worktree } }, data: [] })
-    if (url.pathname === "/api/form/request")
-      return json({ location: { directory, project: { id: "proj_test", directory: worktree } }, data: [] })
+    if (/^\/api\/session\/[^/]+\/permission$/.test(url.pathname)) return json({ data: [] })
     if (/^\/api\/session\/[^/]+\/form$/.test(url.pathname)) return json({ data: [] })
+    if (/^\/api\/experimental\/session\/[^/]+\/terminal$/.test(url.pathname)) return json({ data: [] })
     if (
       ["/api/agent", "/api/model", "/api/provider", "/api/integration", "/api/command", "/api/skill"].includes(
         url.pathname,
       )
     )
       return json({
-        location: { directory, project: { id: "proj_test", directory: worktree } },
+        location: { directory, project: { id: "proj_test", directory: worktree, canonical: worktree } },
         data: [],
       })
     if (url.pathname === "/api/reference")
-      return json({ location: { directory, project: { id: "proj_test", directory } }, data: [] })
+      return json({ location: { directory, project: { id: "proj_test", directory, canonical: directory } }, data: [] })
+    if (url.pathname === "/api/experimental/usage/limits")
+      return json({
+        location: { directory, project: { id: "proj_test", directory, canonical: directory } },
+        data: null,
+      })
+    if (url.pathname === "/api/websearch/provider") {
+      return json({ location: { directory, project: { id: "proj_test", directory, canonical: directory } }, data: [] })
+    }
     if (url.pathname === "/provider") return json({ all: [], default: {}, connected: [] })
     if (url.pathname === "/session") return json([])
     if (url.pathname === "/vcs") return json({ branch: "main" })
+    if (url.pathname === "/api/experimental/migration/v1") return json({ status: "completed" })
     throw new Error(`unexpected request: ${url.pathname}`)
   }
   fetch.preconnect = () => {}

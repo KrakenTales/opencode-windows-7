@@ -1,7 +1,7 @@
 // Current-native subagent (child Session) tracking for the mini transport.
 //
 // Discovers child Sessions of the active parent from four current sources:
-//   1. projected subagent tool output (`structured.sessionID`) during hydration
+//   1. projected subagent tool output (`metadata.sessionID`) during hydration
 //   2. the current session list filtered by `parentID` during hydration
 //   3. the process-local active-session map during hydration
 //   4. live events from unknown sessions whose `parentID` matches the parent
@@ -18,12 +18,14 @@
 import type {
   EventSubscribeOutput,
   OpenCodeClient,
-  PermissionV2Request,
+  PermissionRequest,
   SessionMessageAssistantTool,
   SessionMessageInfo,
-} from "@opencode-ai/client/promise"
+  SessionMessageUser,
+} from "@opencode/client/promise"
 import { Locale } from "../util/locale"
 import { createFragmentReconciler, fragmentRef, type FragmentReconciler } from "./stream-v2.fragment"
+import { toolImageCommits, userImageCommits } from "./stream-v2.image"
 import type {
   FooterSubagentDetail,
   FooterSubagentState,
@@ -33,6 +35,8 @@ import type {
   StreamCommit,
 } from "./types"
 import { canonicalToolName, normalizeTool, toolOutputText, toolView } from "./tool"
+import { toolDisplayContent } from "../util/tool-display"
+import { isRecord } from "../util/record"
 
 const CHILD_MESSAGE_LIMIT = 80
 const CHILD_FRAME_LIMIT = 80
@@ -55,7 +59,7 @@ export function toolCommit(
 ): StreamCommit {
   const part = normalizeTool(input)
   const status = part.state.status
-  const output = status === "streaming" ? "" : toolOutputText(part.name, part.state.content)
+  const output = status === "streaming" ? "" : toolOutputText(part.name, toolDisplayContent(part.state))
   const partial = status === "error" && phase === "progress" && value !== undefined
   const text =
     status === "running" || partial
@@ -113,7 +117,7 @@ type ChildState = {
   permissions: MiniPermissionRequest[]
   forms: MiniFormRequest[]
   messageIDs: Set<string>
-  prompts: Map<string, string>
+  prompts: Map<string, Pick<SessionMessageUser, "text" | "files">>
   hydrated: boolean
   detailStale: boolean
   blockersHydrated: boolean
@@ -153,8 +157,7 @@ type DiscoveryJob = {
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
-  if (typeof value === "object" && value !== null && !Array.isArray(value)) return value as Record<string, unknown>
-  return undefined
+  return isRecord(value) ? value : undefined
 }
 
 function text(value: unknown): string | undefined {
@@ -163,25 +166,25 @@ function text(value: unknown): string | undefined {
   return next || undefined
 }
 
-function sourceKey(messageID: string, callID: string) {
-  return `${messageID}\u0000${callID}`
+function sourceKey(messageID: string, id: string) {
+  return `${messageID}\u0000${id}`
 }
 
-function permissionTool(request: PermissionV2Request, tools: Map<string, SessionMessageAssistantTool>) {
+function permissionTool(request: PermissionRequest, tools: Map<string, SessionMessageAssistantTool>) {
   if (request.source?.type !== "tool") return request
-  const tool = tools.get(sourceKey(request.source.messageID, request.source.callID))
+  const tool = tools.get(sourceKey(request.source.messageID, request.source.id))
   return tool ? { ...request, tool } : request
 }
 
 function blockerCategory(event: V2Event): "permission" | "form" | undefined {
-  if (event.type === "permission.v2.asked" || event.type === "permission.v2.replied") return "permission"
+  if (event.type === "permission.asked" || event.type === "permission.replied") return "permission"
   if (event.type === "form.created" || event.type === "form.replied" || event.type === "form.cancelled") return "form"
 }
 
-function childSessionID(structured: Record<string, unknown> | undefined) {
-  const sessionID = text(structured?.sessionID)
+function childSessionID(metadata: Record<string, unknown> | undefined) {
+  const sessionID = text(metadata?.sessionID)
   if (!sessionID || !sessionID.startsWith("ses")) return undefined
-  const status = structured?.status
+  const status = metadata?.status
   if (status !== "running" && status !== "completed") return undefined
   return { sessionID, running: status === "running" }
 }
@@ -194,13 +197,12 @@ function tab(child: ChildState): FooterSubagentTab {
     status: child.status,
     background: child.background ? true : undefined,
     title: child.title,
-    lastUpdatedAt: child.lastUpdatedAt,
   }
 }
 
 export function createSubagentTracker(input: SubagentTrackerInput): SubagentTracker {
   const children = new Map<string, ChildState>()
-  // Live subagent tool calls in the parent, so tool.success structured output
+  // Live subagent tool calls in the parent, so tool.success metadata
   // can be joined with the call's input metadata.
   const pendingCalls = new Map<string, Record<string, unknown>>()
   // Recently resolved non-family sessions. Retention is bounded so unrelated
@@ -287,16 +289,19 @@ export function createSubagentTracker(input: SubagentTrackerInput): SubagentTrac
     if (meta.background === true) child.background = true
   }
 
-  const userFrame = (child: ChildState, messageID: string, value: string) => {
+  const userFrame = (child: ChildState, messageID: string, prompt: Pick<SessionMessageUser, "text" | "files">) => {
     if (child.messageIDs.has(messageID)) return false
     child.messageIDs.add(messageID)
-    setFrame(child, `user:${messageID}`, {
-      kind: "user",
-      source: "system",
-      text: value,
-      phase: "start",
-      messageID,
-    })
+    if (prompt.text.trim())
+      setFrame(child, `user:${messageID}`, {
+        kind: "user",
+        source: "system",
+        text: prompt.text,
+        phase: "start",
+        messageID,
+      })
+    for (const commit of userImageCommits(messageID, prompt.files))
+      setFrame(child, sourceKey(messageID, commit.partID), commit)
     return true
   }
 
@@ -310,9 +315,14 @@ export function createSubagentTracker(input: SubagentTrackerInput): SubagentTrac
       return
     }
     const current = child.tools.get(key)
-    const output = toolOutputText(part.name, part.state.content)
+    const output = toolOutputText(part.name, toolDisplayContent(part.state))
     if (part.state.status === "running") {
-      if (!current || current.part.state.status === "streaming")
+      const ready = part.name !== "websearch" || typeof part.state.metadata.provider === "string"
+      const awaitingProvider =
+        current?.part.name === "websearch" &&
+        current.part.state.status === "running" &&
+        typeof current.part.state.metadata.provider !== "string"
+      if (ready && (!current || current.part.state.status === "streaming" || awaitingProvider))
         setFrame(child, frame, toolCommit(part, messageID, "start", undefined, input.directory))
       if (output) setFrame(child, frame, toolCommit(part, messageID, "progress", output, input.directory))
       child.tools.set(key, { part })
@@ -320,12 +330,14 @@ export function createSubagentTracker(input: SubagentTrackerInput): SubagentTrac
     }
     child.finishedTools.add(key)
     child.tools.delete(key)
-    if (part.state.status === "error" && output) {
-      setFrame(child, frame, toolCommit(part, messageID, "progress", output, input.directory))
-      setFrame(child, `${frame}:final`, toolCommit(part, messageID, "final", undefined, input.directory))
-      return
-    }
-    setFrame(child, frame, toolCommit(part, messageID, toolFinalPhase(part), undefined, input.directory))
+    const partial = part.state.status === "error" && output
+    if (partial) setFrame(child, frame, toolCommit(part, messageID, "progress", output, input.directory))
+    setFrame(
+      child,
+      partial ? `${frame}:final` : frame,
+      toolCommit(part, messageID, toolFinalPhase(part), undefined, input.directory),
+    )
+    for (const commit of toolImageCommits(part, messageID)) setFrame(child, sourceKey(messageID, commit.partID), commit)
   }
 
   const rebuild = (child: ChildState, messages: SessionMessageInfo[]) => {
@@ -337,7 +349,7 @@ export function createSubagentTracker(input: SubagentTrackerInput): SubagentTrac
     for (const message of messages) {
       if (message.type === "user") {
         child.prompts.delete(message.id)
-        userFrame(child, message.id, message.text)
+        userFrame(child, message.id, message)
         continue
       }
       if (message.type !== "assistant") continue
@@ -393,9 +405,11 @@ export function createSubagentTracker(input: SubagentTrackerInput): SubagentTrac
     const pendingPrompts = new Map(child.prompts)
     const pendingTools = new Map(child.tools)
     let retry = false
-    const task = sdk.message
-      .list({ sessionID: child.sessionID, limit: CHILD_MESSAGE_LIMIT, order: "desc" }, { signal })
-      .then((response) => {
+    const task = Promise.all([
+      sdk.message.list({ sessionID: child.sessionID, limit: CHILD_MESSAGE_LIMIT, order: "desc" }, { signal }),
+      sdk.session.inbox.list({ sessionID: child.sessionID }, { signal }),
+    ])
+      .then(([response, pending]) => {
         if (!active(signal)) return
         const buffered = hydrationEvents.get(child.sessionID) ?? []
         hydrationEvents.delete(child.sessionID)
@@ -404,6 +418,9 @@ export function createSubagentTracker(input: SubagentTrackerInput): SubagentTrac
           retry = true
           notifyDetail(child)
           return
+        }
+        for (const item of pending) {
+          if (item.type === "user") child.prompts.set(item.id, item.payload)
         }
         for (const [id, prompt] of pendingPrompts) {
           if (!child.prompts.has(id)) child.prompts.set(id, prompt)
@@ -436,7 +453,7 @@ export function createSubagentTracker(input: SubagentTrackerInput): SubagentTrac
   const resolvePermissionTools = async (
     sdk: OpenCodeClient,
     child: ChildState,
-    permissions: PermissionV2Request[],
+    permissions: PermissionRequest[],
     epoch: number,
     signal = input.signal,
   ) => {
@@ -444,7 +461,7 @@ export function createSubagentTracker(input: SubagentTrackerInput): SubagentTrac
       ...new Set(
         permissions.flatMap((request) => {
           if (request.source?.type !== "tool") return []
-          const key = sourceKey(request.source.messageID, request.source.callID)
+          const key = sourceKey(request.source.messageID, request.source.id)
           return child.toolSources.has(key) ? [] : [request.source.messageID]
         }),
       ),
@@ -452,7 +469,7 @@ export function createSubagentTracker(input: SubagentTrackerInput): SubagentTrac
     for (let offset = 0; offset < messageIDs.length; offset += FAMILY_DISCOVERY_CONCURRENCY) {
       const batch = messageIDs.slice(offset, offset + FAMILY_DISCOVERY_CONCURRENCY)
       const messages = await Promise.allSettled(
-        batch.map((messageID) => sdk.session.message({ sessionID: child.sessionID, messageID }, { signal })),
+        batch.map((messageID) => sdk.session.message.get({ sessionID: child.sessionID, messageID }, { signal })),
       )
       if (!blockerCurrent(child, epoch, signal)) return permissions
       if (
@@ -475,7 +492,7 @@ export function createSubagentTracker(input: SubagentTrackerInput): SubagentTrac
       permissions.some(
         (request) =>
           request.source?.type === "tool" &&
-          !child.toolSources.has(sourceKey(request.source.messageID, request.source.callID)),
+          !child.toolSources.has(sourceKey(request.source.messageID, request.source.id)),
       )
     )
       throw new Error("Permission source tool is unavailable")
@@ -524,7 +541,7 @@ export function createSubagentTracker(input: SubagentTrackerInput): SubagentTrac
         replayBlockerEvents(child, "permission")
         input.emit()
       }),
-      sdk.form.list({ sessionID: child.sessionID }, { signal }).then((forms) => {
+      sdk.session.form.list({ sessionID: child.sessionID }, { signal }).then((forms) => {
         if (!blockerCurrent(child, epoch, signal)) return
         child.forms = forms
         replayBlockerEvents(child, "form")
@@ -639,18 +656,22 @@ export function createSubagentTracker(input: SubagentTrackerInput): SubagentTrac
   }
 
   const reduce = (child: ChildState, event: V2Event) => {
-    if (event.type === "session.input.admitted") {
-      if (event.data.input.type === "user") child.prompts.set(event.data.inputID, event.data.input.data.text)
+    if (event.type === "session.inbox.enqueued") {
+      if (event.data.item.type === "user") child.prompts.set(event.data.inboxID, event.data.item.payload)
       return
     }
-    if (event.type === "session.input.promoted") {
-      const prompt = child.prompts.get(event.data.inputID)
+    if (event.type === "session.inbox.delivered") {
+      const prompt = child.prompts.get(event.data.inboxID)
       if (prompt === undefined) return
-      child.prompts.delete(event.data.inputID)
-      if (userFrame(child, event.data.inputID, prompt)) {
+      child.prompts.delete(event.data.inboxID)
+      if (userFrame(child, event.data.inboxID, prompt)) {
         touch(child, event.created)
         notifyDetail(child)
       }
+      return
+    }
+    if (event.type === "session.inbox.cancelled") {
+      child.prompts.delete(event.data.inboxID)
       return
     }
     if (event.type === "session.step.started") {
@@ -737,12 +758,12 @@ export function createSubagentTracker(input: SubagentTrackerInput): SubagentTrac
       return
     }
     if (event.type === "session.tool.input.started") {
-      if (child.finishedTools.has(sourceKey(event.data.assistantMessageID, event.data.callID))) return
+      if (child.finishedTools.has(sourceKey(event.data.assistantMessageID, event.data.id))) return
       childTool(
         child,
         {
           type: "tool",
-          id: event.data.callID,
+          id: event.data.id,
           name: event.data.name,
           state: { status: "streaming", input: "" },
           time: { created: event.created },
@@ -752,7 +773,7 @@ export function createSubagentTracker(input: SubagentTrackerInput): SubagentTrac
       return
     }
     if (event.type === "session.tool.input.delta" || event.type === "session.tool.input.ended") {
-      const current = child.tools.get(sourceKey(event.data.assistantMessageID, event.data.callID))
+      const current = child.tools.get(sourceKey(event.data.assistantMessageID, event.data.id))
       if (!current || current.part.state.status !== "streaming") return
       childTool(
         child,
@@ -769,18 +790,18 @@ export function createSubagentTracker(input: SubagentTrackerInput): SubagentTrac
       return
     }
     if (event.type === "session.tool.called") {
-      const key = sourceKey(event.data.assistantMessageID, event.data.callID)
+      const key = sourceKey(event.data.assistantMessageID, event.data.id)
       if (child.finishedTools.has(key)) return
       const current = child.tools.get(key)
       childTool(
         child,
         {
           type: "tool",
-          id: event.data.callID,
+          id: event.data.id,
           name: current?.part.name ?? "tool",
           executed: event.data.executed,
-          providerState: event.data.state,
-          state: { status: "running", input: event.data.input, structured: {}, content: [] },
+          native: event.data.native,
+          state: { status: "running", input: event.data.input, metadata: {} },
           time: { created: current?.part.time.created ?? event.created, ran: event.created },
         },
         event.data.assistantMessageID,
@@ -790,7 +811,7 @@ export function createSubagentTracker(input: SubagentTrackerInput): SubagentTrac
       return
     }
     if (event.type === "session.tool.progress") {
-      const key = sourceKey(event.data.assistantMessageID, event.data.callID)
+      const key = sourceKey(event.data.assistantMessageID, event.data.id)
       if (child.finishedTools.has(key)) return
       const current = child.tools.get(key)
       const part = current?.part
@@ -798,15 +819,14 @@ export function createSubagentTracker(input: SubagentTrackerInput): SubagentTrac
         child,
         {
           type: "tool",
-          id: event.data.callID,
+          id: event.data.id,
           name: part?.name ?? "tool",
           executed: part?.executed,
-          providerState: part?.providerState,
+          native: part?.native,
           state: {
             status: "running",
             input: part && part.state.status !== "streaming" ? part.state.input : {},
-            structured: event.data.structured,
-            content: event.data.content,
+            metadata: event.data.metadata,
           },
           time: {
             created: part?.time.created ?? event.created,
@@ -820,7 +840,7 @@ export function createSubagentTracker(input: SubagentTrackerInput): SubagentTrac
       return
     }
     if (event.type === "session.tool.success" || event.type === "session.tool.failed") {
-      const key = sourceKey(event.data.assistantMessageID, event.data.callID)
+      const key = sourceKey(event.data.assistantMessageID, event.data.id)
       if (child.finishedTools.has(key)) return
       const current = child.tools.get(key)
       const part = current?.part
@@ -829,26 +849,23 @@ export function createSubagentTracker(input: SubagentTrackerInput): SubagentTrac
         child,
         {
           type: "tool",
-          id: event.data.callID,
+          id: event.data.id,
           name: part?.name ?? "tool",
           executed: event.data.executed,
-          providerState: part?.providerState,
-          providerResultState: event.data.resultState,
+          native: event.data.native ? { ...part?.native, ...event.data.native } : part?.native,
           state: failed
             ? {
                 status: "error",
                 input: part && part.state.status !== "streaming" ? part.state.input : {},
-                structured: part && part.state.status !== "streaming" ? part.state.structured : {},
-                content: part && part.state.status !== "streaming" ? part.state.content : [],
+                metadata: event.data.metadata,
+                content: event.data.content,
                 error: event.data.error,
-                result: event.data.result,
               }
             : {
                 status: "completed",
                 input: part && part.state.status !== "streaming" ? part.state.input : {},
-                structured: event.data.structured,
+                metadata: event.data.metadata,
                 content: event.data.content,
-                result: event.data.result,
               },
           time: {
             created: part?.time.created ?? event.created,
@@ -862,13 +879,13 @@ export function createSubagentTracker(input: SubagentTrackerInput): SubagentTrac
       notifyDetail(child)
       return
     }
-    if (event.type === "permission.v2.asked") {
+    if (event.type === "permission.asked") {
       if (!child.permissions.some((item) => item.id === event.data.id))
         child.permissions.push(permissionTool(event.data, child.toolSources))
       input.emit()
       return
     }
-    if (event.type === "permission.v2.replied") {
+    if (event.type === "permission.replied") {
       child.permissions = child.permissions.filter((item) => item.id !== event.data.requestID)
       input.emit()
       return
@@ -921,7 +938,7 @@ export function createSubagentTracker(input: SubagentTrackerInput): SubagentTrac
   const mainTool = (item: SessionMessageAssistantTool, active?: Record<string, unknown>) => {
     const tool = normalizeTool(item)
     if (tool.name !== "subagent" || tool.state.status === "streaming") return
-    const found = childSessionID(record(tool.state.structured))
+    const found = childSessionID(record(tool.state.metadata))
     if (!found) return
     const child = admitChild(found.sessionID)
     if (!child) return
@@ -950,23 +967,24 @@ export function createSubagentTracker(input: SubagentTrackerInput): SubagentTrac
       if (!active(signal)) return
       if (event.type === "session.tool.input.started") {
         if (canonicalToolName(event.data.name) === "subagent")
-          pendingCalls.set(sourceKey(event.data.assistantMessageID, event.data.callID), {})
+          pendingCalls.set(sourceKey(event.data.assistantMessageID, event.data.id), {})
         return
       }
       if (event.type === "session.tool.called") {
-        const key = sourceKey(event.data.assistantMessageID, event.data.callID)
+        const key = sourceKey(event.data.assistantMessageID, event.data.id)
         if (pendingCalls.has(key)) pendingCalls.set(key, event.data.input)
         return
       }
-      if (event.type === "session.tool.failed") {
-        pendingCalls.delete(sourceKey(event.data.assistantMessageID, event.data.callID))
+      if (
+        event.type !== "session.tool.progress" &&
+        event.type !== "session.tool.success" &&
+        event.type !== "session.tool.failed"
+      )
         return
-      }
-      if (event.type !== "session.tool.progress" && event.type !== "session.tool.success") return
-      const key = sourceKey(event.data.assistantMessageID, event.data.callID)
+      const key = sourceKey(event.data.assistantMessageID, event.data.id)
       const pending = pendingCalls.get(key)
-      if (event.type === "session.tool.success") pendingCalls.delete(key)
-      const found = childSessionID(record(event.data.structured))
+      if (event.type !== "session.tool.progress") pendingCalls.delete(key)
+      const found = childSessionID(record(event.data.metadata))
       if (!found) return
       const child = admitChild(found.sessionID)
       if (!child) return
@@ -1084,11 +1102,13 @@ export function createSubagentTracker(input: SubagentTrackerInput): SubagentTrac
       input.emit()
     },
     snapshot() {
-      const tabs = [...children.values()].map(tab).toSorted((a, b) => {
-        const active = Number(b.status === "running") - Number(a.status === "running")
-        if (active !== 0) return active
-        return b.lastUpdatedAt - a.lastUpdatedAt
-      })
+      const tabs = [...children.values()]
+        .toSorted((a, b) => {
+          const active = Number(b.status === "running") - Number(a.status === "running")
+          if (active !== 0) return active
+          return b.lastUpdatedAt - a.lastUpdatedAt
+        })
+        .map(tab)
       const child = selected ? children.get(selected) : undefined
       const details: Record<string, FooterSubagentDetail> =
         child && !child.detailStale ? { [child.sessionID]: { commits: child.frames.map((item) => item.commit) } } : {}

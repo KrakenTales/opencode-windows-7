@@ -1,10 +1,20 @@
 import { afterEach, expect, test } from "bun:test"
-import type { SessionMessageAssistantTool } from "@opencode-ai/client/promise"
-import { RGBA, SyntaxStyle } from "@opentui/core"
+import type { SessionMessageAssistantTool } from "@opencode/client/promise"
+import {
+  CliRenderEvents,
+  MarkdownRenderable,
+  ResourceContext,
+  RGBA,
+  SyntaxStyle,
+  TextAttributes,
+  TextRenderable,
+} from "@opentui/core"
 import { MockTreeSitterClient, createTestRenderer, type TestRenderer } from "@opentui/core/testing"
+import { monoSnapshot } from "../../src/mini/mono"
 import { RunScrollbackStream } from "../../src/mini/scrollback.surface"
-import { entryGroupKey } from "../../src/mini/scrollback.writer"
-import { RUN_THEME_FALLBACK, type RunTheme } from "../../src/mini/theme"
+import { entryLook } from "../../src/mini/scrollback.shared"
+import { entryGroupKey, entryWriter } from "../../src/mini/scrollback.writer"
+import { RUN_THEME_FALLBACK, RUN_THEME_MONO, type RunTheme } from "../../src/mini/theme"
 import type { StreamCommit } from "../../src/mini/types"
 import { canonicalToolPart } from "./fixture/tool-part"
 
@@ -20,13 +30,15 @@ type ClaimedCommit = {
 const decoder = new TextDecoder()
 const active: TestRenderer[] = []
 
-afterEach(() => {
+afterEach(async () => {
   for (const renderer of active.splice(0)) {
     renderer.destroy()
+    await renderer.closed
   }
 })
 
 function claim(renderer: TestRenderer): ClaimedCommit[] {
+  // oxlint-disable-next-line no-restricted-globals -- OpenTUI does not expose its external-output queue publicly.
   const queue = Reflect.get(renderer, "externalOutputQueue")
   if (!queue || typeof queue !== "object" || !("claim" in queue) || typeof queue.claim !== "function") {
     throw new Error("renderer missing external output queue")
@@ -67,6 +79,8 @@ async function setup(
     wrote?: boolean
     theme?: RunTheme
     onThemeRelease?: (theme: RunTheme) => void
+    mono?: boolean
+    failHighlight?: boolean
   } = {},
 ) {
   const out = await createTestRenderer({
@@ -77,16 +91,25 @@ async function setup(
     consoleMode: "disabled",
   })
   active.push(out.renderer)
+  if (input.mono) out.renderer.on(CliRenderEvents.EXTERNAL_OUTPUT, monoSnapshot)
 
   const treeSitterClient = new MockTreeSitterClient({ autoResolveTimeout: 0 })
   treeSitterClient.setMockResult({ highlights: [] })
+  if (input.failHighlight) {
+    treeSitterClient.highlightOnce = async () => {
+      throw new Error("highlight failed")
+    }
+  }
 
   return {
     renderer: out.renderer,
+    renderOnce: out.renderOnce,
+    externalOutput: out.externalOutput,
     scrollback: new RunScrollbackStream(out.renderer, input.theme ?? RUN_THEME_FALLBACK, {
       treeSitterClient,
       wrote: input.wrote ?? false,
       onThemeRelease: input.onThemeRelease,
+      mono: input.mono,
     }),
   }
 }
@@ -131,8 +154,9 @@ test("turn summary starts at the left edge", async () => {
 })
 
 test("theme swaps restyle active reasoning without resetting the stream", async () => {
-  const previousSyntax = SyntaxStyle.fromStyles({ default: { fg: "#123456" } })
-  const nextSyntax = SyntaxStyle.fromStyles({ default: { fg: "#abcdef" } })
+  const owner = new ResourceContext({ objectCapacity: 8, renderCellsMax: 1 })
+  const previousSyntax = SyntaxStyle.fromStyles({ default: { fg: "#123456" } }, owner)
+  const nextSyntax = SyntaxStyle.fromStyles({ default: { fg: "#abcdef" } }, owner)
   const released: RunTheme[] = []
   const previous = {
     ...RUN_THEME_FALLBACK,
@@ -152,27 +176,67 @@ test("theme swaps restyle active reasoning without resetting the stream", async 
 
   try {
     await out.scrollback.append(reasoning("before"))
-    expect(activeSyntax(out.scrollback)).toBe(previousSyntax)
+    const previousBound = activeSyntax(out.scrollback)!
+    expect(previousBound).not.toBe(previousSyntax)
+    expect(previousBound.getAllStyles()).toEqual(previousSyntax.getAllStyles())
 
     out.scrollback.setTheme(next)
-    expect(activeSyntax(out.scrollback)).toBe(nextSyntax)
+    const nextBound = activeSyntax(out.scrollback)!
+    expect(nextBound).not.toBe(nextSyntax)
+    expect(nextBound.getAllStyles()).toEqual(nextSyntax.getAllStyles())
+    expect(previousBound.getAllStyles()).toEqual(previousSyntax.getAllStyles())
     expect(released).toEqual([])
 
     await out.scrollback.append(reasoning("after"))
-    expect(activeSyntax(out.scrollback)).toBe(nextSyntax)
+    expect(activeSyntax(out.scrollback)).toBe(nextBound)
     expect(released).toEqual([previous])
+    expect(() => previousBound.getAllStyles()).toThrow()
+    await out.scrollback.complete()
+    expect(() => nextBound.getAllStyles()).toThrow()
+    expect(nextSyntax.getStyle("default")?.fg?.toInts()).toEqual(RGBA.fromHex("#abcdef").toInts())
   } finally {
     out.scrollback.destroy()
     destroy(claim(out.renderer))
     previousSyntax.destroy()
     nextSyntax.destroy()
+    owner.destroy()
   }
 })
 
 function activeSyntax(scrollback: RunScrollbackStream) {
+  // oxlint-disable-next-line no-restricted-globals -- RunScrollbackStream does not expose its active entry publicly.
   const entry = Reflect.get(scrollback, "active") as { renderable?: { syntaxStyle?: SyntaxStyle } } | undefined
   return entry?.renderable?.syntaxStyle
 }
+
+test("static scrollback owns its bound style without releasing the source theme", async () => {
+  const out = await setup()
+  const syntax = SyntaxStyle.fromStyles({ default: { fg: "#123456" } }, out.renderer.nativeScene)
+  const surface = out.renderer.createScrollbackSurface()
+  try {
+    const snapshot = entryWriter({
+      commit: assistant("Hello", "final"),
+      body: { type: "markdown", content: "Hello" },
+      theme: { ...RUN_THEME_FALLBACK, block: { ...RUN_THEME_FALLBACK.block, syntax } },
+    })({
+      width: surface.width,
+      widthMethod: out.renderer.widthMethod,
+      tailColumn: 0,
+      renderContext: surface.renderContext,
+    })
+    const bound = (snapshot.root.getChildren()[0] as MarkdownRenderable).syntaxStyle
+    expect(bound).not.toBe(syntax)
+    expect(bound.getAllStyles()).toEqual(syntax.getAllStyles())
+    snapshot.root.destroyRecursively()
+    snapshot.teardown?.()
+    expect(() => bound.getAllStyles()).toThrow()
+    expect(syntax.getStyleCount()).toBe(1)
+  } finally {
+    surface.destroy()
+    syntax.destroy()
+    out.scrollback.destroy()
+  }
+})
 
 test("theme swaps preserve streamed markdown parser state", async () => {
   const out = await setup()
@@ -195,6 +259,174 @@ test("theme swaps preserve streamed markdown parser state", async () => {
       const output = render(commits)
       expect(output).toContain("const answer = 42")
       expect(output).not.toContain("```")
+    } finally {
+      destroy(commits)
+    }
+  } finally {
+    out.scrollback.destroy()
+  }
+})
+
+test.each([false, true])("monochrome switches preserve printed blocks and open fences (initial=%s)", async (mono) => {
+  const out = await setup()
+  try {
+    await out.scrollback.setMono(mono)
+    out.scrollback.setTheme(mono ? RUN_THEME_MONO : RUN_THEME_FALLBACK)
+    await out.scrollback.append(assistant('Printed block\n\n```ts\nconst arrow = "'))
+    await out.renderOnce()
+    const printed = out.externalOutput.takeText()
+    expect(printed).toContain("Printed block")
+    expect(printed).not.toContain("const arrow")
+    await out.scrollback.setMono(!mono)
+    out.scrollback.setTheme(mono ? RUN_THEME_FALLBACK : RUN_THEME_MONO)
+    expect(out.externalOutput.takeText()).toBe("")
+    await out.scrollback.append(assistant('\u2192"\n```\n\nNext block'))
+    // A frame can flush the code block while completion is awaiting highlighting.
+    await out.renderOnce()
+    await out.scrollback.complete()
+    const next = out.externalOutput.takeText()
+    expect(next).toContain(mono ? 'const arrow = "\u2192"' : 'const arrow = "->"')
+    expect(next).toContain("Next block")
+    expect(next).not.toContain("Printed block")
+    expect(next).not.toContain("```")
+  } finally {
+    out.scrollback.destroy()
+    destroy(claim(out.renderer))
+  }
+})
+
+test.each([false, true])(
+  "monochrome switches finish pending reasoning without repeating it (initial=%s)",
+  async (mono) => {
+    const out = await setup()
+    const output: string[] = []
+    out.renderer.on(CliRenderEvents.EXTERNAL_OUTPUT, (event) => {
+      output.push(decoder.decode(event.snapshot.getRealCharBytes(true)))
+    })
+    try {
+      await out.scrollback.setMono(mono)
+      await out.scrollback.append(reasoning("Before switch"))
+      await out.scrollback.setMono(!mono)
+      expect(output.join("")).toContain("Before switch")
+      await out.scrollback.append(reasoning(" after switch"))
+      await out.scrollback.complete()
+      expect(output.join("").match(/Before switch/g)).toHaveLength(1)
+      expect(output.join("").match(/after switch/g)).toHaveLength(1)
+    } finally {
+      out.scrollback.destroy()
+      destroy(claim(out.renderer))
+    }
+  },
+)
+
+test("renders monochrome scrollback as ASCII markdown", async () => {
+  const out = await setup({ mono: true, width: 60 })
+  const output: string[] = []
+  out.renderer.on(CliRenderEvents.EXTERNAL_OUTPUT, (event) => {
+    output.push(decoder.decode(event.snapshot.getRealCharBytes(true)))
+  })
+
+  try {
+    await out.scrollback.append(assistant("# H"))
+    // oxlint-disable-next-line no-restricted-globals -- RunScrollbackStream does not expose its active entry publicly.
+    expect(Reflect.get(out.scrollback, "active")?.renderable).toBeInstanceOf(MarkdownRenderable)
+    await out.scrollback.append(
+      assistant(
+        "éading →\n\n> “quote”\n\n---\n\n| A | B |\n| - | - |\n| α | β |\n\n• literal\n\n———\n\n[café](https://example.com/café)",
+      ),
+    )
+    // oxlint-disable-next-line no-restricted-globals -- RunScrollbackStream does not expose its active entry publicly.
+    const active: unknown = Reflect.get(out.scrollback, "active")
+    const renderable =
+      active && typeof active === "object" && "renderable" in active && active.renderable instanceof MarkdownRenderable
+        ? active.renderable
+        : undefined
+    expect(renderable?._blockStates.slice(-3).map((state) => state.token.type)).toEqual([
+      "paragraph",
+      "paragraph",
+      "paragraph",
+    ])
+    const link = renderable?._blockStates.at(-1)?.token
+    const tokens = link && "tokens" in link && Array.isArray(link.tokens) ? link.tokens : []
+    const href = tokens.find((token) => "href" in token)
+    expect(href && "href" in href ? href.href : undefined).toBe("https://example.com/café")
+    await out.scrollback.complete()
+    out.renderer.writeToScrollback((ctx) => ({
+      root: new TextRenderable(ctx.renderContext, {
+        content: "plain │ emoji 🙂",
+        width: ctx.width,
+        height: 1,
+      }),
+      width: ctx.width,
+      height: 1,
+      trailingNewline: false,
+    }))
+
+    const rendered = output.join("").replace(/ +\n/g, "\n")
+    expect(rendered).toContain("# H?ading ->")
+    expect(rendered).toContain('| "quote"')
+    expect(rendered).toContain("------------------------------------------------------------")
+    expect(rendered).toContain("?  ?")
+    expect(rendered).toContain("* literal")
+    expect(rendered).toContain("------")
+    expect(rendered).toContain("plain ? emoji ?")
+    expect(rendered).not.toMatch(/[^\x00-\x7f]/)
+  } finally {
+    out.scrollback.destroy()
+    destroy(claim(out.renderer))
+  }
+})
+
+test("renders completed subagent markdown in monochrome mode", async () => {
+  const out = await setup({ mono: true, width: 60 })
+
+  try {
+    await out.scrollback.append(
+      toolCommit({
+        tool: "subagent",
+        phase: "final",
+        toolState: "completed",
+        state: {
+          status: "completed",
+          input: { description: "Inspect reducer", agent: "explore" },
+          content: [{ type: "text", text: "# Findings\n\n- Café → stable" }],
+          metadata: {
+            sessionID: "ses-child-1",
+            status: "completed",
+            output: "# Findings\n\n- Café → stable",
+          },
+        },
+      }),
+    )
+
+    const commits = claim(out.renderer)
+    try {
+      expect(commits).toHaveLength(1)
+      expect(commits[0]?.trailingNewline).toBe(true)
+      const output = render(commits)
+      expect(output).toContain("# Findings")
+      expect(output).toContain("- Caf? -> stable")
+      expect(output).not.toMatch(/[^\x00-\x7f]/)
+    } finally {
+      destroy(commits)
+    }
+  } finally {
+    out.scrollback.destroy()
+  }
+})
+
+test("keeps fenced code monochrome when highlighting fails", async () => {
+  const out = await setup({ mono: true, failHighlight: true })
+
+  try {
+    await out.scrollback.append(assistant("```ts\nCafé → …\n```"))
+    await out.scrollback.complete()
+
+    const commits = claim(out.renderer)
+    try {
+      const output = render(commits)
+      expect(output).toContain("Caf? -> ...")
+      expect(output).not.toMatch(/[^\x00-\x7f]/)
     } finally {
       destroy(commits)
     }
@@ -245,6 +477,22 @@ function toolCommit(input: {
     ...(input.state ? { part: canonicalToolPart(input.tool, input.state, id) } : {}),
   }
 }
+
+test("entry looks preserve semantic colors without dimming and keep errors bold", () => {
+  const theme = {
+    ...RUN_THEME_FALLBACK.entry,
+    system: { body: "#123456" },
+    reasoning: { body: "#abcdef" },
+  }
+
+  expect(entryLook(reasoning("Thinking: next steps"), theme)).toEqual({ fg: theme.reasoning.body })
+  expect(entryLook(reasoning("", "final"), theme)).toEqual({ fg: theme.system.body })
+  expect(entryLook(error("failed"), theme)).toEqual({ fg: theme.error.body, attrs: TextAttributes.BOLD })
+  expect(entryLook(toolCommit({ tool: "shell", phase: "final", toolState: "error" }), theme)).toEqual({
+    fg: theme.error.body,
+    attrs: TextAttributes.BOLD,
+  })
+})
 
 test("scopes repeated tool part IDs to their assistant messages", () => {
   const first = toolCommit({
@@ -346,8 +594,7 @@ test("renders question summaries without boilerplate footer copy", async () => {
               },
             ],
           },
-          structured: {},
-          content: [],
+          metadata: {},
         },
       }),
       final: toolCommit({
@@ -366,10 +613,10 @@ test("renders question summaries without boilerplate footer copy", async () => {
               },
             ],
           },
-          structured: {
+          metadata: {
             answers: [["Bug fix"]],
           },
-          content: [],
+          content: [{ type: "text", text: "" }],
         },
       }),
     },
@@ -441,8 +688,7 @@ test("inserts spacers for new visible groups", async () => {
           input: {
             pattern: "**/run.ts",
           },
-          structured: {},
-          content: [],
+          metadata: {},
         },
       }),
     )
@@ -577,8 +823,7 @@ test("does not double-space before completed shell output when inline tool heade
             command: "ls",
             workdir: "src/cli/cmd/run",
           },
-          structured: {},
-          content: [],
+          metadata: {},
         },
       }),
     )
@@ -594,8 +839,7 @@ test("does not double-space before completed shell output when inline tool heade
             pattern: "**/*tool*",
             path: "src/cli/cmd/run",
           },
-          structured: {},
-          content: [],
+          metadata: {},
         },
       }),
     )
@@ -611,8 +855,7 @@ test("does not double-space before completed shell output when inline tool heade
             pattern: "tool",
             path: "src/cli/cmd/run",
           },
-          structured: {},
-          content: [],
+          metadata: {},
         },
       }),
     )
@@ -630,7 +873,7 @@ test("does not double-space before completed shell output when inline tool heade
             workdir: "src/cli/cmd/run",
           },
           content: [{ type: "text", text: ["src/cli/cmd/run", "ls", "demo.ts", "entry.body.ts", "", ""].join("\n") }],
-          structured: { exit: 0, truncated: false },
+          metadata: { exit: 0, truncated: false },
         },
       }),
     )
@@ -695,8 +938,7 @@ test("renders structured write finals once as code blocks", async () => {
             path: "src/a.ts",
             content: "const x = 1\nconst y = 2\n",
           },
-          structured: {},
-          content: [],
+          metadata: {},
         },
       }),
     )
@@ -715,8 +957,8 @@ test("renders structured write finals once as code blocks", async () => {
             path: "src/a.ts",
             content: "const x = 1\nconst y = 2\n",
           },
-          structured: {},
-          content: [],
+          metadata: {},
+          content: [{ type: "text", text: "" }],
         },
       }),
     )

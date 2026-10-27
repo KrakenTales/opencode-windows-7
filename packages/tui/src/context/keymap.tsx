@@ -1,4 +1,4 @@
-import type { KeymapCommand, KeymapLayer } from "@opencode-ai/plugin/v2/tui/context"
+import type { KeymapActive, KeymapCommand, KeymapLayer, KeymapPending } from "@opencode/plugin/tui/context"
 import { InputRenderable, TextareaRenderable, type KeyEvent, type Renderable } from "@opentui/core"
 import { stringifyKeyStroke, type Binding, type CommandContext } from "@opentui/keymap"
 import {
@@ -13,9 +13,19 @@ import { formatCommandBindings, formatKeySequence } from "@opentui/keymap/extras
 import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
 import { KeymapProvider, useBindings, useKeymapSelector } from "@opentui/keymap/solid"
 import { useRenderer } from "@opentui/solid"
-import { createContext, onCleanup, useContext, type Accessor, type ParentProps } from "solid-js"
+import {
+  createComputed,
+  createContext,
+  createMemo,
+  createSignal,
+  onCleanup,
+  useContext,
+  type Accessor,
+  type ParentProps,
+} from "solid-js"
 import { useConfig } from "../config"
 import { TuiKeybind } from "../config/keybind"
+import { resolveInteractivity, useInteractivity } from "./interactivity"
 
 declare module "@opentui/keymap" {
   interface Command {
@@ -155,7 +165,7 @@ function Provider(props: ParentProps<{ config?: KeymapConfig }>) {
   )
 }
 
-export type { KeymapCommand, KeymapLayer } from "@opencode-ai/plugin/v2/tui/context"
+export type { KeymapCommand, KeymapLayer } from "@opencode/plugin/tui/context"
 
 export interface Keymap {
   /** Dispatches a reachable command by ID. */
@@ -169,47 +179,38 @@ export interface Keymap {
   }
   /** Registers a low-level keymap interceptor. */
   intercept: OpenTuiKeymap["intercept"]
+  /** Returns whether an event matches the configured leader key. */
+  isLeader(event: KeyEvent): boolean
 }
 
 function use(): Keymap {
   const value = useValue()
+  const enabled = useInteractivity()
+  const leader = value.config.keybinds.get("leader")?.[0]?.key
+  const isLeader = leader ? value.keymap.createKeyMatcher(leader) : () => false
   return {
     dispatch(id, input) {
       value.dispatch(id, input)
     },
-    mode: value.mode,
+    mode: {
+      current: value.mode.current,
+      push: (mode) => value.mode.push(mode, resolveInteractivity(enabled)),
+    },
     intercept: value.keymap.intercept.bind(value.keymap),
+    isLeader,
   }
 }
 
 function createLayer(input: () => KeymapLayer) {
   const value = useValue()
+  const enabled = useInteractivity()
   useBindings(() => {
     const layer = input()
     const { commands, bindings, mode, ...options } = layer
-    const grouped = (commands ?? []).reduce(
-      (result, command) => {
-        if (command.id !== undefined) {
-          if (!command.id) throw new Error("Keymap command IDs cannot be empty")
-          if (typeof command.bind === "string" && !command.bind)
-            throw new Error("Keymap command bindings cannot be empty")
-          result.named.push({ ...command, id: command.id })
-          return result
-        }
-        if (command.palette) throw new Error("Palette commands require an ID")
-        if (command.slash) throw new Error("Slash commands require an ID")
-        if (typeof command.bind !== "string") throw new Error("Inline keymap commands require bind")
-        if (!command.bind) throw new Error("Keymap command bindings cannot be empty")
-        result.inline.push({ ...command, id: undefined, bind: command.bind })
-        return result
-      },
-      {
-        named: [] as Array<KeymapCommand & { readonly id: string }>,
-        inline: [] as Array<KeymapCommand & { readonly id?: undefined; readonly bind: string }>,
-      },
-    )
+    const grouped = groupCommands(commands)
     return {
       ...options,
+      enabled: enabled() ? options.enabled : false,
       ...(mode === "global" ? {} : { mode: mode ?? MODE.base }),
       commands: grouped.named.map((command) => {
         const { id, description, group, palette, bind, run, ...definition } = command
@@ -249,19 +250,49 @@ function createLayer(input: () => KeymapLayer) {
   })
 }
 
+function groupCommands(commands: readonly KeymapCommand[] = []) {
+  return commands.reduce(
+    (result, command) => {
+      if (command.id !== undefined) {
+        if (!command.id) throw new Error("Keymap command IDs cannot be empty")
+        if (typeof command.bind === "string" && !command.bind)
+          throw new Error("Keymap command bindings cannot be empty")
+        result.named.push({ ...command, id: command.id })
+        return result
+      }
+      if (command.palette) throw new Error("Palette commands require an ID")
+      if (command.slash) throw new Error("Slash commands require an ID")
+      if (typeof command.bind !== "string") throw new Error("Inline keymap commands require bind")
+      if (!command.bind) throw new Error("Keymap command bindings cannot be empty")
+      result.inline.push({ ...command, id: undefined, bind: command.bind })
+      return result
+    },
+    {
+      named: [] as Array<KeymapCommand & { readonly id: string }>,
+      inline: [] as Array<KeymapCommand & { readonly id?: undefined; readonly bind: string }>,
+    },
+  )
+}
+
 function useShortcuts() {
   const value = useValue()
   const shortcuts = useKeymapSelector((keymap) => {
     const commands = keymap.getCommands({ visibility: "registered" }).map((command) => command.name)
     const bindings = keymap.getCommandBindings({ visibility: "registered", commands })
     return new Map(
-      commands.map((id) => [
-        id,
-        {
-          first: formatKeySequence(bindings.get(id)?.[0]?.sequence, formatOptions(value.config)),
-          all: formatCommandBindings(bindings.get(id) ?? [], formatOptions(value.config)),
-        },
-      ]),
+      commands.map((id) => {
+        const current = bindings.get(id) ?? []
+        return [
+          id,
+          {
+            first: formatKeySequence(current[0]?.sequence, formatOptions(value.config)),
+            all: formatCommandBindings(current, formatOptions(value.config)),
+            list: current
+              .map((binding) => formatKeySequence(binding.sequence, formatOptions(value.config)))
+              .filter((shortcut): shortcut is string => shortcut !== undefined),
+          },
+        ]
+      }),
     )
   })
   return {
@@ -270,6 +301,9 @@ function useShortcuts() {
     },
     all(id: string) {
       return shortcuts().get(id)?.all
+    },
+    list(id: string) {
+      return shortcuts().get(id)?.list ?? []
     },
   }
 }
@@ -328,6 +362,41 @@ function useActiveKeys() {
   return useKeymapSelector((keymap) => keymap.getActiveKeys({ includeMetadata: true }))
 }
 
+function useState() {
+  const value = useValue()
+  const commands = useCommands()
+  const pending = usePendingSequence()
+  const active = useActiveKeys()
+  return {
+    commands,
+    pending: (): readonly KeymapPending[] =>
+      pending().map((item) => ({
+        key: formatKeySequence([item], formatOptions(value.config)) ?? "",
+        ...(item.tokenName ? { token: item.tokenName } : {}),
+      })),
+    active: (): readonly KeymapActive[] =>
+      active().map((item) => ({
+        key:
+          formatKeySequence(
+            [{ stroke: item.stroke, display: item.display, tokenName: item.tokenName }],
+            formatOptions(value.config),
+          ) ?? "",
+        ...(typeof item.commandAttrs?.title === "string" ? { title: item.commandAttrs.title } : {}),
+        ...(typeof item.bindingAttrs?.desc === "string"
+          ? { description: item.bindingAttrs.desc }
+          : typeof item.commandAttrs?.desc === "string"
+            ? { description: item.commandAttrs.desc }
+            : {}),
+        ...(typeof item.commandAttrs?.category === "string"
+          ? { group: item.commandAttrs.category }
+          : typeof item.bindingAttrs?.group === "string"
+            ? { group: item.bindingAttrs.group }
+            : {}),
+        continues: item.continues,
+      })),
+  }
+}
+
 function useValue() {
   const value = useContext(Context)
   if (!value) throw new Error("Keymap.Provider is missing")
@@ -338,46 +407,45 @@ export const Keymap = {
   Provider,
   use,
   createLayer,
+  validateCommands: (commands?: readonly KeymapCommand[]) => void groupCommands(commands),
   useShortcuts,
   useShortcut,
   useLeaderActive,
   useCommands,
   usePendingSequence,
   useActiveKeys,
+  useState,
 } as const
 
 function createMode(keymap: OpenTuiKeymap) {
-  keymap.setData(MODE.key, MODE.base)
+  const [stack, setStack] = createSignal<
+    { readonly id: symbol; readonly mode: string; readonly enabled: Accessor<boolean> }[]
+  >([])
+  const current = createMemo(() => stack().findLast((item) => item.enabled())?.mode ?? MODE.base)
+  // Publish mode changes before another command can be dispatched in the same callback.
+  createComputed(() => keymap.setData(MODE.key, current()))
   const unregister = keymap.registerLayerFields({
     mode(value, context) {
       context.require(MODE.key, value)
     },
   })
-  const stack: { readonly id: symbol; readonly mode: string }[] = []
   let disposed = false
 
-  const update = () => keymap.setData(MODE.key, stack.at(-1)?.mode ?? MODE.base)
-
   return {
-    current() {
-      return stack.at(-1)?.mode ?? MODE.base
-    },
-    push(mode: string) {
+    current,
+    push(mode: string, enabled: Accessor<boolean>) {
       if (disposed) return () => {}
       const id = Symbol(mode)
-      stack.push({ id, mode })
-      update()
+      // Inactive scopes retain their stack position beneath any newer modes.
+      setStack((items) => [...items, { id, mode, enabled }])
       return () => {
-        const index = stack.findIndex((item) => item.id === id)
-        if (index < 0) return
-        stack.splice(index, 1)
-        update()
+        setStack((items) => items.filter((item) => item.id !== id))
       }
     },
     dispose() {
       if (disposed) return
       disposed = true
-      stack.length = 0
+      setStack([])
       unregister()
       keymap.setData(MODE.key, undefined)
     },

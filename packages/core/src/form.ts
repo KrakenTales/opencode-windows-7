@@ -1,9 +1,9 @@
-export * as Form from "./form"
+export * as Form from "./form.js"
 
-import { Form } from "@opencode-ai/schema/form"
+import { Form } from "@opencode/schema/form"
 import { Cache, Context, Deferred, Duration, Effect, Exit, Layer, Option, Schema } from "effect"
-import { makeLocationNode } from "./effect/app-node"
-import { EventV2 } from "./event"
+import { makeLocationNode } from "@opencode/util/effect/app-node"
+import { Bus } from "./bus.js"
 
 const RETENTION = Duration.minutes(10)
 
@@ -32,9 +32,9 @@ export type Answer = typeof Answer.Type
 export const Reply = Form.Reply
 export type Reply = typeof Reply.Type
 
-export const Event = Form.Event
+export { Event } from "@opencode/schema/form"
 
-export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("Form.NotFoundError", {
+export class NotFoundError extends Schema.TaggedError<NotFoundError>()("Form.NotFoundError", {
   id: ID,
 }) {
   override get message() {
@@ -42,7 +42,7 @@ export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("For
   }
 }
 
-export class AlreadySettledError extends Schema.TaggedErrorClass<AlreadySettledError>()("Form.AlreadySettledError", {
+export class AlreadySettledError extends Schema.TaggedError<AlreadySettledError>()("Form.AlreadySettledError", {
   id: ID,
 }) {
   override get message() {
@@ -50,7 +50,7 @@ export class AlreadySettledError extends Schema.TaggedErrorClass<AlreadySettledE
   }
 }
 
-export class AlreadyExistsError extends Schema.TaggedErrorClass<AlreadyExistsError>()("Form.AlreadyExistsError", {
+export class AlreadyExistsError extends Schema.TaggedError<AlreadyExistsError>()("Form.AlreadyExistsError", {
   id: ID,
 }) {
   override get message() {
@@ -58,12 +58,12 @@ export class AlreadyExistsError extends Schema.TaggedErrorClass<AlreadyExistsErr
   }
 }
 
-export class InvalidAnswerError extends Schema.TaggedErrorClass<InvalidAnswerError>()("Form.InvalidAnswerError", {
+export class InvalidAnswerError extends Schema.TaggedError<InvalidAnswerError>()("Form.InvalidAnswerError", {
   id: ID,
   message: Schema.String,
 }) {}
 
-export class InvalidFormError extends Schema.TaggedErrorClass<InvalidFormError>()("Form.InvalidFormError", {
+export class InvalidFormError extends Schema.TaggedError<InvalidFormError>()("Form.InvalidFormError", {
   message: Schema.String,
 }) {}
 
@@ -74,18 +74,23 @@ export interface ReplyInput {
   readonly answer: Answer
 }
 
+export interface CancelOptions {
+  readonly message?: string
+}
+
 export interface ListInput {
   readonly sessionID?: Form.Info["sessionID"]
 }
 
 export interface Interface {
+  readonly close: Effect.Effect<void>
   readonly create: (input: CreateInput) => Effect.Effect<Info, AlreadyExistsError | InvalidFormError>
   readonly ask: (input: CreateInput) => Effect.Effect<TerminalState, AlreadyExistsError | InvalidFormError>
   readonly get: (id: ID) => Effect.Effect<Info, NotFoundError>
   readonly list: (input?: ListInput) => Effect.Effect<ReadonlyArray<Info>>
   readonly state: (id: ID) => Effect.Effect<State, NotFoundError>
   readonly reply: (input: ReplyInput) => Effect.Effect<void, AlreadySettledError | InvalidAnswerError | NotFoundError>
-  readonly cancel: (id: ID) => Effect.Effect<void, AlreadySettledError | NotFoundError>
+  readonly cancel: (id: ID, options?: CancelOptions) => Effect.Effect<void, AlreadySettledError | NotFoundError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Form") {}
@@ -99,7 +104,8 @@ interface Entry {
 export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const events = yield* EventV2.Service
+    const bus = yield* Bus.Service
+    let closed = false
     const forms = yield* Cache.makeWith<ID, Entry>(
       () => Effect.die(new Error("Form cache must be used via set/getSuccess, never get")),
       {
@@ -109,16 +115,11 @@ export const layer = Layer.effect(
       },
     )
 
-    const find = Effect.fn("Form.find")(function* (id: ID) {
-      return yield* Cache.getSuccess(forms, id).pipe(
-        Effect.flatMap((entry) =>
-          Option.match(entry, {
-            onNone: () => Effect.fail(new NotFoundError({ id })),
-            onSome: Effect.succeed,
-          }),
-        ),
-      )
-    })
+    const requireEntry = Effect.fn("Form.requireEntry")((id: ID) =>
+      Cache.getSuccess(forms, id).pipe(
+        Effect.flatMap((entry) => Effect.fromOption(entry, () => new NotFoundError({ id }))),
+      ),
+    )
 
     const create = Effect.fn("Form.create")((input: CreateInput) =>
       Effect.uninterruptible(
@@ -141,7 +142,8 @@ export const layer = Layer.effect(
             deferred: yield* Deferred.make<TerminalState>(),
           }
           yield* Cache.set(forms, id, entry)
-          yield* events.publish(Event.Created, { form }).pipe(Effect.onError(() => Cache.invalidate(forms, id)))
+          yield* bus.publish(Form.Event.Created, { form }).pipe(Effect.onError(() => Cache.invalidate(forms, id)))
+          if (closed) yield* cancel(id).pipe(Effect.orDie)
           return form
         }),
       ),
@@ -151,7 +153,7 @@ export const layer = Layer.effect(
       Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
           const form = yield* create(input)
-          const entry = yield* find(form.id).pipe(Effect.orDie)
+          const entry = yield* requireEntry(form.id).pipe(Effect.orDie)
           return yield* restore(Deferred.await(entry.deferred)).pipe(
             Effect.onInterrupt(() => Effect.ignore(cancel(form.id))),
           )
@@ -160,7 +162,7 @@ export const layer = Layer.effect(
     )
 
     const get = Effect.fn("Form.get")(function* (id: ID) {
-      return (yield* find(id)).form
+      return (yield* requireEntry(id)).form
     })
 
     const list = Effect.fn("Form.list")(function* (input?: ListInput) {
@@ -172,63 +174,70 @@ export const layer = Layer.effect(
     })
 
     const state = Effect.fn("Form.state")(function* (id: ID) {
-      return (yield* find(id)).state
+      return (yield* requireEntry(id)).state
     })
 
     const reply = Effect.fn("Form.reply")((input: ReplyInput) =>
       Effect.uninterruptible(
         Effect.gen(function* () {
-          const entry = yield* find(input.id)
+          const entry = yield* requireEntry(input.id)
           if (entry.state.status !== "pending") return yield* new AlreadySettledError({ id: input.id })
-          const invalid = validateAnswer(entry.form, input.answer)
+          const invalid = validateAnswer(entry.form.fields, input.answer)
           if (invalid) return yield* new InvalidAnswerError({ id: input.id, message: invalid })
           const next: TerminalState = { status: "answered", answer: input.answer }
-          yield* events.publish(Event.Replied, { id: input.id, sessionID: entry.form.sessionID, answer: input.answer })
+          yield* bus.publish(Form.Event.Replied, {
+            id: input.id,
+            sessionID: entry.form.sessionID,
+            answer: input.answer,
+          })
           yield* Cache.set(forms, input.id, { ...entry, state: next })
           yield* Deferred.succeed(entry.deferred, next)
         }),
       ),
     )
 
-    const cancel = Effect.fn("Form.cancel")((id: ID) =>
+    const cancel = Effect.fn("Form.cancel")((id: ID, options?: CancelOptions) =>
       Effect.uninterruptible(
         Effect.gen(function* () {
-          const entry = yield* find(id)
+          const entry = yield* requireEntry(id)
           if (entry.state.status !== "pending") return yield* new AlreadySettledError({ id })
-          const next: TerminalState = { status: "cancelled" }
-          yield* events.publish(Event.Cancelled, { id, sessionID: entry.form.sessionID })
+          const next: TerminalState = {
+            status: "cancelled",
+            ...(options?.message === undefined ? {} : { message: options.message }),
+          }
+          yield* bus.publish(Form.Event.Cancelled, { id, sessionID: entry.form.sessionID })
           yield* Cache.set(forms, id, { ...entry, state: next })
           yield* Deferred.succeed(entry.deferred, next)
         }),
       ),
     )
 
-    yield* Effect.addFinalizer(() =>
-      Cache.values(forms).pipe(
-        Effect.flatMap((entries) =>
-          Effect.forEach(
-            Array.from(entries).filter((entry) => entry.state.status === "pending"),
-            (entry) => cancel(entry.form.id).pipe(Effect.ignore),
-            { discard: true },
-          ),
+    const close = Effect.sync(() => {
+      closed = true
+    }).pipe(
+      Effect.andThen(Cache.values(forms)),
+      Effect.flatMap((entries) =>
+        Effect.forEach(
+          Array.from(entries).filter((entry) => entry.state.status === "pending"),
+          (entry) => cancel(entry.form.id).pipe(Effect.ignore),
+          { discard: true },
         ),
       ),
     )
+    yield* Effect.addFinalizer(() => close)
 
-    return Service.of({ create, ask, get, list, state, reply, cancel })
+    return Service.of({ create, ask, get, list, state, reply, cancel, close })
   }),
 )
 
-export const locationLayer = layer
+export const node = makeLocationNode({ service: Service, layer, deps: [Bus.node] })
 
-export const node = makeLocationNode({ service: Service, layer, deps: [EventV2.node] })
-
-function validateAnswer(form: Info, answer: Answer) {
-  const fields = new Map(form.fields.map((field) => [field.key, field] as const))
+export function validateAnswer(form: ReadonlyArray<Form.Field>, answer: Answer) {
+  const fields = new Map(form.map((field) => [field.key, field] as const))
   for (const key of Object.keys(answer)) {
     if (!fields.has(key)) return `Unknown form field: ${key}`
   }
-  for (const field of form.fields) {
+  for (const field of form) {
     const value = answer[field.key]
     if (field.type === "external") {
       if (value !== true) return `External form field must be acknowledged: ${field.key}`
@@ -264,7 +273,7 @@ function matches(when: Form.When, value: Form.Value | undefined) {
 // carry a value matching that field's type, and use a declared option when the field's options
 // are closed. Rejecting these at creation surfaces authoring mistakes to the caller instead of
 // silently never matching.
-function validateFields(fields: ReadonlyArray<Form.Field>) {
+export function validateFields(fields: ReadonlyArray<Form.Field>) {
   if (fields.length === 0) return "Form must have at least one field"
   const earlier = new Map<string, InputField>()
   const keys = new Set<string>()
@@ -314,7 +323,7 @@ function validateField(field: InputField, value: Form.Value): string | undefined
     }
     if (field.format === "email" && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value))
       return `Expected email for form field: ${field.key}`
-    if (field.format === "uri" && !isUri(value)) return `Expected URI for form field: ${field.key}`
+    if (field.format === "uri" && !URL.canParse(value)) return `Expected URI for form field: ${field.key}`
     if (field.format === "date" && !isDate(value)) return `Expected date for form field: ${field.key}`
     if (field.format === "date-time" && !isDateTime(value)) return `Expected date-time for form field: ${field.key}`
     if (field.options && !field.custom && !field.options.some((option) => option.value === value)) {
@@ -348,15 +357,6 @@ function validateField(field: InputField, value: Form.Value): string | undefined
 
 function isStringArray(value: Form.Value): value is ReadonlyArray<string> {
   return Array.isArray(value) && value.every((item): item is string => typeof item === "string")
-}
-
-function isUri(value: string) {
-  try {
-    new URL(value)
-    return true
-  } catch {
-    return false
-  }
 }
 
 function isDate(value: string) {

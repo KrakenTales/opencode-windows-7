@@ -1,4 +1,13 @@
-import { LLM, Message, ToolCallPart, ToolDefinition, ToolResultPart, type ContentPart, type Model } from "../src"
+import {
+  LLM,
+  Media,
+  Message,
+  ToolCallPart,
+  ToolDefinition,
+  ToolResultPart,
+  type ContentPart,
+  type LanguageModel,
+} from "../src/effect.js"
 
 export const basicContinuation = ["system", "user-text", "assistant-text", "user-follow-up"] as const
 export const toolContinuation = ["tool-call", "tool-result"] as const
@@ -40,7 +49,7 @@ export const continuationTool = ToolDefinition.make({
 
 export function continuationRequest(input: {
   readonly id: string
-  readonly model: Model
+  readonly model: LanguageModel
   readonly features: ReadonlyArray<ContinuationFeature>
   readonly image?: string
 }) {
@@ -51,7 +60,7 @@ export function continuationRequest(input: {
 
   if (features.has("user-text")) firstUser.push({ type: "text", text: "What is shown here?" })
   if (features.has("user-image"))
-    firstUser.push({ type: "media", mediaType: "image/png", data: input.image ?? "AAECAw==" })
+    firstUser.push({ type: "media", media: Media.base64(input.image ?? "AAECAw==", "image/png") })
   if (firstUser.length > 0) messages.push(Message.user(firstUser))
 
   if (features.has("assistant-reasoning"))
@@ -97,7 +106,7 @@ export function continuationRequest(input: {
     tools: features.has("tool-call") ? [continuationTool] : [],
     cache: "none",
     providerOptions: features.has("encrypted-reasoning")
-      ? { openai: { store: false, include: ["reasoning.encrypted_content"], reasoningSummary: "auto" } }
+      ? { store: false, include: ["reasoning.encrypted_content"], reasoningSummary: "auto" }
       : undefined,
     generation: { maxTokens: 80, temperature: 0 },
   })

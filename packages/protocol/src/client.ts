@@ -1,17 +1,18 @@
-import { InvalidRequestError, SessionNotFoundError } from "./errors.js"
+import { LocationNotFoundError, InvalidRequestError, SessionNotFoundError } from "./errors.js"
 import { makeDefaultApi } from "./api.js"
 import type { Api } from "./api.js"
 import type { Context } from "effect"
-import { HttpApiMiddleware } from "effect/unstable/httpapi"
+import { HttpApiMiddleware } from "effect/http-api"
 import type { EventGroup } from "./groups/event.js"
 
 class LocationMiddleware extends HttpApiMiddleware.Service<LocationMiddleware>()(
-  "@opencode-ai/client/LocationMiddleware",
+  "@opencode/client/LocationMiddleware",
+  { error: [LocationNotFoundError] },
 ) {}
 
 class SessionLocationMiddleware extends HttpApiMiddleware.Service<SessionLocationMiddleware>()(
-  "@opencode-ai/client/SessionLocationMiddleware",
-  { error: [InvalidRequestError, SessionNotFoundError] },
+  "@opencode/client/SessionLocationMiddleware",
+  { error: [InvalidRequestError, SessionNotFoundError, LocationNotFoundError] },
 ) {}
 
 type ClientApiShape = Api<
@@ -33,9 +34,9 @@ export const ClientApi: ClientApiShape = makeDefaultApi({
 })
 
 export const groupNames = {
-  "server.health": "health",
   "server.server": "server",
   "server.debug": "debug",
+  "server.migration": "migration",
   "server.location": "location",
   "server.agent": "agent",
   "server.plugin": "plugin",
@@ -43,24 +44,42 @@ export const groupNames = {
   "server.message": "message",
   "server.model": "model",
   "server.generate": "generate",
+  "server.voice": "voice",
   "server.provider": "provider",
   "server.integration": "integration",
+  "server.websearch": "websearch",
+  "server.usage": "usage",
   "server.credential": "credential",
   "server.form": "form",
   "server.permission": "permission",
   "server.fs": "file",
   "server.command": "command",
   "server.skill": "skill",
+  "server.rpc": "rpc",
   "server.event": "event",
   "server.pty": "pty",
+  "server.experimental": "experimental",
   "server.shell": "shell",
   "server.mcp": "mcp",
-  "server.question": "question",
   "server.reference": "reference",
   "server.project": "project",
-  "server.projectCopy": "projectCopy",
+  "server.worktree": "worktree",
   "server.vcs": "vcs",
+  "server.config": "config",
 } as const
 
-export const promiseOmitEndpoints = new Set(["pty.connect", "pty.connectToken"])
-export const effectOmitEndpoints = new Set(["fs.read", "pty.connect", "pty.connectToken"])
+export const promiseOmitEndpoints = new Set([
+  "pty.connect",
+  "persistentPty.connect",
+  "mcp.client",
+  "generate.textLegacy",
+])
+export const effectOmitEndpoints = new Set([
+  "fs.read",
+  "fs.write",
+  "media.get",
+  "pty.connect",
+  "persistentPty.connect",
+  "mcp.client",
+  "generate.textLegacy",
+])

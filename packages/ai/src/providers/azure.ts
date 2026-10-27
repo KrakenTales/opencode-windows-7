@@ -1,55 +1,81 @@
-import { Auth } from "../route/auth"
-import { type AtLeastOne, type ProviderAuthOption } from "../route/auth-options"
-import type { Route as RouteDef, RouteDefaultsInput } from "../route/client"
-import type { ProviderPackage } from "../provider-package"
-import { ProviderID, type ModelID } from "../schema"
-import * as OpenAIChat from "../protocols/openai-chat"
-import * as OpenAIResponses from "../protocols/openai-responses"
-import { withOpenAIOptions, type OpenAIProviderOptionsInput } from "./openai-options"
+import { Auth } from "../route/auth.js"
+import { type AtLeastOne, type ProviderAuthOption } from "../route/auth-options.js"
+import type { Route, RouteDefaultsInput, CompactionOperations } from "../route/client.js"
+import { Endpoint } from "../route/endpoint.js"
+import type { ProviderPackage } from "../provider-package.js"
+import { MediaRoute } from "../route/media.js"
+import {
+  HttpOptions,
+  ProviderConfigurationError,
+  ProviderID,
+  mergeHttpOptions,
+  type ModelID,
+  type ProviderOptions,
+} from "../schema/index.js"
+import { OpenAIImages } from "../protocols/openai-images.js"
+import * as OpenAIChat from "../protocols/openai-chat.js"
+import * as OpenAIResponses from "../protocols/openai-responses.js"
+import { withOpenAIOptions, type OpenAIProviderOptionsInput } from "./openai-options.js"
 
 export const id = ProviderID.make("azure")
 const routeAuth = Auth.remove("authorization")
+const RESPONSES_WEBSOCKET_ROTATE_AFTER_MS = 55 * 60 * 1000
 
 // Azure needs the customer's resource URL; supply either `resourceName`
 // (helper builds the URL) or `baseURL` directly.
 type AzureURL = AtLeastOne<{ readonly resourceName: string; readonly baseURL: string }>
 
-export type ModelOptions = AzureURL &
+export type LanguageModelOptions = AzureURL &
   RouteDefaultsInput &
   ProviderAuthOption<"optional"> & {
     readonly apiVersion?: string
     readonly queryParams?: Record<string, string>
-    readonly useCompletionUrls?: boolean
+    readonly useDeploymentBasedUrls?: boolean
     readonly providerOptions?: OpenAIProviderOptionsInput
   }
-export type Config = ModelOptions
+export type Config = LanguageModelOptions
 
 export type Settings = ProviderPackage.Settings &
+  OpenAIProviderOptionsInput &
   AzureURL & {
     readonly apiKey?: string
     readonly apiVersion?: string
     readonly queryParams?: Readonly<Record<string, string>>
-    readonly providerOptions?: OpenAIProviderOptionsInput
+    readonly useDeploymentBasedUrls?: boolean
   }
 
-const resourceBaseURL = (resourceName: string) => `https://${resourceName.trim()}.openai.azure.com/openai/v1`
+const resourceBaseURL = (resourceName: string) => `https://${resourceName.trim()}.openai.azure.com/openai`
 
 const responsesRoute = OpenAIResponses.route.with({
+  compact: { endpoint: OpenAIResponses.route.compact.endpoint },
   id: "azure-openai-responses",
   provider: id,
   auth: routeAuth,
-  endpoint: {
-    query: { "api-version": "v1" },
-  },
+  transport: OpenAIResponses.channelTransport({
+    id: "azure-openai-responses",
+    name: "Azure OpenAI Responses",
+    rotateAfterMs: RESPONSES_WEBSOCKET_ROTATE_AFTER_MS,
+    enabled: (value) => {
+      const url = new URL(value)
+      return (
+        url.protocol === "https:" &&
+        url.hostname.endsWith(".openai.azure.com") &&
+        url.pathname.endsWith("/openai/v1/responses") &&
+        url.searchParams.get("api-version") === "v1"
+      )
+    },
+    url: (value) => {
+      const url = new URL(value)
+      url.searchParams.delete("api-version")
+      return url.toString()
+    },
+  }),
 })
 
 const chatRoute = OpenAIChat.route.with({
   id: "azure-openai-chat",
   provider: id,
   auth: routeAuth,
-  endpoint: {
-    query: { "api-version": "v1" },
-  },
 })
 
 export const routes = [responsesRoute, chatRoute]
@@ -59,7 +85,7 @@ const defaults = (input: Config) => {
     apiKey: _,
     apiVersion: _apiVersion,
     resourceName: _resourceName,
-    useCompletionUrls: _useCompletionUrls,
+    useDeploymentBasedUrls: _useDeploymentBasedUrls,
     baseURL: _baseURL,
     queryParams: _queryParams,
     ...rest
@@ -80,35 +106,61 @@ const auth = (input: Config) => {
   )
 }
 
-const configuredRoute = <Body, Prepared>(route: RouteDef<Body, Prepared>, input: Config) =>
+const configuredRoute = <Body, Prepared, Compact extends CompactionOperations | undefined>(
+  route: Route<Body, Prepared, Compact>,
+  input: Config,
+  modelID: string | ModelID,
+) =>
   route.with({
     auth: auth(input),
-    endpoint: {
-      // AtLeastOne guarantees at least one is set; baseURL wins if both are.
-      baseURL: input.baseURL ?? resourceBaseURL(input.resourceName!),
-      query: {
-        ...(input.apiVersion ? { "api-version": input.apiVersion } : {}),
-        ...input.queryParams,
-      },
-    },
+    endpoint: endpoint(input, modelID),
   })
 
+function endpoint(input: Config, modelID: string | ModelID) {
+  const baseURL = Endpoint.trimBaseUrl(input.baseURL ?? resourceBaseURL(input.resourceName!))
+  const query = { "api-version": input.apiVersion ?? "v1", ...input.queryParams }
+
+  if (input.useDeploymentBasedUrls) return { baseURL: `${baseURL}/deployments/${modelID}`, query }
+  if (input.baseURL !== undefined && !new URL(input.baseURL).hostname.endsWith(".openai.azure.com")) {
+    return { baseURL, query: input.queryParams }
+  }
+  return { baseURL: `${baseURL}/v1`, query }
+}
+
 export const configure = (input: Config) => {
-  const configuredResponsesRoute = configuredRoute(responsesRoute, input)
-  const configuredChatRoute = configuredRoute(chatRoute, input)
   const modelDefaults = defaults(input)
 
   const responses = (modelID: string | ModelID) =>
-    configuredResponsesRoute.with(withOpenAIOptions(modelID, modelDefaults)).model({ id: modelID })
+    configuredRoute(responsesRoute, input, modelID)
+      .with(withOpenAIOptions(modelID, modelDefaults))
+      .model<OpenAIProviderOptionsInput>({ id: modelID })
 
   const chat = (modelID: string | ModelID) =>
-    configuredChatRoute.with(withOpenAIOptions(modelID, modelDefaults)).model({ id: modelID })
+    configuredRoute(chatRoute, input, modelID)
+      .with(withOpenAIOptions(modelID, modelDefaults))
+      .model<OpenAIProviderOptionsInput>({ id: modelID, compatibility: { supportsPromptCacheKey: true } })
+
+  const image = (modelID: string | ModelID, providerOptions?: ProviderOptions) => {
+    const target = endpoint(input, modelID)
+    const media = MediaRoute.deployment({ ...input, baseURL: target.baseURL }, auth(input))
+    return OpenAIImages.model({
+      ...media,
+      id: modelID,
+      provider: id,
+      providerOptions,
+      http: mergeHttpOptions(
+        media.http,
+        target.query === undefined ? undefined : new HttpOptions({ query: target.query }),
+      ),
+    })
+  }
 
   return {
     id,
-    model: (modelID: string | ModelID) => (input.useCompletionUrls === true ? chat(modelID) : responses(modelID)),
+    model: responses,
     responses,
     chat,
+    image,
     configure,
   }
 }
@@ -118,23 +170,42 @@ export const provider = {
   configure,
 }
 
-const config = (settings: Settings): Config => {
+const config = ({
+  apiKey,
+  apiVersion,
+  baseURL,
+  body,
+  headers,
+  queryParams,
+  resourceName,
+  useDeploymentBasedUrls,
+  ...providerOptions
+}: Settings): Config => {
   const common = {
-    apiKey: settings.apiKey,
-    apiVersion: settings.apiVersion,
-    headers: settings.headers === undefined ? undefined : { ...settings.headers },
-    http: settings.body === undefined ? undefined : { body: { ...settings.body } },
-    limits: settings.limits,
-    providerOptions: settings.providerOptions,
-    queryParams: settings.queryParams === undefined ? undefined : { ...settings.queryParams },
+    apiKey,
+    apiVersion,
+    headers,
+    http: body === undefined ? undefined : { body },
+    providerOptions,
+    queryParams,
+    useDeploymentBasedUrls,
   }
-  if (settings.baseURL !== undefined) return { ...common, baseURL: settings.baseURL }
-  if (settings.resourceName !== undefined) return { ...common, resourceName: settings.resourceName }
-  throw new Error("Azure requires resourceName or baseURL")
+  if (baseURL !== undefined) return { ...common, baseURL }
+  if (resourceName !== undefined) return { ...common, resourceName }
+  throw new ProviderConfigurationError({ provider: id, message: "Azure requires resourceName or baseURL" })
 }
 
-export const responsesModel: ProviderPackage.Definition<Settings>["model"] = (modelID, settings) =>
-  configure(config(settings)).responses(modelID)
-export const chatModel: ProviderPackage.Definition<Settings>["model"] = (modelID, settings) =>
-  configure(config(settings)).chat(modelID)
+export const responsesModel: ProviderPackage.Definition<
+  Settings,
+  OpenAIProviderOptionsInput,
+  typeof responsesRoute.compact
+>["model"] = (modelID, settings) => configure(config(settings)).responses(modelID)
+export const chatModel: ProviderPackage.Definition<Settings, OpenAIProviderOptionsInput>["model"] = (
+  modelID,
+  settings,
+) => configure(config(settings)).chat(modelID)
+export const imageModel = (modelID: string, settings: Settings) => {
+  const input = config(settings)
+  return configure(input).image(modelID, input.providerOptions)
+}
 export const model = responsesModel

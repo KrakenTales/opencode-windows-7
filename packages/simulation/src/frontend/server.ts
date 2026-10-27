@@ -1,25 +1,22 @@
-import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { Effect } from "effect"
 import { SimulationControlServer } from "../control-server"
 import { SimulationProtocol } from "../protocol"
 import { SimulationActions, type Harness } from "./actions"
 import { SimulationRenderer } from "./renderer"
 
-function handle(harness: Harness, request: SimulationProtocol.Frontend.Request) {
+function handle(harness: Harness, request: SimulationProtocol.Frontend.Request, version: string) {
   switch (request.method) {
     case "simulation.handshake":
       return SimulationProtocol.Handshake.dispatch(
         {
           role: "ui",
-          server: { name: "opencode", version: InstallationVersion },
+          server: { name: "opencode", version },
           capabilities: SimulationProtocol.Frontend.Capabilities,
         },
         request.params,
       )
     case "ui.capture":
       return SimulationActions.capture(harness)
-    case "ui.screenshot":
-      return SimulationActions.screenshot(harness, request.params?.name)
     case "ui.state":
       return Effect.sync(() => SimulationActions.state(harness))
     case "ui.snapshot":
@@ -50,6 +47,8 @@ function handle(harness: Harness, request: SimulationProtocol.Frontend.Request) 
         y: request.params.y,
         semantic: request.params.semantic,
       })
+    case "ui.mouse":
+      return SimulationActions.execute(harness, { type: "ui.mouse", params: request.params })
     case "ui.resize":
       return SimulationActions.execute(harness, {
         type: "ui.resize",
@@ -59,13 +58,17 @@ function handle(harness: Harness, request: SimulationProtocol.Frontend.Request) 
   }
 }
 
-export const start = Effect.fn("SimulationServer.start")(function* (harness: Harness, endpoint: string) {
+export const start = Effect.fn("SimulationServer.start")(function* (
+  harness: Harness,
+  endpoint: string,
+  version = "unknown",
+) {
   return yield* SimulationControlServer.start({
     endpoint,
     label: "opencode drive ui websocket",
     data: () => ({ drive: true as const }),
     decode: SimulationProtocol.Frontend.decodeRequestEffect,
-    handle: (_socket, request) => handle(harness, request),
+    handle: (_socket, request) => handle(harness, request, version),
   })
 })
 

@@ -1,14 +1,14 @@
-export * as SkillInstructions from "./instructions"
+export * as SkillInstructions from "./instructions.js"
 
-import { makeLocationNode } from "../effect/app-node"
+import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { Context, Effect, Layer, Schema } from "effect"
-import { AgentV2 } from "../agent"
-import { SkillV2 } from "../skill"
-import { Instructions } from "../instructions/index"
+import { Permission } from "../permission.js"
+import { Skill } from "../skill.js"
+import { Instructions } from "../instructions/index.js"
 
 const Summary = Schema.Struct({
-  id: SkillV2.ID,
-  name: SkillV2.Name,
+  id: Skill.ID,
+  name: Skill.Name,
   description: Schema.String,
 })
 type Summary = typeof Summary.Type
@@ -26,6 +26,7 @@ const render = (skills: ReadonlyArray<Summary>) =>
   [
     "Skills provide specialized instructions and workflows for specific tasks.",
     "Use the skill tool to load a skill when a task matches its description.",
+    "The user may also invoke a skill directly. When that happens, its instructions appear in the conversation as a <skill_content> block, the same shape the skill tool returns. A skill that is already present this way does not need to be invoked again.",
     ...(skills.length === 0
       ? ["No skills are currently available."]
       : ["<available_skills>", ...entries(skills), "</available_skills>"]),
@@ -38,8 +39,8 @@ const update = (previous: ReadonlyArray<Summary>, current: ReadonlyArray<Summary
     (skill) => skill.id,
     (before, after) => before.name !== after.name || before.description !== after.description,
   )
-  // Additions and removals render as small deltas; anything else restates the full list.
-  if (diff.changed.length > 0 || (diff.added.length === 0 && diff.removed.length === 0))
+  // Added, changed, and removed skills render as deltas; the full list is restated only when no entry differs.
+  if (diff.added.length === 0 && diff.changed.length === 0 && diff.removed.length === 0)
     return [
       "The available skills have changed. This list supersedes the previous available skills list.",
       render(current),
@@ -48,6 +49,12 @@ const update = (previous: ReadonlyArray<Summary>, current: ReadonlyArray<Summary
     ...(diff.added.length === 0
       ? []
       : ["New skills are available in addition to those previously listed:", ...entries(diff.added)]),
+    ...(diff.changed.length === 0
+      ? []
+      : [
+          "The following skills have changed. Each entry replaces the previously listed skill with the same ID:",
+          ...entries(diff.changed.map((change) => change.current)),
+        ]),
     ...(diff.removed.length === 0
       ? []
       : [
@@ -57,22 +64,20 @@ const update = (previous: ReadonlyArray<Summary>, current: ReadonlyArray<Summary
 }
 
 export interface Interface {
-  readonly load: (agent: AgentV2.Selection) => Effect.Effect<Instructions.Instructions>
+  /** Lists skills the given ruleset does not deny; callers pass the merged agent and Session permissions. */
+  readonly load: (permissions: Permission.Ruleset) => Effect.Effect<Instructions.List>
 }
 
-export class Service extends Context.Service<Service, Interface>()("@opencode/v2/SkillInstructions") {}
+export class Service extends Context.Service<Service, Interface>()("@opencode/SkillInstructions") {}
 
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const skills = yield* SkillV2.Service
+    const skills = yield* Skill.Service
 
     return Service.of({
-      load: Effect.fn("SkillInstructions.load")(function* (selection) {
-        const agent = selection.info
-        if (!agent) return Instructions.empty
-        const permitted = SkillV2.available(yield* skills.list(), agent)
-        const available = permitted
+      load: Effect.fn("SkillInstructions.load")(function* (permissions) {
+        const available = Skill.available(yield* skills.list(), permissions)
           .flatMap((skill) =>
             skill.description === undefined || skill.autoinvoke === false
               ? []
@@ -94,4 +99,4 @@ const layer = Layer.effect(
   }),
 )
 
-export const node = makeLocationNode({ service: Service, layer, deps: [SkillV2.node] })
+export const node = makeLocationNode({ service: Service, layer, deps: [Skill.node] })

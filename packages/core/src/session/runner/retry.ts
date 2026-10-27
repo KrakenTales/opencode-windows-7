@@ -1,66 +1,78 @@
-export * as SessionRunnerRetry from "./retry"
+export * as SessionRunnerRetry from "./retry.js"
 
-import { LLMError } from "@opencode-ai/ai"
-import { SessionError } from "@opencode-ai/schema/session-error"
-import { Data, Duration, Effect, Schedule } from "effect"
-import { EventV2 } from "../../event"
-import { SessionEvent } from "../event"
-import { SessionMessage } from "../message"
-import { SessionSchema } from "../schema"
-import type { SessionRunner } from "./index"
+import { AIError, isRetryable } from "@opencode/ai/effect"
+import { Agent } from "@opencode/schema/agent"
+import { Model } from "@opencode/schema/model"
+import { SessionError } from "@opencode/schema/session-error"
+import { Clock, Duration, Effect } from "effect"
+import { Bus } from "../../bus.js"
+import { ModelRetry } from "../../model-retry.js"
+import type { PluginHooks } from "../../plugin/hooks.js"
+import { SessionEvent } from "../event.js"
+import { SessionMessage } from "../message.js"
+import { SessionSchema } from "../schema.js"
 
-export class RetryableFailure extends Data.TaggedError("SessionRunner.RetryableFailure")<{
-  readonly cause: LLMError
-  readonly assistantMessageID: SessionMessage.ID
+export { isRetryable }
+
+interface Input {
+  readonly cause: AIError
   readonly error: SessionError.Error
-  readonly step: number
-}> {}
-
-export function isRetryable(error: LLMError) {
-  switch (error.reason._tag) {
-    case "RateLimit":
-    case "ProviderInternal":
-    case "Transport":
-      return true
-    case "Authentication":
-    case "QuotaExceeded":
-    case "ContentPolicy":
-    case "InvalidProviderOutput":
-    case "InvalidRequest":
-    case "NoRoute":
-    case "UnknownProvider":
-      return false
-    default: {
-      const exhaustive: never = error.reason
-      return exhaustive
-    }
-  }
+  readonly agent: Agent.ID
+  readonly model: Model.Ref
+  readonly hook: (event: PluginHooks.Domains["session"]["retry"]) => Effect.Effect<void>
+  readonly retry: boolean
 }
 
-const retryAfter = (failure: RetryableFailure) => {
-  if (failure.cause.reason._tag === "RateLimit" || failure.cause.reason._tag === "ProviderInternal")
-    return failure.cause.reason.retryAfterMs
-  return undefined
+export interface Decision {
+  readonly retry: true
+  readonly attempt: number
+  readonly delay: number
 }
 
-export const schedule = (events: EventV2.Interface, sessionID: SessionSchema.ID) =>
-  Schedule.max([Schedule.exponential("2 seconds"), Schedule.recurs(4)]).pipe(
-    Schedule.setInputType<RetryableFailure | SessionRunner.RunError>(),
-    Schedule.passthrough,
-    Schedule.while(({ input }) => input instanceof RetryableFailure),
-    Schedule.modifyDelay(({ input: failure, duration: delay }) => {
-      const minimum = failure instanceof RetryableFailure ? retryAfter(failure) : undefined
-      return Effect.succeed(minimum === undefined ? delay : Duration.max(delay, Duration.millis(minimum)))
-    }),
-    Schedule.tap((metadata) =>
-      metadata.input instanceof RetryableFailure
-        ? events.publish(SessionEvent.RetryScheduled, {
-            sessionID,
-            assistantMessageID: metadata.input.assistantMessageID,
-            attempt: metadata.attempt + 1,
-            at: metadata.now + Duration.toMillis(metadata.duration),
-            error: metadata.input.error,
-          })
-        : Effect.void,
-    ),
-  )
+export const policy = (sessionID: SessionSchema.ID) =>
+  Effect.gen(function* () {
+    const decide = yield* ModelRetry.policy
+    return (input: Input) =>
+      Effect.gen(function* () {
+        const next = yield* decide(input)
+        if (!next) return { retry: false as const }
+        const event: PluginHooks.Domains["session"]["retry"] = {
+          sessionID,
+          agent: input.agent,
+          model: input.model,
+          error: input.error,
+          attempt: next.attempt,
+          decision: next.retry ? { retry: true, delay: next.delay } : { retry: false },
+        }
+        yield* input.hook(event)
+        if (!event.decision.retry) return event.decision
+        const normalized =
+          Number.isFinite(event.decision.delay) && event.decision.delay >= 0
+            ? Math.ceil(event.decision.delay)
+            : next.delay
+        return { retry: true as const, attempt: next.attempt, delay: normalized }
+      })
+  })
+
+export const make = (bus: Bus.Interface, sessionID: SessionSchema.ID) =>
+  Effect.gen(function* () {
+    const decide = yield* policy(sessionID)
+    const wait = (input: {
+      readonly decision: Decision
+      readonly assistantMessageID: SessionMessage.ID
+      readonly error: SessionError.Error
+    }) =>
+      Effect.gen(function* () {
+        const scheduled = yield* Clock.currentTimeMillis
+        yield* bus.publish(SessionEvent.RetryScheduled, {
+          sessionID,
+          assistantMessageID: input.assistantMessageID,
+          attempt: input.decision.attempt,
+          at: scheduled + input.decision.delay,
+          error: input.error,
+        })
+        const remaining = Math.max(0, scheduled + input.decision.delay - (yield* Clock.currentTimeMillis))
+        yield* Effect.sleep(Duration.millis(remaining))
+      })
+    return { decide, wait }
+  })

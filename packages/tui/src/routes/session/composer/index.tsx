@@ -1,4 +1,4 @@
-import { createEffect, createMemo, For, onCleanup, Show, useContext, createContext } from "solid-js"
+import { createEffect, createMemo, For, onCleanup, Show } from "solid-js"
 import { createStore } from "solid-js/store"
 import { TextAttributes } from "@opentui/core"
 import { useTheme } from "../../../context/theme"
@@ -6,43 +6,23 @@ import { SplitBorder } from "../../../ui/border"
 import { Keymap } from "../../../context/keymap"
 import { SubagentsTab } from "./subagents-tab"
 import { ShellTab } from "./shell-tab"
-
-export interface ComposerHint {
-  label: string
-  shortcut: string
-}
-
-interface Tab {
-  id: string
-  label: string
-  hints?: () => ComposerHint[]
-  onClose?: () => void
-}
-
-const ComposerContext = createContext<{
-  register: (tab: Tab) => () => void
-  active: (id: string) => boolean
-  close: () => void
-}>()
-
-export function useComposerTab() {
-  const ctx = useContext(ComposerContext)
-  if (!ctx) throw new Error("useComposerTab must be used within a Composer")
-  return ctx
-}
+import { TerminalsTab } from "./terminals-tab"
+import { ComposerContext, type ComposerTab } from "./context"
 
 export type ComposerProps = {
   sessionID: string
   open: boolean
   defaultTab?: string
   onClose?: () => void
+  terminals?: boolean
+  visibleTerminalID?: string
 }
 
 export function Composer(props: ComposerProps) {
-  const { themeV2 } = useTheme().contextual("elevated")
+  const theme = useTheme()
 
   const [store, setStore] = createStore({
-    tabs: {} as Record<string, Tab>,
+    tabs: {} as Record<string, ComposerTab>,
     active: "",
   })
 
@@ -60,13 +40,11 @@ export function Composer(props: ComposerProps) {
   })
 
   function close() {
-    const tab = activeTab()
-    tab?.onClose?.()
     props.onClose?.()
   }
 
   const ctx = {
-    register(tab: Tab) {
+    register(tab: ComposerTab) {
       setStore("tabs", tab.id, tab)
       if (!store.active) setStore("active", tab.id)
       return () => setStore("tabs", tab.id, undefined!)
@@ -94,16 +72,12 @@ export function Composer(props: ComposerProps) {
   Keymap.createLayer(() => ({
     mode: "composer",
     enabled: () => props.open,
+    priority: 1,
     commands: [
       { bind: "left", title: "Previous tab", group: "Composer", run: () => switchTab(-1) },
       { bind: "right", title: "Next tab", group: "Composer", run: () => switchTab(1) },
       { bind: "escape", title: "Close composer", group: "Composer", run: close },
-      {
-        bind: "<leader>down",
-        title: "Toggle composer",
-        group: "Composer",
-        run: close,
-      },
+      { bind: "ctrl+c", title: "Close composer", group: "Composer", run: close },
     ],
   }))
 
@@ -113,8 +87,8 @@ export function Composer(props: ComposerProps) {
         <box
           {...SplitBorder}
           border={["left"]}
-          borderColor={themeV2.border()}
-          backgroundColor={themeV2.background()}
+          borderColor={theme.border.base}
+          backgroundColor={theme.background.raised.base}
           paddingLeft={1}
           paddingRight={2}
           paddingTop={1}
@@ -125,7 +99,7 @@ export function Composer(props: ComposerProps) {
               <Show
                 when={tabList().length > 1}
                 fallback={
-                  <text fg={themeV2.text()} attributes={TextAttributes.BOLD}>
+                  <text fg={theme.text.base} attributes={TextAttributes.BOLD}>
                     {tabList()[0]?.label ?? ""}
                   </text>
                 }
@@ -136,7 +110,7 @@ export function Composer(props: ComposerProps) {
                       const isActive = createMemo(() => store.active === t.id)
                       return (
                         <text
-                          fg={isActive() ? themeV2.text() : themeV2.text.subdued()}
+                          fg={isActive() ? theme.text.base : theme.text.muted}
                           attributes={isActive() ? TextAttributes.BOLD : undefined}
                         >
                           {t.label}
@@ -146,29 +120,32 @@ export function Composer(props: ComposerProps) {
                   </For>
                 </box>
               </Show>
-              <text fg={themeV2.text.subdued()} onMouseUp={close}>
+              <text fg={theme.text.muted} onMouseUp={close}>
                 esc
               </text>
             </box>
             <SubagentsTab sessionID={props.sessionID} />
             <ShellTab sessionID={props.sessionID} />
+            <Show when={props.terminals}>
+              <TerminalsTab sessionID={props.sessionID} visibleTerminalID={props.visibleTerminalID} />
+            </Show>
             <box flexDirection="row" gap={2} paddingLeft={1} flexShrink={0}>
               <For each={footerHints()}>
                 {(hint) => (
                   <text>
-                    <span style={{ fg: themeV2.text() }}>
+                    <span style={{ fg: theme.text.base }}>
                       <b>{hint.label}</b>{" "}
                     </span>
-                    <span style={{ fg: themeV2.text.subdued() }}>{hint.shortcut}</span>
+                    <span style={{ fg: theme.text.muted }}>{hint.shortcut}</span>
                   </text>
                 )}
               </For>
               <Show when={tabList().length > 1}>
                 <text>
-                  <span style={{ fg: themeV2.text() }}>
+                  <span style={{ fg: theme.text.base }}>
                     <b>tabs</b>{" "}
                   </span>
-                  <span style={{ fg: themeV2.text.subdued() }}>←/→</span>
+                  <span style={{ fg: theme.text.muted }}>←/→</span>
                 </text>
               </Show>
             </box>

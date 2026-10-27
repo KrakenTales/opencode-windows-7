@@ -1,11 +1,12 @@
-import { Service, type Endpoint } from "@opencode-ai/client/effect/service"
-import { ClientError, OpenCode, type OpenCodeClient } from "@opencode-ai/client/promise"
-import type { MiniFrontendInput } from "@opencode-ai/tui/mini"
+import { Service, type Endpoint } from "@opencode/client/effect/service"
+import { ClientError, OpenCode, type OpenCodeClient } from "@opencode/client/promise"
+import type { MiniFrontendInput } from "@opencode/tui/mini"
+import { noTimeoutFetch } from "@opencode/util/no-timeout-fetch"
 import { setTimeout } from "node:timers/promises"
-import { waitForCatalogReady } from "./services/catalog"
 import { readStdin } from "./util/io"
 import { createMiniHost, INTERACTIVE_INPUT_ERROR, usingInteractiveStdin } from "./mini-host"
 import { parseSessionTargetModel, resolveSessionTarget, type SessionTargetPreparation } from "./session-target"
+import { Env } from "./env"
 
 export type MiniCommandInput = {
   server: {
@@ -22,6 +23,8 @@ export type MiniCommandInput = {
   replayLimit?: number
   demo?: boolean
   tuiConfig?: MiniFrontendInput["tuiConfig"]
+  config?: MiniFrontendInput["config"]
+  paths: { home: string; state: string; log: string }
 }
 
 type Model = MiniFrontendInput["model"]
@@ -31,12 +34,13 @@ class MiniInputError extends Error {}
 export async function runMini(input: MiniCommandInput) {
   try {
     validate(input)
-    const result = await usingInteractiveStdin(async (terminal) => {
+    await usingInteractiveStdin(async (terminal) => {
       const initialInput = mergeInput(process.stdin.isTTY ? undefined : await readStdin(), input.prompt)
-      const frontendTask = import("@opencode-ai/tui/mini")
+      const frontendTask = import("@opencode/tui/mini")
       const directory = localDirectory()
       const connection = createMiniConnection(input.server)
       const sdk = connection.sdk
+      const environment = input.server.reconnect ? Env.session() : undefined
       const requested = parseModel(input.model)
       const model = requested ? { providerID: requested.providerID, modelID: requested.id } : undefined
       const prepare = prepareTarget(input.agent)
@@ -54,6 +58,7 @@ export async function runMini(input: MiniCommandInput) {
               fork: input.fork,
               model: requested,
               agent: input.agent,
+              environment,
               prepare,
               signal,
             }).catch((error) => {
@@ -77,7 +82,7 @@ export async function runMini(input: MiniCommandInput) {
       const create = (
         client: OpenCodeClient,
         next: {
-          location: { directory: string; workspaceID?: string }
+          location: { directory: string }
           agent: string | undefined
           model: Model
           variant: string | undefined
@@ -86,8 +91,9 @@ export async function runMini(input: MiniCommandInput) {
       ) =>
         resolveSessionTarget({
           client,
-          location: { directory: next.location.directory, workspace: next.location.workspaceID },
+          location: { directory: next.location.directory },
           agent: next.agent,
+          environment,
           model: next.model
             ? { providerID: next.model.providerID, id: next.model.modelID, variant: next.variant }
             : undefined,
@@ -104,7 +110,7 @@ export async function runMini(input: MiniCommandInput) {
         }))
       const frontend = await frontendTask
       return frontend.runMiniFrontend({
-        host: createMiniHost({ terminal, directory }),
+        host: createMiniHost({ terminal, directory, paths: input.paths }),
         sdk,
         directory,
         target: resolveTarget,
@@ -119,9 +125,9 @@ export async function runMini(input: MiniCommandInput) {
         replayLimit: input.replayLimit,
         demo: input.demo,
         tuiConfig: input.tuiConfig,
+        config: input.config,
       })
     })
-    if (result.exitCode !== 0) process.exit(result.exitCode)
   } catch (error) {
     if (error instanceof MiniInputError || (error instanceof Error && error.message === INTERACTIVE_INPUT_ERROR))
       fail(error.message)
@@ -135,6 +141,8 @@ export function createMiniConnection(input: MiniCommandInput["server"]) {
     OpenCode.make({
       baseUrl: endpoint.url,
       headers: Service.headers(endpoint),
+      // Session waits can remain idle until background work finishes.
+      fetch: noTimeoutFetch,
     })
   const reconnect = input.reconnect
   return {
@@ -212,63 +220,7 @@ function parseModel(value?: string) {
 }
 
 function prepareTarget(requestedAgent?: string): SessionTargetPreparation {
-  return async (input) => {
-    if (input.model)
-      await waitForCatalogReady({
-        sdk: input.client,
-        directory: input.location.directory,
-        workspace: input.location.workspaceID,
-        model: { providerID: input.model.providerID, modelID: input.model.id },
-        signal: input.signal,
-      })
-    return {
-      model: input.model,
-      agent: requestedAgent
-        ? await validateAgent(
-            input.client,
-            input.location.directory,
-            input.location.workspaceID,
-            requestedAgent,
-            input.signal,
-          )
-        : input.agent,
-    }
-  }
-}
-
-async function validateAgent(
-  sdk: OpenCodeClient,
-  directory: string,
-  workspace: string | undefined,
-  name?: string,
-  signal?: AbortSignal,
-) {
-  if (!name) return
-  const deadline = Date.now() + 5_000
-  let agents: Awaited<ReturnType<OpenCodeClient["agent"]["list"]>> | undefined
-  while (Date.now() < deadline && !signal?.aborted) {
-    agents = await sdk.agent.list({ location: { directory, workspace } }, { signal }).catch((error) => {
-      if (signal && error instanceof ClientError && error.reason === "Transport") throw error
-      return undefined
-    })
-    const agent = agents?.data.find((item) => item.id === name)
-    if (agent?.mode === "subagent") {
-      warning(`agent "${name}" is a subagent, not a primary agent. Falling back to default agent`)
-      return
-    }
-    if (agent) return name
-    await setTimeout(25, undefined, { signal }).catch(() => {})
-  }
-  if (signal?.aborted) return
-  if (!agents) {
-    warning("failed to list agents. Falling back to default agent")
-    return
-  }
-  warning(`agent "${name}" not found. Falling back to default agent`)
-}
-
-function warning(message: string) {
-  process.stderr.write(`\x1b[93m\x1b[1m!\x1b[0m ${message}\n`)
+  return async (input) => ({ model: input.model, agent: requestedAgent ?? input.agent })
 }
 
 function fail(message: string): never {

@@ -7,8 +7,8 @@ import {
   ToolResultValue,
   type ToolOutput as ToolOutputType,
   type ToolResultValue as ToolResultValueType,
-} from "./schema"
-import { type AnyTool, type Tools } from "./tool"
+} from "./schema/index.js"
+import { type AnyTool, type Tools } from "./tool.js"
 
 export interface ToolSettlement {
   readonly result: ToolResultValueType
@@ -21,14 +21,21 @@ export interface DispatchResult extends ToolSettlement {
 
 /** Execute one canonical tool call without owning provider IO or continuation. */
 export const dispatch = (tools: Tools, call: ToolCallPart): Effect.Effect<DispatchResult> => {
-  const tool = tools[call.name]
-  if (!tool) return Effect.succeed(result(call, { type: "error", value: `Unknown tool: ${call.name}` }))
+  const name = call.namespace === undefined ? call.name : `${call.namespace}.${call.name}`
+  const tool = tools[name]
+  if (!tool)
+    return Effect.succeed(
+      result(call, {
+        type: "error",
+        value: `No tool named "${name}" is currently available. Please use a tool from the available tool list.`,
+      }),
+    )
   if (!tool.execute)
-    return Effect.succeed(result(call, { type: "error", value: `Tool has no execute handler: ${call.name}` }))
+    return Effect.succeed(result(call, { type: "error", value: `Tool has no execute handler: ${name}` }))
 
   return decodeAndExecute(tool, call).pipe(
     Effect.map((value) => result(call, value)),
-    Effect.catchTag("LLM.ToolFailure", (failure) =>
+    Effect.catchTag("Tool.Error", (failure) =>
       Effect.succeed(result(call, { type: "error", value: failure.message }, failure.error)),
     ),
   )
@@ -38,7 +45,11 @@ const decodeAndExecute = (tool: AnyTool, call: ToolCallPart): Effect.Effect<Tool
   tool._decode(call.input).pipe(
     Effect.mapError((error) => new ToolFailure({ message: `Invalid tool input: ${error.message}` })),
     Effect.flatMap((decoded) =>
-      tool.execute!(decoded, { id: call.id, name: call.name }).pipe(
+      tool.execute!(decoded, {
+        id: call.id,
+        name: call.name,
+        namespace: call.namespace,
+      }).pipe(
         Effect.flatMap((value) =>
           tool._encode(value).pipe(
             Effect.mapError(
@@ -68,10 +79,32 @@ const result = (call: ToolCallPart, value: ToolResultValueType | ToolSettlement,
     events:
       settlement.result.type === "error"
         ? [
-            LLMEvent.toolError({ id: call.id, name: call.name, message: String(settlement.result.value), error }),
-            LLMEvent.toolResult({ id: call.id, name: call.name, result: settlement.result }),
+            LLMEvent.toolError({
+              id: call.id,
+              name: call.name,
+              namespace: call.namespace,
+              message: String(settlement.result.value),
+              error,
+              providerMetadata: call.providerMetadata,
+            }),
+            LLMEvent.toolResult({
+              id: call.id,
+              name: call.name,
+              namespace: call.namespace,
+              result: settlement.result,
+              providerMetadata: call.providerMetadata,
+            }),
           ]
-        : [LLMEvent.toolResult({ id: call.id, name: call.name, result: settlement.result, output: settlement.output })],
+        : [
+            LLMEvent.toolResult({
+              id: call.id,
+              name: call.name,
+              namespace: call.namespace,
+              result: settlement.result,
+              output: settlement.output,
+              providerMetadata: call.providerMetadata,
+            }),
+          ],
   }
 }
 

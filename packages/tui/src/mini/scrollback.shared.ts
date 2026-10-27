@@ -1,13 +1,9 @@
-import { SyntaxStyle, TextAttributes, type ColorInput } from "@opentui/core"
+import { SyntaxStyle, TextAttributes, type ColorInput, type NativeResourceOwner } from "@opentui/core"
 import { type RunEntryTheme, type RunTheme } from "./theme"
 import type { StreamCommit } from "./types"
 
-function syntax(style?: SyntaxStyle): SyntaxStyle {
-  return style ?? SyntaxStyle.fromTheme([])
-}
-
-export function entrySyntax(theme: RunTheme): SyntaxStyle {
-  return syntax(theme.block.syntax)
+export function entrySyntax(theme: RunTheme, owner: NativeResourceOwner): SyntaxStyle {
+  return SyntaxStyle.fromStyles(theme.block.syntax?.getAllStyles() ?? {}, owner)
 }
 
 function entryFailed(commit: StreamCommit): boolean {
@@ -32,7 +28,6 @@ export function entryLook(commit: StreamCommit, theme: RunEntryTheme): { fg: Col
   if (commit.phase === "final") {
     return {
       fg: theme.system.body,
-      attrs: TextAttributes.DIM,
     }
   }
 
@@ -49,7 +44,6 @@ export function entryLook(commit: StreamCommit, theme: RunEntryTheme): { fg: Col
   if (commit.kind === "reasoning") {
     return {
       fg: theme.reasoning.body,
-      attrs: TextAttributes.DIM,
     }
   }
 

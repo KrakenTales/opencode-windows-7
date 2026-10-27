@@ -1,10 +1,15 @@
-import type { HttpRecorder } from "@opencode-ai/http-recorder"
+import type { HttpRecorder } from "@opencode/http-recorder"
 import { describe } from "bun:test"
 import { Effect } from "effect"
-import type { Model } from "../src"
-import { goldenScenarioTags, goldenScenarioTitle, runGoldenScenario, type GoldenScenarioID } from "./recorded-scenarios"
-import { recordedTests } from "./recorded-test"
-import { kebab } from "./recorded-utils"
+import type { LanguageModel } from "../src/effect.js"
+import {
+  goldenScenarioTags,
+  goldenScenarioTitle,
+  runGoldenScenario,
+  type GoldenScenarioID,
+} from "./recorded-scenarios.js"
+import { recordedTests } from "./recorded-test.js"
+import { kebab } from "./recorded-utils.js"
 
 type Transport = "http" | "websocket"
 
@@ -15,6 +20,7 @@ type ScenarioInput =
       readonly name?: string
       readonly cassette?: string
       readonly tags?: ReadonlyArray<string>
+      readonly prompt?: string
       readonly maxTokens?: number
       readonly temperature?: number | false
       readonly timeout?: number
@@ -22,7 +28,7 @@ type ScenarioInput =
 
 type TargetInput = {
   readonly name: string
-  readonly model: Model
+  readonly model: LanguageModel
   readonly protocol?: string
   readonly requires?: ReadonlyArray<string>
   readonly transport?: Transport
@@ -82,6 +88,7 @@ const runTarget = (target: TargetInput) => {
             yield* runGoldenScenario(input.id, {
               id: `recorded_${kebab(target.name).replaceAll("-", "_")}_${input.id.replaceAll("-", "_")}`,
               model: target.model,
+              prompt: input.prompt,
               maxTokens: input.maxTokens,
               temperature: input.temperature,
             })

@@ -24,19 +24,22 @@
 // Ctrl-c clears a live prompt draft first; otherwise interrupt and exit use a
 // two-press pattern where the first press shows a hint and the second press
 // within 5 seconds actually fires the action.
-import { CliRenderEvents, type CliRenderer } from "@opentui/core"
+import { CliRenderEvents, type CliRenderer, type CliRendererExternalOutputEvent } from "@opentui/core"
 import { render } from "@opentui/solid"
-import { createComponent, createSignal, type Accessor, type Setter } from "solid-js"
+import { batch, createComponent, createSignal, type Accessor, type Setter } from "solid-js"
 import { createStore, reconcile } from "solid-js/store"
 import { Keymap } from "../context/keymap"
 import { Locale } from "../util/locale"
-import { RUN_COMMAND_PANEL_ROWS, RUN_SUBAGENT_PANEL_ROWS } from "./footer.command"
+import { RUN_SUBAGENT_PANEL_ROWS, footerPanelLayout } from "./footer.command"
 import { SUBAGENT_INSPECTOR_ROWS } from "./footer.subagent"
-import { PROMPT_MAX_ROWS, TEXTAREA_MIN_ROWS } from "./footer.prompt"
+import { TEXTAREA_MIN_ROWS, footerPromptLayout } from "./footer.prompt"
 import { RunFooterView } from "./footer.view"
+import { monoSnapshot } from "./mono"
 import { RunScrollbackStream } from "./scrollback.surface"
-import { RUN_THEME_FALLBACK, resolveRunTheme, type RunTheme } from "./theme"
+import { resolveRunTheme, type RunTheme } from "./theme"
 import { modelInfo } from "./variant.shared"
+import { entrySplash } from "./splash"
+import { SEED_LAUNCH } from "../ui/one-cell-motion"
 import type {
   FooterApi,
   FooterEvent,
@@ -48,7 +51,10 @@ import type {
   FooterView,
   FormCancel,
   FormReply,
+  MiniSettingChange,
+  MiniSettings,
   PermissionReply,
+  QueuedPromptAction,
   RunAgent,
   RunCommand,
   RunInput,
@@ -72,8 +78,8 @@ type RunFooterOptions = {
   agents: RunAgent[]
   references: RunReference[]
   wrote?: boolean
-  sessionID: () => string | undefined
-  agentLabel: string
+  startup?: { version: string; detail: string }
+  agent: string | undefined
   modelLabel: string
   model: RunInput["model"]
   variant: string | undefined
@@ -81,27 +87,36 @@ type RunFooterOptions = {
   history?: RunPrompt[]
   theme: RunTheme
   tuiConfig: RunTuiConfig
+  miniSettings: {
+    current: MiniSettings
+    update?: (change: MiniSettingChange) => Promise<MiniSettings>
+  }
+  onMonoChange?: (mono: boolean) => void
   onPermissionReply: (input: PermissionReply) => void | Promise<void>
   onFormReply: (input: FormReply) => void | Promise<void>
   onFormCancel: (input: FormCancel) => void | Promise<void>
   onCycleVariant?: () => CycleResult | void
+  onAgentSelect?: (agent: string) => void
   onModelSelect?: (model: NonNullable<RunInput["model"]>) => CycleResult | void | Promise<CycleResult | void>
   onVariantSelect?: (variant: string | undefined) => CycleResult | void | Promise<CycleResult | void>
   onInterrupt?: () => void
   onBackground?: () => void
+  onQueuedPromptAction?: (action: QueuedPromptAction, inboxID: string) => Promise<void>
   onEditorOpen: (input: { value: string }) => Promise<string | undefined>
   onSubagentSelect?: (sessionID: string | undefined) => void
   onSubagentInterrupt?: (sessionID: string) => void
   subscribeThemeSignal: (listener: () => void) => () => void
 }
 
+export function resolveRunAgent(agents: RunAgent[], current: string | undefined) {
+  const selectable = agents.filter((agent) => agent.mode !== "subagent" && !agent.hidden)
+  if (current === undefined) return selectable.at(0)
+  return selectable.find((agent) => agent.id === current)
+}
+
 const PERMISSION_ROWS = 12
 const FORM_ROWS = 14
-const COMMAND_ROWS = RUN_COMMAND_PANEL_ROWS
-const SKILL_ROWS = RUN_COMMAND_PANEL_ROWS
 const SUBAGENT_ROWS = RUN_SUBAGENT_PANEL_ROWS
-const MODEL_ROWS = RUN_COMMAND_PANEL_ROWS
-const VARIANT_ROWS = RUN_COMMAND_PANEL_ROWS
 const NOTICE_DURATION = 3000
 const THEME_REFRESH_DELAYS = [1000, 1000] as const
 
@@ -115,10 +130,6 @@ function createEmptySubagentState(): FooterSubagentState {
 }
 
 function eventPatch(next: FooterEvent): FooterPatch | undefined {
-  if (next.type === "queue") {
-    return { queue: next.queue }
-  }
-
   if (next.type === "first") {
     return { first: next.first }
   }
@@ -131,7 +142,6 @@ function eventPatch(next: FooterEvent): FooterPatch | undefined {
     return {
       phase: "running",
       status: "sending prompt",
-      queue: next.queue,
       interrupt: 0,
       exit: 0,
     }
@@ -141,7 +151,6 @@ function eventPatch(next: FooterEvent): FooterPatch | undefined {
     return {
       phase: "idle",
       status: "",
-      queue: next.queue,
     }
   }
 
@@ -156,7 +165,6 @@ export class RunFooter implements FooterApi {
   private closed = false
   private destroyed = false
   private prompts = new Set<(input: RunPrompt) => void>()
-  private queuedRemoves = new Set<(messageID: string) => boolean | Promise<boolean>>()
   private closes = new Set<() => void>()
   // Microtask-coalesced commit queue. Flushed on next microtask or on close/destroy.
   private queue: StreamCommit[] = []
@@ -174,6 +182,9 @@ export class RunFooter implements FooterApi {
   private setCommands: Setter<RunCommand[] | undefined>
   private providers: Accessor<RunProvider[] | undefined>
   private setProviders: Setter<RunProvider[] | undefined>
+  private currentAgent: Accessor<string>
+  private currentAgentID: Accessor<string | undefined>
+  private setCurrentAgentID: Setter<string | undefined>
   private currentModel: Accessor<RunInput["model"]>
   private setCurrentModel: Setter<RunInput["model"]>
   private variants: Accessor<string[]>
@@ -192,20 +203,24 @@ export class RunFooter implements FooterApi {
   private setQueuedPrompts: Setter<FooterQueuedPrompt[]>
   private history: Accessor<RunPrompt[]>
   private setHistory: Setter<RunPrompt[]>
+  private miniSettings: Accessor<MiniSettings>
+  private setMiniSettings: Setter<MiniSettings>
   private promptRoute: FooterPromptRoute = { type: "composer" }
   private subagentMenuRows = SUBAGENT_ROWS
   private interruptTimeout: NodeJS.Timeout | undefined
   private exitTimeout: NodeJS.Timeout | undefined
   private noticeTimeout: NodeJS.Timeout | undefined
-  private noticeRestoreStatus = ""
-  private statusVersion = 0
+  private turnAgent: string | undefined
   private requestExitHandler: (() => boolean) | undefined
+  private startup: Accessor<RunFooterOptions["startup"]>
+  private setStartup: Setter<RunFooterOptions["startup"]>
+  private startupTimer: ReturnType<typeof setTimeout> | undefined
   private scrollback: RunScrollbackStream
   private themes: RunTheme[]
   private paletteRefreshRunning = false
   private paletteRefreshQueued = false
   private themeRefreshTimeouts: NodeJS.Timeout[] = []
-  private unsubscribeThemeSignal: () => void
+  private unsubscribeThemeSignal = () => {}
 
   private createScrollback(wrote: boolean): RunScrollbackStream {
     return new RunScrollbackStream(this.renderer, this.theme(), {
@@ -216,6 +231,9 @@ export class RunFooter implements FooterApi {
           .catch(() => {})
           .finally(() => this.destroyTheme(theme))
       },
+      shellOutput: () => this.miniSettings().shell_output === "show",
+      mono: this.miniSettings().mono,
+      imagePreview: this.options.tuiConfig.session?.image_preview,
     })
   }
 
@@ -226,9 +244,9 @@ export class RunFooter implements FooterApi {
     const [state, setState] = createSignal<FooterState>({
       phase: "idle",
       status: "",
-      queue: 0,
+      notice: "",
       model: options.modelLabel,
-      usage: "",
+      usage: undefined,
       first: options.first,
       interrupt: 0,
       exit: 0,
@@ -250,6 +268,16 @@ export class RunFooter implements FooterApi {
     const [providers, setProviders] = createSignal<RunProvider[] | undefined>()
     this.providers = providers
     this.setProviders = setProviders
+    const [selectedAgentID, setCurrentAgentID] = createSignal(options.agent)
+    const currentAgent = () => resolveRunAgent(this.agents(), selectedAgentID())
+    this.currentAgentID = () => currentAgent()?.id ?? selectedAgentID()
+    this.setCurrentAgentID = setCurrentAgentID
+    this.currentAgent = () => {
+      const agent = currentAgent()
+      if (agent) return agent.name
+      const selected = selectedAgentID()
+      return selected ? Locale.titlecase(selected) : "Default"
+    }
     const [currentModel, setCurrentModel] = createSignal<RunInput["model"]>(options.model)
     this.currentModel = currentModel
     this.setCurrentModel = setCurrentModel
@@ -277,10 +305,18 @@ export class RunFooter implements FooterApi {
     const [history, setHistory] = createSignal(options.history ?? [])
     this.history = history
     this.setHistory = setHistory
+    const [miniSettings, setMiniSettings] = createSignal(options.miniSettings.current)
+    this.miniSettings = miniSettings
+    this.setMiniSettings = setMiniSettings
+    const [startup, setStartup] = createSignal(options.startup)
+    this.startup = startup
+    this.setStartup = setStartup
     this.base = Math.max(1, renderer.footerHeight - TEXTAREA_MIN_ROWS)
     this.scrollback = this.createScrollback(options.wrote ?? false)
 
     this.renderer.on(CliRenderEvents.DESTROY, this.handleDestroy)
+    this.renderer.on(CliRenderEvents.RESIZE, this.handleResize)
+    this.renderer.on(CliRenderEvents.EXTERNAL_OUTPUT, this.handleExternalOutput)
     this.renderer.on(CliRenderEvents.PALETTE, this.handlePalette)
     this.renderer.on(CliRenderEvents.THEME_MODE, this.handleThemeRefresh)
     this.renderer.prependInputHandler(this.handleThemeNotification)
@@ -295,6 +331,7 @@ export class RunFooter implements FooterApi {
             return createComponent(RunFooterView, {
               directory: options.directory,
               state: footer.state,
+              startup: footer.startup,
               view: footer.view,
               subagent: footer.subagent,
               queuedPrompts: footer.queuedPrompts,
@@ -303,11 +340,17 @@ export class RunFooter implements FooterApi {
               references: footer.references,
               commands: footer.commands,
               providers: footer.providers,
+              currentAgent: footer.currentAgent,
+              currentAgentID: footer.currentAgentID,
               currentModel: footer.currentModel,
               variants: footer.variants,
               currentVariant: footer.currentVariant,
               theme: footer.theme,
               tuiConfig: options.tuiConfig,
+              get mono() {
+                return footer.miniSettings().mono
+              },
+              miniSettings: footer.miniSettings,
               history: footer.history,
               onSubmit: footer.handlePrompt,
               onPermissionReply: footer.handlePermissionReply,
@@ -316,19 +359,24 @@ export class RunFooter implements FooterApi {
               onCycle: footer.handleCycle,
               onInterrupt: footer.handleInterrupt,
               onBackground: options.onBackground,
-              onEditorOpen: options.onEditorOpen,
+              onQueuedPromptAction: options.onQueuedPromptAction,
+              onEditorOpen: (input) => {
+                footer.finishStartup()
+                return options.onEditorOpen(input)
+              },
               onInputClear: footer.handleInputClear,
               onExitRequest: footer.handleExit,
               onRequestExit: footer.setRequestExitHandler,
               onExit: () => footer.close(),
+              onAgentSelect: footer.handleAgentSelect,
               onModelSelect: footer.handleModelSelect,
               onVariantSelect: footer.handleVariantSelect,
               onRows: footer.syncRows,
               onLayout: footer.syncLayout,
               onStatus: footer.setStatus,
+              onMiniSettingChange: footer.handleMiniSettingChange,
               onSubagentSelect: options.onSubagentSelect,
               onSubagentInterrupt: options.onSubagentInterrupt,
-              onQueuedRemove: footer.handleQueuedRemove,
             })
           },
         }),
@@ -338,6 +386,26 @@ export class RunFooter implements FooterApi {
         this.close()
       }
     })
+    if (options.startup)
+      this.startupTimer = setTimeout(() => this.finishStartup(), (SEED_LAUNCH.frames.length - 1) * SEED_LAUNCH.interval)
+  }
+
+  public finishStartup(): void {
+    const startup = this.startup()
+    if (!startup) return
+    clearTimeout(this.startupTimer)
+    this.startupTimer = undefined
+    this.setStartup(undefined)
+    if (this.isGone) return
+    this.applyHeight()
+    this.renderer.writeToScrollback(
+      entrySplash({
+        ...startup,
+        theme: this.theme().splash,
+        mono: this.miniSettings().mono,
+      }),
+    )
+    this.renderer.requestRender()
   }
 
   public get isClosed(): boolean {
@@ -352,13 +420,6 @@ export class RunFooter implements FooterApi {
     this.prompts.add(fn)
     return () => {
       this.prompts.delete(fn)
-    }
-  }
-
-  public onQueuedRemove(fn: (messageID: string) => boolean | Promise<boolean>): () => void {
-    this.queuedRemoves.add(fn)
-    return () => {
-      this.queuedRemoves.delete(fn)
     }
   }
 
@@ -381,7 +442,7 @@ export class RunFooter implements FooterApi {
     }
 
     if (next.type === "agent") {
-      this.options.agentLabel = Locale.titlecase(next.agent ?? "build")
+      this.setCurrentAgentID(next.agent)
       return
     }
 
@@ -390,12 +451,16 @@ export class RunFooter implements FooterApi {
     }
 
     if (next.type === "turn.duration") {
+      this.finishStartup()
+      const agent = this.turnAgent ?? this.currentAgent()
+      this.turnAgent = undefined
+      if (this.miniSettings().turn_summary === "hide") return
       const current = this.currentModel()
       this.flush()
       this.flushing = this.flushing
         .then(() =>
           this.scrollback.writeTurnSummary({
-            agent: this.options.agentLabel,
+            agent,
             model: current ? modelInfo(this.providers(), current).model : this.state().model,
             duration: next.duration,
           }),
@@ -451,8 +516,10 @@ export class RunFooter implements FooterApi {
     if (patch) {
       if (typeof patch.status === "string") {
         this.clearNoticeTimer()
+        patch.notice = ""
       }
       if (next.type === "turn.send") {
+        this.turnAgent = this.currentAgent()
         this.clearInterruptTimer()
         this.clearExitTimer()
       }
@@ -481,15 +548,12 @@ export class RunFooter implements FooterApi {
     }
 
     const prev = this.state()
-    if (typeof next.status === "string") {
-      this.statusVersion++
-    }
     const state = {
       phase: next.phase ?? prev.phase,
       status: typeof next.status === "string" ? next.status : prev.status,
-      queue: typeof next.queue === "number" ? Math.max(0, next.queue) : prev.queue,
+      notice: typeof next.notice === "string" ? next.notice : prev.notice,
       model: typeof next.model === "string" ? next.model : prev.model,
-      usage: typeof next.usage === "string" ? next.usage : prev.usage,
+      usage: "usage" in next ? next.usage : prev.usage,
       first: typeof next.first === "boolean" ? next.first : prev.first,
       interrupt:
         typeof next.interrupt === "number" && Number.isFinite(next.interrupt)
@@ -524,6 +588,7 @@ export class RunFooter implements FooterApi {
       return
     }
 
+    if (view.type !== "prompt") this.finishStartup()
     this.setView(view)
     this.applyHeight()
   }
@@ -537,6 +602,8 @@ export class RunFooter implements FooterApi {
       return
     }
 
+    this.finishStartup()
+    if (this.miniSettings().tools === "hide" && toolTranscript(commit)) return
     const last = this.queue.at(-1)
     const merged = last ? coalesceProgressCommit(last, commit) : undefined
     if (merged) this.queue[this.queue.length - 1] = merged
@@ -587,12 +654,17 @@ export class RunFooter implements FooterApi {
       return
     }
 
+    this.finishStartup()
     this.scrollback.destroy()
     this.scrollback = this.createScrollback(wrote)
   }
 
   public currentTheme(): RunTheme {
     return this.theme()
+  }
+
+  public currentMiniSettings(): MiniSettings {
+    return this.miniSettings()
   }
 
   private destroyTheme(theme: RunTheme): void {
@@ -610,6 +682,7 @@ export class RunFooter implements FooterApi {
       return
     }
 
+    this.finishStartup()
     this.flush()
     this.notifyClose()
   }
@@ -638,36 +711,18 @@ export class RunFooter implements FooterApi {
   }
 
   private setNotice(status: string): void {
-    const restore = this.noticeTimeout ? this.noticeRestoreStatus : this.state().status
-    this.clearNoticeTimer(false)
-    this.patch({ status })
-    if (!status) {
-      this.noticeRestoreStatus = ""
-      return
-    }
+    this.clearNoticeTimer()
+    this.patch({ notice: status })
+    if (!status) return
 
-    this.noticeRestoreStatus = restore
-    const version = this.statusVersion
     this.noticeTimeout = setTimeout(() => {
       this.noticeTimeout = undefined
-      if (this.isGone || version !== this.statusVersion) {
-        this.noticeRestoreStatus = ""
-        return
-      }
-
-      const next = this.noticeRestoreStatus
-      this.noticeRestoreStatus = ""
-      this.patch({ status: next })
+      this.patch({ notice: "" })
     }, NOTICE_DURATION)
   }
 
   private setRequestExitHandler = (fn?: () => boolean): void => {
     this.requestExitHandler = fn
-  }
-
-  private handleQueuedRemove = async (messageID: string): Promise<boolean> => {
-    const fn = [...this.queuedRemoves][0]
-    return fn ? await fn(messageID) : false
   }
 
   private handleInputClear = (): void => {
@@ -680,30 +735,34 @@ export class RunFooter implements FooterApi {
     this.patch({ interrupt: 0, exit: 0 })
   }
 
-  // Resizes the footer to fit the current view. Permission and form views
-  // get fixed extra rows; the prompt view scales with textarea line count.
+  private handleResize = (): void => {
+    if (!this.isGone) this.applyHeight()
+  }
+
   private applyHeight(): void {
     const type = this.view().type
-    const height =
+    const route = this.promptRoute.type
+    const panel = footerPanelLayout(this.renderer.terminalHeight)
+    const prompt = footerPromptLayout(this.renderer.terminalHeight)
+    const desired =
       type === "permission"
         ? this.base + PERMISSION_ROWS
         : type === "form"
           ? this.base + FORM_ROWS
-          : this.promptRoute.type === "command"
-            ? 1 + COMMAND_ROWS
-            : this.promptRoute.type === "skill"
-              ? 1 + SKILL_ROWS
-              : this.promptRoute.type === "model"
-                ? 1 + MODEL_ROWS
-                : this.promptRoute.type === "variant"
-                  ? 1 + VARIANT_ROWS
-                  : this.promptRoute.type === "queued-menu"
-                    ? 1 + this.subagentMenuRows
-                    : this.promptRoute.type === "subagent-menu"
-                      ? 1 + this.subagentMenuRows
-                      : this.promptRoute.type === "subagent"
-                        ? this.base + SUBAGENT_INSPECTOR_ROWS
-                        : this.base + Math.max(TEXTAREA_MIN_ROWS, Math.min(PROMPT_MAX_ROWS, this.rows))
+          : ["command", "skill", "agent", "model", "variant", "settings"].includes(route)
+            ? 1 + panel.frame + panel.limit
+            : route === "queued-menu" || route === "subagent-menu"
+              ? 1 + this.subagentMenuRows
+              : route === "subagent"
+                ? this.base + SUBAGENT_INSPECTOR_ROWS
+                : prompt.padding * 2 + 1 + this.rows
+    const height = Math.max(
+      1,
+      Math.min(
+        desired + (this.startup() ? 1 : 0),
+        this.renderer.terminalHeight - (type === "prompt" && route === "composer" ? 1 : 0),
+      ),
+    )
 
     if (height !== this.renderer.footerHeight) {
       this.renderer.footerHeight = height
@@ -715,7 +774,7 @@ export class RunFooter implements FooterApi {
       return
     }
 
-    const rows = Math.max(TEXTAREA_MIN_ROWS, Math.min(PROMPT_MAX_ROWS, value))
+    const rows = Math.max(TEXTAREA_MIN_ROWS, value)
     if (rows === this.rows) {
       return
     }
@@ -727,6 +786,7 @@ export class RunFooter implements FooterApi {
   }
 
   private syncLayout = (next: { route: FooterPromptRoute; subagentRows: number }): void => {
+    if (next.route.type !== "composer") this.finishStartup()
     this.promptRoute = next.route
     this.subagentMenuRows = next.subagentRows
     if (this.view().type === "prompt") {
@@ -780,22 +840,8 @@ export class RunFooter implements FooterApi {
       return
     }
 
-    const patch: FooterPatch = {}
-
-    if ("variants" in result) {
-      this.setVariants(result.variants ?? [])
-    }
-
-    if ("variant" in result) {
-      this.setCurrentVariant(result.variant)
-    }
-
-    if (result.modelLabel) {
-      patch.model = result.modelLabel
-    }
-
-    this.patch(patch)
-    this.setNotice(result.status ?? "variant updated")
+    this.applySelectionResult(result)
+    if (result.status === undefined) this.setNotice("variant updated")
   }
 
   private handleModelSelect = (model: NonNullable<RunInput["model"]>): void => {
@@ -821,28 +867,16 @@ export class RunFooter implements FooterApi {
         ) {
           return
         }
-
-        if ("variants" in result) {
-          this.setVariants(result.variants ?? [])
-        }
-
-        if ("variant" in result) {
-          this.setCurrentVariant(result.variant)
-        }
-
-        const patch: FooterPatch = {}
-        if (result.modelLabel) {
-          patch.model = result.modelLabel
-        }
-
-        if (patch.model) {
-          this.patch(patch)
-        }
-        if (result.status) {
-          this.setNotice(result.status)
-        }
+        this.applySelectionResult(result)
       })
       .catch(() => {})
+  }
+
+  private handleAgentSelect = (agent: string): void => {
+    if (this.isClosed || this.currentAgentID() === agent) return
+    this.setCurrentAgentID(agent)
+    this.options.onAgentSelect?.(agent)
+    this.setNotice(`agent ${this.currentAgent()}`)
   }
 
   private handleVariantSelect = (variant: string | undefined): void => {
@@ -862,28 +896,52 @@ export class RunFooter implements FooterApi {
         ) {
           return
         }
-
-        if ("variants" in result) {
-          this.setVariants(result.variants ?? [])
-        }
-
-        if ("variant" in result) {
-          this.setCurrentVariant(result.variant)
-        }
-
-        const patch: FooterPatch = {}
-        if (result.modelLabel) {
-          patch.model = result.modelLabel
-        }
-
-        if (patch.model) {
-          this.patch(patch)
-        }
-        if (result.status) {
-          this.setNotice(result.status)
-        }
+        this.applySelectionResult(result)
       })
       .catch(() => {})
+  }
+
+  private applySelectionResult(result: CycleResult): void {
+    if ("variants" in result) this.setVariants(result.variants ?? [])
+    if ("variant" in result) this.setCurrentVariant(result.variant)
+    if (result.modelLabel) this.patch({ model: result.modelLabel })
+    if (result.status) this.setNotice(result.status)
+  }
+
+  private handleMiniSettingChange = async (change: MiniSettingChange): Promise<void> => {
+    if (!this.options.miniSettings.update) {
+      this.setNotice("settings are unavailable")
+      return
+    }
+
+    try {
+      const settings = await this.options.miniSettings.update(change)
+      if (this.isClosed) return
+      if (settings.mono === this.miniSettings().mono) {
+        this.setMiniSettings(settings)
+        this.setNotice("settings updated")
+        return
+      }
+      const theme = await resolveRunTheme(this.renderer, this.options.tuiConfig.theme, settings.mono)
+      this.flush()
+      this.flushing = this.flushing.then(async () => {
+        if (this.isClosed) {
+          theme.block.syntax?.destroy()
+          return
+        }
+        await this.scrollback.setMono(settings.mono)
+        batch(() => {
+          this.setMiniSettings(settings)
+          this.applyTheme(theme)
+          this.options.onMonoChange?.(settings.mono)
+        })
+      })
+      await this.flushing
+      this.setNotice("settings updated")
+    } catch (error) {
+      this.setNotice("failed to save settings")
+      throw error
+    }
   }
 
   private clearInterruptTimer(): void {
@@ -895,19 +953,9 @@ export class RunFooter implements FooterApi {
     this.interruptTimeout = undefined
   }
 
-  private clearNoticeTimer(reset = true): void {
-    if (!this.noticeTimeout) {
-      if (reset) {
-        this.noticeRestoreStatus = ""
-      }
-      return
-    }
-
-    clearTimeout(this.noticeTimeout)
+  private clearNoticeTimer(): void {
+    if (this.noticeTimeout) clearTimeout(this.noticeTimeout)
     this.noticeTimeout = undefined
-    if (reset) {
-      this.noticeRestoreStatus = ""
-    }
   }
 
   private armInterruptTimer(): void {
@@ -986,26 +1034,34 @@ export class RunFooter implements FooterApi {
     return true
   }
 
-  private handlePalette = (): void => {
-    void resolveRunTheme(this.renderer, this.options.tuiConfig.theme).then((theme) => {
-      if (this.isGone) {
-        theme.block.syntax?.destroy()
-        return
-      }
+  private applyTheme(theme: RunTheme): void {
+    if (theme === this.theme()) return
+    this.themes.push(theme)
+    this.setTheme(theme)
+    this.renderer.setBackgroundColor(theme.background)
+    this.scrollback.setTheme(theme)
+  }
 
-      // Keep the last known good theme when a runtime OSC probe times out.
-      if (theme === RUN_THEME_FALLBACK) {
-        return
-      }
+  private handleExternalOutput = (event: CliRendererExternalOutputEvent): void => {
+    if (this.miniSettings().mono) monoSnapshot(event)
+  }
 
-      this.themes.push(theme)
-      this.setTheme(theme)
-      this.renderer.setBackgroundColor(theme.background)
+  private handlePalette = (): Promise<void> | undefined => {
+    if (this.isGone || this.paletteRefreshRunning) return
+    const mono = this.miniSettings().mono
+    return resolveRunTheme(this.renderer, this.options.tuiConfig.theme, mono).then((theme) => {
       this.flushing = this.flushing
-        .then(() => this.scrollback.setTheme(theme))
+        .then(() => {
+          if (this.isGone || mono !== this.miniSettings().mono) {
+            theme.block.syntax?.destroy()
+            return
+          }
+          this.applyTheme(theme)
+        })
         .catch((error) => {
           this.flushError = error
         })
+      return this.flushing
     })
   }
 
@@ -1020,10 +1076,11 @@ export class RunFooter implements FooterApi {
     return false
   }
 
-  private handleThemeRefresh = (): void => {
+  private handleThemeRefresh = (): Promise<void> | undefined => {
     if (this.isGone) {
       return
     }
+    if (this.miniSettings().mono) return this.handlePalette()
 
     if (this.paletteRefreshRunning) {
       this.paletteRefreshQueued = true
@@ -1033,22 +1090,23 @@ export class RunFooter implements FooterApi {
     this.paletteRefreshRunning = true
     const retry = this.renderer.paletteDetectionStatus === "detecting"
     this.renderer.clearPaletteCache()
-    void this.renderer
+    return this.renderer
       .getPalette({ size: 256 })
       .catch(() => {})
-      .finally(() => {
+      .then(() => {
         this.paletteRefreshRunning = false
         if (!retry && !this.paletteRefreshQueued) {
-          return
+          // Theme files can change without a new terminal palette.
+          return this.handlePalette()
         }
 
         this.paletteRefreshQueued = false
-        this.handleThemeRefresh()
+        return this.handleThemeRefresh()
       })
   }
 
-  public refreshTheme(): void {
-    this.handleThemeRefresh()
+  public refreshTheme() {
+    return this.handleThemeRefresh()
   }
 
   private handleThemeSignal = (): void => {
@@ -1066,6 +1124,8 @@ export class RunFooter implements FooterApi {
       return
     }
 
+    clearTimeout(this.startupTimer)
+    this.startupTimer = undefined
     this.flush()
     this.destroyed = true
     this.notifyClose()
@@ -1073,6 +1133,8 @@ export class RunFooter implements FooterApi {
     this.clearExitTimer()
     this.clearNoticeTimer()
     this.renderer.off(CliRenderEvents.DESTROY, this.handleDestroy)
+    this.renderer.off(CliRenderEvents.RESIZE, this.handleResize)
+    this.renderer.off(CliRenderEvents.EXTERNAL_OUTPUT, this.handleExternalOutput)
     this.renderer.off(CliRenderEvents.PALETTE, this.handlePalette)
     this.renderer.off(CliRenderEvents.THEME_MODE, this.handleThemeRefresh)
     this.renderer.removeInputHandler(this.handleThemeNotification)
@@ -1080,10 +1142,13 @@ export class RunFooter implements FooterApi {
     for (const timeout of this.themeRefreshTimeouts) clearTimeout(timeout)
     this.themeRefreshTimeouts.length = 0
     this.prompts.clear()
-    this.queuedRemoves.clear()
     this.closes.clear()
     this.scrollback.destroy()
-    for (const theme of [...this.themes]) this.destroyTheme(theme)
+    void this.renderer.closed
+      .catch(() => {})
+      .then(() => {
+        for (const theme of [...this.themes]) this.destroyTheme(theme)
+      })
   }
 
   // Drains the commit queue to scrollback. The surface manager owns grouping,
@@ -1106,6 +1171,10 @@ export class RunFooter implements FooterApi {
         this.flushError = error
       })
   }
+}
+
+function toolTranscript(commit: StreamCommit) {
+  return commit.kind === "tool" || commit.partID?.startsWith("skill:")
 }
 
 /** @internal Exported for queue identity regression tests. */

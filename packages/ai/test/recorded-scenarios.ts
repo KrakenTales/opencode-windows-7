@@ -1,8 +1,10 @@
 import { expect } from "bun:test"
 import { Effect, Schema } from "effect"
 import {
+  Media,
   LLM,
   LLMEvent,
+  LLMRequest,
   LLMResponse,
   Message,
   ToolRuntime,
@@ -11,11 +13,10 @@ import {
   toDefinitions,
   type ContentPart,
   type FinishReason,
-  type LLMRequest,
-  type Model,
-} from "../src"
-import { LLMClient } from "../src/route"
-import { Tool } from "../src/tool"
+  type LanguageModel,
+} from "../src/effect.js"
+import { LLMClient } from "../src/route.js"
+import { Tool } from "../src/tool.js"
 
 export const weatherToolName = "get_weather"
 
@@ -54,7 +55,7 @@ export const weatherRuntimeTool = Tool.make({
 
 export const weatherToolLoopRequest = (input: {
   readonly id: string
-  readonly model: Model
+  readonly model: LanguageModel
   readonly system?: string
   readonly maxTokens?: number
   readonly temperature?: number | false
@@ -73,7 +74,7 @@ export const weatherToolLoopRequest = (input: {
 
 export const goldenWeatherToolLoopRequest = (input: {
   readonly id: string
-  readonly model: Model
+  readonly model: LanguageModel
   readonly maxTokens?: number
   readonly temperature?: number | false
 }) =>
@@ -91,7 +92,7 @@ const restroomImage = () =>
 export const runWeatherToolLoop = (request: LLMRequest) =>
   Effect.gen(function* () {
     const tools = { [weatherToolName]: weatherRuntimeTool }
-    let next = LLM.updateRequest(request, { tools: toDefinitions(tools) })
+    let next = LLMRequest.update(request, { tools: toDefinitions(tools) })
     const events: LLMEvent[] = []
 
     for (let step = 0; step < 10; step++) {
@@ -108,7 +109,7 @@ export const runWeatherToolLoop = (request: LLMRequest) =>
         ToolRuntime.dispatch(tools, call).pipe(Effect.map((result) => [call, result] as const)),
       )
       events.push(...dispatched.flatMap(([, result]) => result.events))
-      next = LLM.updateRequest(next, {
+      next = LLMRequest.update(next, {
         messages: [
           ...next.messages,
           Message.assistant(assistantContent(response.events)),
@@ -123,23 +124,16 @@ export const runWeatherToolLoop = (request: LLMRequest) =>
 const assistantContent = (events: ReadonlyArray<LLMEvent>) =>
   events.reduce(LLMResponse.reduce, LLMResponse.empty()).message.content
 
-export const expectFinish = (
-  events: ReadonlyArray<LLMEvent>,
-  reason: Extract<LLMEvent, { readonly type: "finish" }>["reason"],
-) => expect(events.at(-1)).toMatchObject({ type: "finish", reason })
-
-export const expectWeatherToolCall = (response: LLMResponse) =>
-  expect(response.toolCalls).toMatchObject([
-    { type: "tool-call", id: expect.any(String), name: weatherToolName, input: { city: "Paris" } },
-  ])
+export const expectFinish = (events: ReadonlyArray<LLMEvent>, reason: FinishReason) =>
+  expect(events.at(-1)).toMatchObject({ type: "finish", reason: { normalized: reason } })
 
 export const expectWeatherToolLoop = (events: ReadonlyArray<LLMEvent>) => {
   const finishes = events.filter(LLMEvent.is.finish)
   expect(finishes).toHaveLength(1)
-  expect(finishes[0]?.reason).toBe("stop")
+  expect(finishes[0]?.reason.normalized).toBe("stop")
 
   const stepFinishes = events.filter(LLMEvent.is.stepFinish)
-  expect(stepFinishes.map((event) => event.reason)).toEqual(["tool-calls", "stop"])
+  expect(stepFinishes.map((event) => event.reason.normalized)).toEqual(["tool-calls", "stop"])
 
   const toolCalls = events.filter(LLMEvent.is.toolCall)
   expect(toolCalls).toHaveLength(1)
@@ -165,7 +159,8 @@ export const expectGoldenWeatherToolLoop = (events: ReadonlyArray<LLMEvent>) => 
 
 export interface GoldenScenarioContext {
   readonly id: string
-  readonly model: Model
+  readonly model: LanguageModel
+  readonly prompt?: string
   readonly maxTokens?: number
   readonly temperature?: number | false
 }
@@ -183,12 +178,10 @@ const normalizeImageText = (value: string) =>
     .trim()
 
 const encryptedReasoningOptions = {
-  openai: {
-    store: false,
-    include: ["reasoning.encrypted_content"],
-    reasoningEffort: "low",
-    reasoningSummary: "auto",
-  },
+  store: false,
+  include: ["reasoning.encrypted_content"],
+  reasoningEffort: "low",
+  reasoningSummary: "auto",
 } as const
 
 type AssistantTextExpectation = string | RegExp
@@ -302,12 +295,11 @@ const runGeneratedConversation = (context: GoldenScenarioContext, steps: Readonl
 
 const runTextScenario = (context: GoldenScenarioContext) =>
   runGeneratedConversation(context, [
-    user("Reply exactly with: Hello!"),
+    user(context.prompt ?? "Reply exactly with: Hello!"),
     assistant.expectText(/^Hello!?$/, {
       system: "You are concise.",
       maxTokens: context.maxTokens ?? 40,
-      providerOptions:
-        context.model.route.id === "gemini" ? { gemini: { thinkingConfig: { thinkingBudget: 0 } } } : undefined,
+      providerOptions: context.model.route.id === "gemini" ? { thinkingConfig: { thinkingBudget: 0 } } : undefined,
     }),
   ])
 
@@ -334,7 +326,7 @@ const runImageScenario = (context: GoldenScenarioContext) =>
           type: "text",
           text: "The image contains exactly three lowercase English words. Read them left to right and reply with only those words.",
         },
-        { type: "media", mediaType: "image/png", data: yield* restroomImage() },
+        { type: "media", media: Media.base64(yield* restroomImage(), "image/png") },
       ]),
       assistant.expectText(/.+/, {
         system: "Read images carefully. Reply only with the visible text.",
@@ -390,7 +382,7 @@ const runReasoningScenario = (context: GoldenScenarioContext) =>
     user("Think briefly, then reply exactly with: Hello!"),
     assistant.expectText(/^Hello!?$/, {
       system: "Show concise reasoning when the provider supports visible reasoning summaries.",
-      providerOptions: { openai: { reasoningEffort: "low", reasoningSummary: "auto" } },
+      providerOptions: { reasoningEffort: "low", reasoningSummary: "auto" },
       maxTokens: context.maxTokens ?? 120,
       assert: (response) => expect(response.usage?.reasoningTokens ?? 0).toBeGreaterThan(0),
     }),
@@ -503,7 +495,7 @@ export const eventSummary = (events: ReadonlyArray<LLMEvent>) => {
       continue
     }
     if (event.type === "finish") {
-      summary.push({ type: "finish", reason: event.reason, usage: usageSummary(event.usage) })
+      summary.push({ type: "finish", reason: event.reason.normalized, usage: usageSummary(event.usage) })
     }
   }
   return summary.map((item) => Object.fromEntries(Object.entries(item).filter((entry) => entry[1] !== undefined)))

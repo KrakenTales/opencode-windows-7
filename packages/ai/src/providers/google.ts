@@ -1,21 +1,39 @@
-import type { RouteDefaultsInput } from "../route/client"
-import { Auth } from "../route/auth"
-import type { ProviderAuthOption } from "../route/auth-options"
-import type { ProviderPackage } from "../provider-package"
-import { ProviderID, type ModelID, type ProviderOptions } from "../schema"
-import * as Gemini from "../protocols/gemini"
+import type { RouteDefaultsInput } from "../route/client.js"
+import { Auth } from "../route/auth.js"
+import type { ProviderAuthOption } from "../route/auth-options.js"
+import { MediaRoute } from "../route/media.js"
+import type { ProviderPackage } from "../provider-package.js"
+import { ProviderID, type ModelID, type ProviderOptions } from "../schema/index.js"
+import { Gemini } from "../protocols/gemini.js"
+import { GoogleInteractions } from "../protocols/google-interactions.js"
+import { GoogleImages } from "../protocols/google-images.js"
+import { GoogleSpeech } from "../protocols/google-speech.js"
+import { GoogleTranscription } from "../protocols/google-transcription.js"
+import { GoogleVideo } from "../protocols/google-video.js"
+
+export type { GoogleImageOptions } from "../protocols/google-images.js"
+export type { GoogleSpeechOptions } from "../protocols/google-speech.js"
+export type { GoogleTranscriptionOptions } from "../protocols/google-transcription.js"
+export type { GoogleVideoOptions } from "../protocols/google-video.js"
+export type GeminiOptionsInput = Gemini.OptionsInput
+export type GeminiProviderOptionsInput = Gemini.ProviderOptionsInput
+export type GoogleInteractionsOptionsInput = GoogleInteractions.OptionsInput
 
 export const id = ProviderID.make("google")
 
-export const routes = [Gemini.route]
+export const routes = [Gemini.route, GoogleInteractions.route]
 
-export type Config = RouteDefaultsInput & ProviderAuthOption<"optional"> & { readonly baseURL?: string }
+export type Config = RouteDefaultsInput &
+  ProviderAuthOption<"optional"> & {
+    readonly baseURL?: string
+    readonly providerOptions?: Gemini.ProviderOptionsInput & GoogleInteractions.ProviderOptionsInput
+  }
 
-export interface Settings extends ProviderPackage.Settings {
-  readonly apiKey?: string
-  readonly baseURL?: string
-  readonly providerOptions?: ProviderOptions
-}
+export type Settings = ProviderPackage.Settings &
+  Gemini.ProviderOptionsInput & {
+    readonly apiKey?: string
+    readonly baseURL?: string
+  }
 
 const auth = (options: ProviderAuthOption<"optional">) => {
   if ("auth" in options && options.auth) return options.auth
@@ -29,22 +47,48 @@ const configuredRoute = (input: Config) => {
   return Gemini.route.with({ ...rest, endpoint: { baseURL }, auth: auth(input) })
 }
 
+const interactionsRoute = (input: Config) => {
+  const { apiKey: _, auth: _auth, baseURL, ...rest } = input
+  return GoogleInteractions.route.with({ ...rest, endpoint: { baseURL }, auth: auth(input) })
+}
+
 export const configure = (input: Config = {}) => {
   const route = configuredRoute(input)
+  const media = MediaRoute.deployment(input, auth(input))
   return {
     id,
-    model: (modelID: string | ModelID) => route.model({ id: modelID }),
+    model: (modelID: string | ModelID) => route.model<Gemini.ProviderOptionsInput>({ id: modelID }),
+    interactions: (modelID: string | ModelID) =>
+      interactionsRoute(input).model<GoogleInteractions.ProviderOptionsInput>({ id: modelID }),
+    image: (modelID: string | ModelID, providerOptions?: ProviderOptions) =>
+      GoogleImages.model({ ...media, id: modelID, providerOptions }),
+    video: (modelID: string | ModelID) => GoogleVideo.model({ ...media, id: modelID }),
+    speech: (modelID: string | ModelID) => GoogleSpeech.model({ ...media, id: modelID }),
+    transcription: (modelID: string | ModelID) => GoogleTranscription.model({ ...media, id: modelID }),
     configure,
   }
 }
 
 export const provider = configure()
-export const model: ProviderPackage.Definition<Settings>["model"] = (modelID, settings) =>
-  configure({
-    apiKey: settings.apiKey,
-    baseURL: settings.baseURL,
-    headers: settings.headers === undefined ? undefined : { ...settings.headers },
-    http: settings.body === undefined ? undefined : { body: { ...settings.body } },
-    limits: settings.limits,
-    providerOptions: settings.providerOptions,
-  }).model(modelID)
+export const model: ProviderPackage.Definition<Settings, Gemini.ProviderOptionsInput>["model"] = (modelID, settings) =>
+  configure(config(settings)).model(modelID)
+export const imageModel = (modelID: string, settings: Settings) => {
+  const input = config(settings)
+  return configure(input).image(modelID, input.providerOptions)
+}
+
+function config({ apiKey, baseURL, body, headers, ...providerOptions }: Settings) {
+  return {
+    apiKey,
+    baseURL,
+    headers,
+    http: body === undefined ? undefined : { body },
+    providerOptions,
+  }
+}
+
+export const image = provider.image
+export const interactions = provider.interactions
+export const video = provider.video
+export const speech = provider.speech
+export const transcription = provider.transcription

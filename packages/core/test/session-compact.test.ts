@@ -1,47 +1,37 @@
+import type { FileSystem } from "@opencode/core/filesystem"
 import { describe, expect } from "bun:test"
-import { LLMClient, LLMEvent, Model, type LLMRequest } from "@opencode-ai/ai"
-import { OpenAIChat } from "@opencode-ai/ai/protocols"
-import { Config } from "@opencode-ai/core/config"
-import { Database } from "@opencode-ai/core/database/database"
-import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
-import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { EventV2 } from "@opencode-ai/core/event"
-import { Job } from "@opencode-ai/core/job"
-import { Location } from "@opencode-ai/core/location"
-import { LocationServiceMap } from "@opencode-ai/core/location-service-map"
-import type { LocationServices } from "@opencode-ai/core/location-services"
-import { ProjectV2 } from "@opencode-ai/core/project"
-import { AbsolutePath } from "@opencode-ai/core/schema"
-import { SessionV2 } from "@opencode-ai/core/session"
-import { SessionCompaction } from "@opencode-ai/core/session/compaction"
-import { SessionEvent } from "@opencode-ai/core/session/event"
-import { SessionPending } from "@opencode-ai/core/session/pending"
-import { SessionMessage } from "@opencode-ai/core/session/message"
-import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { SessionExecution } from "@opencode-ai/core/session/execution"
-import { SessionRunnerModel } from "@opencode-ai/core/session/runner/model"
-import { SessionStore } from "@opencode-ai/core/session/store"
-import { DateTime, Effect, Layer, LayerMap, Stream } from "effect"
+import { LLMClient, LLMEvent, LanguageModel, type LLMRequest } from "@opencode/ai/effect"
+import { OpenAIChat } from "@opencode/ai/protocols"
+import { Config } from "@opencode/core/config"
+import { Database } from "@opencode/core/database/database"
+import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
+import { LayerNode } from "@opencode/util/effect/layer-node"
+import { Bus } from "@opencode/core/bus"
+import { Location } from "@opencode/core/location"
+import { LocationServiceMap } from "@opencode/core/location-service-map"
+import type { LocationServices } from "@opencode/core/location-services"
+import { Project } from "@opencode/core/project"
+import { AbsolutePath } from "@opencode/core/schema"
+import { Session } from "@opencode/core/session"
+import { SessionCompaction } from "@opencode/core/session/compaction"
+import { SessionEvent } from "@opencode/core/session/event"
+import { SessionMessage } from "@opencode/core/session/message"
+import { SessionProjector } from "@opencode/core/session/projector"
+import { SessionExecution } from "@opencode/core/session/execution"
+import { SessionRunnerModel } from "@opencode/core/session/runner/model"
+import { SessionStore } from "@opencode/core/session/store"
+import { Effect, Layer, LayerMap, Stream } from "effect"
 import { testEffect } from "./lib/effect"
+import { globalProjectNode } from "./lib/project"
 
 const location = Location.Ref.make({ directory: AbsolutePath.make("/project") })
-const model = Model.make({
+const model = LanguageModel.make({
   id: "summary-model",
   provider: "test",
-  route: OpenAIChat.route.with({ limits: { context: 10_000, output: 1_000 } }),
+  route: OpenAIChat.route,
 })
-const projects = Layer.succeed(
-  ProjectV2.Service,
-  ProjectV2.Service.of({
-    list: () => Effect.succeed([]),
-    resolve: (directory) => Effect.succeed({ id: ProjectV2.ID.global, directory }),
-    directories: () => Effect.succeed([]),
-    commit: () => Effect.void,
-  }),
-)
 let requests: LLMRequest[] = []
 const client = Layer.mock(LLMClient.Service)({
-  prepare: () => Effect.die("unused"),
   stream: (request: LLMRequest) => {
     requests.push(request)
     return Stream.make(LLMEvent.textDelta({ id: "summary", text: "manual session summary" }))
@@ -49,52 +39,61 @@ const client = Layer.mock(LLMClient.Service)({
   generate: () => Effect.die("unused"),
 })
 const config = Layer.mock(Config.Service)({ entries: () => Effect.succeed([]) })
-const models = SessionRunnerModel.layerWith(() => Effect.succeed(SessionRunnerModel.resolved(model)))
+const models = Layer.mock(SessionRunnerModel.Service)({
+  resolve: () =>
+    Effect.succeed(
+      SessionRunnerModel.resolved(model, {
+        capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
+        cost: [],
+        limit: { context: 10_000, output: 1_000 },
+      }),
+    ),
+})
 const locations = Layer.effect(
   LocationServiceMap.Service,
   LayerMap.make(
     () =>
-      // The test only needs the compaction location service used by SessionV2.compact.
+      // The test only needs the compaction location service used by Session.compact.
       // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
       SessionCompaction.layer.pipe(
         Layer.provide(client),
         Layer.provide(config),
         Layer.provide(models),
-      ) as unknown as Layer.Layer<LocationServices>,
+      ) as unknown as Layer.Layer<LocationServices, FileSystem.DirectoryNotFoundError>,
   ),
 )
 const it = testEffect(
   AppNodeBuilder.build(
-    LayerNode.group([Database.node, EventV2.node, SessionProjector.node, SessionStore.node, SessionV2.node]),
+    LayerNode.group([Database.node, Bus.node, SessionProjector.node, SessionStore.node, Session.node]),
     [
-      [LocationServiceMap.node, locations],
-      [ProjectV2.node, projects],
-      [SessionExecution.node, SessionExecution.noopLayer],
+      LocationServiceMap.node.replace(locations),
+      Project.node.replace(globalProjectNode),
+      SessionExecution.node.replace(SessionExecution.noopLayer),
     ],
   ),
 )
 
-describe("SessionV2.compact", () => {
-  it.effect("durably admits and coalesces manual compaction", () =>
+describe("Session.compact", () => {
+  it.effect("durably coalesces manual compaction", () =>
     Effect.gen(function* () {
       requests = []
-      const session = yield* SessionV2.Service
-      const events = yield* EventV2.Service
+      const session = yield* Session.Service
+      const bus = yield* Bus.Service
       const created = yield* session.create({ location })
 
       const messageID = SessionMessage.ID.create()
-      yield* events.publish(SessionEvent.InputAdmitted, {
+      yield* bus.publish(SessionEvent.InboxEnqueued, {
         sessionID: created.id,
-        inputID: messageID,
-        input: {
+        inboxID: messageID,
+        item: {
           type: "user",
-          data: { text: "Please compact this session history." },
+          payload: { text: "Please compact this session history." },
           delivery: "steer",
         },
       })
-      yield* events.publish(SessionEvent.InputPromoted, {
+      yield* bus.publish(SessionEvent.InboxDelivered, {
         sessionID: created.id,
-        inputID: messageID,
+        inboxID: messageID,
       })
 
       expect(yield* session.compact({ id: messageID, sessionID: created.id }).pipe(Effect.flip)).toMatchObject({
@@ -106,10 +105,67 @@ describe("SessionV2.compact", () => {
 
       expect(second.id).toBe(first.id)
       expect(requests).toHaveLength(0)
-      expect(yield* SessionPending.compaction((yield* Database.Service).db, created.id)).toMatchObject({
-        id: first.id,
-      })
+      expect(yield* session.inbox(created.id)).toEqual([
+        expect.objectContaining({ id: first.id, type: "compaction", delivery: "steer" }),
+      ])
       expect((yield* session.context(created.id)).find((message) => message.id === first.id)).toBeUndefined()
+
+      const queued = yield* session.create({ location })
+      const queue = yield* session.compact({ sessionID: queued.id, delivery: "queue" })
+      expect(queue).toMatchObject({ type: "compaction", delivery: "queue" })
+    }),
+  )
+
+  it.effect("coalesces concurrent manual compaction", () =>
+    Effect.gen(function* () {
+      const session = yield* Session.Service
+      const created = yield* session.create({ location })
+      const admitted = yield* Effect.all(
+        [SessionMessage.ID.create(), SessionMessage.ID.create()].map((id) =>
+          session.compact({ id, sessionID: created.id }),
+        ),
+        { concurrency: "unbounded" },
+      )
+
+      expect(admitted[1]?.id).toBe(admitted[0]?.id)
+      expect(yield* session.inbox(created.id)).toHaveLength(1)
+    }),
+  )
+
+  it.effect("commits a staged revert before admitting manual compaction", () =>
+    Effect.gen(function* () {
+      const session = yield* Session.Service
+      const bus = yield* Bus.Service
+      const created = yield* session.create({ location })
+      const messageID = SessionMessage.ID.create()
+
+      yield* bus.publish(SessionEvent.InboxEnqueued, {
+        sessionID: created.id,
+        inboxID: messageID,
+        item: {
+          type: "user",
+          payload: { text: "Undo this prompt before compacting." },
+          delivery: "steer",
+        },
+      })
+      yield* bus.publish(SessionEvent.InboxDelivered, {
+        sessionID: created.id,
+        inboxID: messageID,
+      })
+      yield* bus.publish(SessionEvent.RevertEvent.Staged, {
+        sessionID: created.id,
+        revert: { messageID, files: [] },
+      })
+
+      expect((yield* session.get(created.id)).revert?.messageID).toBe(messageID)
+
+      const compacted = yield* session.compact({ sessionID: created.id })
+
+      expect((yield* session.get(created.id)).revert).toBeUndefined()
+      expect(yield* session.context(created.id)).toEqual([])
+      expect(yield* session.inbox(created.id)).toEqual([
+        expect.objectContaining({ id: compacted.id, type: "compaction" }),
+      ])
     }),
   )
 })

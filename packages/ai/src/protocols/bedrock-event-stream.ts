@@ -1,8 +1,10 @@
 import { EventStreamCodec } from "@smithy/eventstream-codec"
 import { fromUtf8, toUtf8 } from "@smithy/util-utf8"
-import { Effect, Stream } from "effect"
-import { Framing } from "../route/framing"
-import { ProviderShared } from "./shared"
+import { Effect, Schema, Stream } from "effect"
+import { Base64 } from "effect/encoding"
+import { AIError, AIErrorReason, InvalidProviderOutputError } from "../schema/index.js"
+import { Framing } from "../route/framing.js"
+import { ProviderShared } from "./shared.js"
 
 // Bedrock streams responses using the AWS event stream binary protocol — each
 // frame is `[length:4][headers-length:4][prelude-crc:4][headers][payload][crc:4]`.
@@ -21,6 +23,13 @@ interface FrameBufferState {
 
 const initialFrameBuffer: FrameBufferState = { buffer: new Uint8Array(0), offset: 0 }
 
+export const Frame = Schema.StructWithRest(Schema.Struct({ rawBody: Schema.String }), [ProviderShared.JsonObject])
+export type Frame = typeof Frame.Type
+
+type FrameInput = { readonly _tag: "Chunk"; readonly bytes: Uint8Array } | { readonly _tag: "End" }
+
+const endOfStream: FrameInput = { _tag: "End" }
+
 const appendChunk = (state: FrameBufferState, chunk: Uint8Array): FrameBufferState => {
   const remaining = state.buffer.length - state.offset
   // Compact: drop the consumed prefix and append the new chunk in one alloc.
@@ -32,10 +41,24 @@ const appendChunk = (state: FrameBufferState, chunk: Uint8Array): FrameBufferSta
   return { buffer: next, offset: 0 }
 }
 
-const consumeFrames = (route: string) => (state: FrameBufferState, chunk: Uint8Array) =>
+const consumeFrames = (route: string) => (state: FrameBufferState, input: FrameInput) =>
   Effect.gen(function* () {
-    let cursor = appendChunk(state, chunk)
-    const out: object[] = []
+    if (input._tag === "End") {
+      const remaining = state.buffer.subarray(state.offset)
+      if (remaining.length > 0)
+        return yield* new AIError({
+          reason: new InvalidProviderOutputError({
+            route,
+            classification: "incomplete-stream",
+            message: `Incomplete Bedrock Converse event-stream frame: ${remaining.length} buffered bytes remain at end of stream`,
+            body: Base64.encode(remaining),
+          }),
+        })
+      return [state, []] as const
+    }
+
+    let cursor = appendChunk(state, input.bytes)
+    const out: Frame[] = []
     while (cursor.buffer.length - cursor.offset >= 4) {
       const view = cursor.buffer.subarray(cursor.offset)
       const totalLength = new DataView(view.buffer, view.byteOffset, view.byteLength).getUint32(0, false)
@@ -49,26 +72,56 @@ const consumeFrames = (route: string) => (state: FrameBufferState, chunk: Uint8A
             `Failed to decode Bedrock Converse event-stream frame: ${
               error instanceof Error ? error.message : String(error)
             }`,
+            Base64.encode(view.subarray(0, totalLength)),
+            error,
           ),
       })
       cursor = { buffer: cursor.buffer, offset: cursor.offset + totalLength }
 
-      if (decoded.headers[":message-type"]?.value !== "event") continue
-      const eventType = decoded.headers[":event-type"]?.value
-      if (typeof eventType !== "string") continue
       const payload = utf8.decode(decoded.body)
+      const body = ProviderShared.encodeJson({ headers: decoded.headers, body: payload })
+      const messageType = decoded.headers[":message-type"]?.value
+      if (messageType === "error") {
+        const code = decoded.headers[":error-code"]?.value
+        const message = decoded.headers[":error-message"]?.value
+        return yield* ProviderShared.eventError(
+          route,
+          [code, message].filter((value): value is string => typeof value === "string").join(": ") ||
+            "Bedrock Converse event-stream error",
+          body,
+        )
+      }
+      const eventType =
+        messageType === "event"
+          ? decoded.headers[":event-type"]?.value
+          : messageType === "exception"
+            ? decoded.headers[":exception-type"]?.value
+            : undefined
+      if (typeof eventType !== "string") continue
       if (!payload) continue
       // The AWS event stream pads short payloads with a `p` field. Drop it
       // before handing the object to the chunk schema. JSON decode goes
       // through the shared Schema-driven codec to satisfy the package rule
       // against ad-hoc `JSON.parse` calls.
-      const parsed = (yield* ProviderShared.parseJson(
+      const parsed = yield* ProviderShared.parseJson(
         route,
         payload,
         "Failed to parse Bedrock Converse event-stream payload",
-      )) as Record<string, unknown>
-      delete parsed.p
-      out.push({ [eventType]: parsed })
+      ).pipe(
+        Effect.mapError(
+          (error) =>
+            new AIError({
+              reason: AIErrorReason.make({ ...error.reason, message: error.message, cause: error.reason.cause, body }),
+            }),
+        ),
+      )
+      if (!ProviderShared.isRecord(parsed))
+        return yield* ProviderShared.eventError(route, "Failed to parse Bedrock Converse event-stream payload", body)
+      const { p: _, ...event } = parsed
+      out.push({
+        ...(messageType === "exception" ? { exception: { type: eventType, details: event } } : { [eventType]: event }),
+        rawBody: body,
+      })
     }
     return [cursor, out] as const
   })
@@ -79,9 +132,16 @@ const consumeFrames = (route: string) => (state: FrameBufferState, chunk: Uint8A
  * under its `:event-type` header so the chunk schema can match the JSON
  * payload directly.
  */
-export const framing = (route: string): Framing.Definition<object> => ({
+export const framing = (route: string): Framing.Definition<Frame> => ({
   id: "aws-event-stream",
-  frame: (bytes) => bytes.pipe(Stream.mapAccumEffect(() => initialFrameBuffer, consumeFrames(route))),
+  body: (frame) => frame.rawBody,
+  raw: ({ rawBody: _, ...event }) => event,
+  frame: (bytes) =>
+    bytes.pipe(
+      Stream.map((bytes): FrameInput => ({ _tag: "Chunk", bytes })),
+      Stream.concat(Stream.succeed(endOfStream)),
+      Stream.mapAccumEffect(() => initialFrameBuffer, consumeFrames(route)),
+    ),
 })
 
-export * as BedrockEventStream from "./bedrock-event-stream"
+export * as BedrockEventStream from "./bedrock-event-stream.js"

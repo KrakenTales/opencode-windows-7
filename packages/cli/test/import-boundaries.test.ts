@@ -5,20 +5,49 @@ import path from "node:path"
 const root = path.resolve(import.meta.dir, "../../..")
 
 describe("CLI frontend import boundaries", () => {
+  test("does not import Core directly", async () => {
+    const glob = new Bun.Glob("{src,test}/**/*.{ts,tsx}")
+    const imports: string[] = []
+    for await (const file of glob.scan({ cwd: path.join(root, "packages/cli") })) {
+      const source = await Bun.file(path.join(root, "packages/cli", file)).text()
+      if (/["']@opencode\/core(?:\/[^"']*)?["']/.test(source)) imports.push(file)
+    }
+    expect(imports).toEqual([])
+  })
+
+  test("keeps ACP and its tests off the promise client", async () => {
+    const glob = new Bun.Glob("{src,test}/acp/**/*.ts")
+    const imports: string[] = []
+    for await (const file of glob.scan({ cwd: path.join(root, "packages/cli") })) {
+      const source = await Bun.file(path.join(root, "packages/cli", file)).text()
+      if (/["']@opencode\/client(?:\/promise(?:\/[^"']*)?|\/service)?["']/.test(source)) imports.push(file)
+    }
+    expect(imports).toEqual([])
+  })
+
   test("exposes only the intentional package entrypoints", async () => {
-    const run = await import("@opencode-ai/cli/run")
-    const mini = await import("@opencode-ai/tui/mini")
+    const run = await import("@opencode/cli/run")
+    const mini = await import("@opencode/tui/mini")
+    const tool = await import("@opencode/tui/mini/tool")
     const cli = await Bun.file(path.join(root, "packages/cli/package.json")).json()
 
     expect(Object.keys(run).sort()).toEqual(["runNonInteractive", "runV1Bridge"])
     expect(Object.keys(mini).sort()).toEqual(["runMiniFrontend"])
+    expect(Object.keys(tool).sort()).toEqual([
+      "nonEmptyToolContent",
+      "readDisplayText",
+      "toolInlineInfo",
+      "toolOutputText",
+    ])
     expect(Object.keys(cli.exports).filter((key) => key === "./mini" || key.startsWith("./mini/"))).toEqual([])
   })
 
   test("keeps run and Mini on separate evaluation graphs", async () => {
     const run = await bundleInputs("packages/cli/src/commands/handlers/run.ts")
     expect(run).toContain("packages/cli/src/run/run.ts")
+    expect(run).toContain("packages/cli/src/util/error.ts")
     expect(run).toContain("packages/tui/src/mini/tool.ts")
+    expect(run).not.toContain("packages/cli/src/ui/prompt.ts")
     expect(run).not.toContain("packages/tui/src/mini/runtime.ts")
     expect(run).not.toContain("packages/tui/src/mini/runtime.lifecycle.ts")
     expect(run).not.toContain("packages/tui/src/mini/footer.ts")
@@ -40,7 +69,7 @@ describe("CLI frontend import boundaries", () => {
     const imports: string[] = []
     for await (const file of glob.scan({ cwd: path.join(root, "packages/tui/src/mini") })) {
       const source = await Bun.file(path.join(root, "packages/tui/src/mini", file)).text()
-      if (/["']@opencode-ai\/(?:core|server|cli)(?:\/[^"']*)?["']/.test(source)) imports.push(file)
+      if (/["']@opencode\/(?:core|server|cli)(?:\/[^"']*)?["']/.test(source)) imports.push(file)
     }
     expect(imports).toEqual([])
 

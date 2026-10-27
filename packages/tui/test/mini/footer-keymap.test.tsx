@@ -8,13 +8,13 @@ import { RunFooterView } from "../../src/mini/footer.view"
 import { RUN_THEME_FALLBACK } from "../../src/mini/theme"
 import type { FooterState, FooterSubagentState, FooterView } from "../../src/mini/types"
 
-test("down opens subagents from an empty prompt", async () => {
+async function renderSubagent(interrupt: "ctrl+i" | "none") {
   const [state] = createSignal<FooterState>({
     phase: "idle",
     status: "",
-    queue: 0,
+    notice: "",
     model: "gpt-5",
-    usage: "",
+    usage: undefined,
     first: false,
     interrupt: 0,
     exit: 0,
@@ -27,7 +27,6 @@ test("down opens subagents from an empty prompt", async () => {
         label: "Explore",
         description: "Inspect the keymap",
         status: "running",
-        lastUpdatedAt: 1,
       },
     ],
     details: {},
@@ -35,9 +34,17 @@ test("down opens subagents from an empty prompt", async () => {
     forms: [],
   })
   const config = resolve(
-    { keybinds: { editor_open: "none", session_queued_prompts: "none" } },
+    {
+      keybinds: {
+        "prompt.editor": "none",
+        "session.queued_prompts": "none",
+        "composer.subagent.interrupt": interrupt,
+      },
+    },
     { terminalSuspend: true },
   )
+  const interrupted: string[] = []
+
   function Harness() {
     return (
       <Keymap.Provider config={config}>
@@ -48,6 +55,8 @@ test("down opens subagents from an empty prompt", async () => {
           references={() => []}
           commands={() => []}
           providers={() => undefined}
+          currentAgent={() => "Build"}
+          currentAgentID={() => "build"}
           currentModel={() => undefined}
           variants={() => []}
           currentVariant={() => undefined}
@@ -56,6 +65,17 @@ test("down opens subagents from an empty prompt", async () => {
           subagent={subagents}
           theme={() => RUN_THEME_FALLBACK}
           tuiConfig={config}
+          miniSettings={() => ({
+            thinking: "hide",
+            tools: "show",
+            shell_output: "hide",
+            turn_summary: "show",
+            footer: "show",
+            splash: "show",
+            work_spinner: "block-soft-slide",
+            mono: false,
+          })}
+          mono={false}
           onSubmit={() => true}
           onPermissionReply={() => {}}
           onFormReply={() => {}}
@@ -65,24 +85,54 @@ test("down opens subagents from an empty prompt", async () => {
           onEditorOpen={async () => undefined}
           onInputClear={() => {}}
           onExit={() => {}}
+          onAgentSelect={() => {}}
           onModelSelect={() => {}}
           onVariantSelect={() => {}}
           onRows={() => {}}
           onLayout={() => {}}
           onStatus={() => {}}
-          onQueuedRemove={async () => true}
+          onMiniSettingChange={() => {}}
+          onSubagentInterrupt={(sessionID) => interrupted.push(sessionID)}
         />
       </Keymap.Provider>
     )
   }
 
   const app = await testRender(() => <Harness />, { width: 100, height: 8, kittyKeyboard: true })
+  return { app, interrupted }
+}
+
+async function openSubagent(app: Awaited<ReturnType<typeof testRender>>) {
+  await app.renderOnce()
+  expect(app.renderer.currentFocusedEditor?.plainText).toBe("")
+  app.mockInput.pressArrow("down")
+  await app.renderOnce()
+  expect(app.captureCharFrame()).toContain("Select subagent")
+  app.mockInput.pressEnter()
+  await app.renderOnce()
+}
+
+test("configured subagent key updates its hint and action", async () => {
+  const { app, interrupted } = await renderSubagent("ctrl+i")
   try {
-    await app.renderOnce()
-    expect(app.renderer.currentFocusedEditor?.plainText).toBe("")
-    app.mockInput.pressArrow("down")
-    await app.renderOnce()
-    expect(app.captureCharFrame()).toContain("Select subagent")
+    await openSubagent(app)
+    expect(app.captureCharFrame()).toContain("ctrl+i")
+    app.mockInput.pressKey("i", { ctrl: true })
+    expect(interrupted).toEqual(["subagent-1"])
+  } finally {
+    app.renderer.currentFocusedRenderable?.blur()
+    app.renderer.currentFocusedEditor?.blur()
+    app.renderer.destroy()
+  }
+})
+
+test("disabled subagent interrupt has no component fallback", async () => {
+  const { app, interrupted } = await renderSubagent("none")
+  try {
+    await openSubagent(app)
+    expect(app.captureCharFrame()).not.toContain("ctrl+d")
+    app.mockInput.pressKey("d", { ctrl: true })
+    expect(interrupted).toEqual([])
   } finally {
     app.renderer.currentFocusedRenderable?.blur()
     app.renderer.currentFocusedEditor?.blur()

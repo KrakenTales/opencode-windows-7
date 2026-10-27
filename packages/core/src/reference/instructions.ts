@@ -1,9 +1,9 @@
-export * as ReferenceInstructions from "./instructions"
+export * as ReferenceInstructions from "./instructions.js"
 
-import { makeLocationNode } from "../effect/app-node"
+import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { Context, Effect, Layer, Schema } from "effect"
-import { Reference } from "../reference"
-import { Instructions } from "../instructions/index"
+import { Reference } from "../reference.js"
+import { Instructions } from "../instructions/index.js"
 
 const Summary = Schema.Struct({
   name: Schema.String,
@@ -35,8 +35,8 @@ const update = (previous: ReadonlyArray<typeof Summary.Type>, current: ReadonlyA
     (reference) => reference.name,
     (before, after) => before.path !== after.path || before.description !== after.description,
   )
-  // Additions and removals render as small deltas; anything else restates the full list.
-  if (diff.changed.length > 0 || (diff.added.length === 0 && diff.removed.length === 0))
+  // Added, changed, and removed references render as deltas; the full list is restated only when no entry differs.
+  if (diff.added.length === 0 && diff.changed.length === 0 && diff.removed.length === 0)
     return [
       "The available project references have changed. This list supersedes the previous reference list.",
       render(current),
@@ -45,6 +45,12 @@ const update = (previous: ReadonlyArray<typeof Summary.Type>, current: ReadonlyA
     ...(diff.added.length === 0
       ? []
       : ["New project references are available in addition to those previously listed:", ...entries(diff.added)]),
+    ...(diff.changed.length === 0
+      ? []
+      : [
+          "The following project references have changed. Each entry replaces the previously listed reference with the same name:",
+          ...entries(diff.changed.map((change) => change.current)),
+        ]),
     ...(diff.removed.length === 0
       ? []
       : [
@@ -54,10 +60,10 @@ const update = (previous: ReadonlyArray<typeof Summary.Type>, current: ReadonlyA
 }
 
 export interface Interface {
-  readonly load: () => Effect.Effect<Instructions.Instructions>
+  readonly load: () => Effect.Effect<Instructions.List>
 }
 
-export class Service extends Context.Service<Service, Interface>()("@opencode/v2/ReferenceInstructions") {}
+export class Service extends Context.Service<Service, Interface>()("@opencode/ReferenceInstructions") {}
 
 const layer = Layer.effect(
   Service,

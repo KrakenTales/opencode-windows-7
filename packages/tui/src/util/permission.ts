@@ -17,7 +17,7 @@ export type PermissionPresentationInput = {
   resources: ReadonlyArray<unknown>
   metadata?: unknown
   input?: unknown
-  structured?: unknown
+  toolMetadata?: unknown
 }
 
 export function permissionPresentation(
@@ -26,7 +26,7 @@ export function permissionPresentation(
 ): PermissionPresentation {
   const action = canonicalToolName(source.action)
   const input = normalizeInput(action, source.input)
-  const metadata = { ...dict(source.structured), ...dict(source.metadata) }
+  const metadata = { ...dict(source.toolMetadata), ...dict(source.metadata) }
   const resources = source.resources.filter((item): item is string => typeof item === "string")
 
   if (action === "edit") {
@@ -154,14 +154,14 @@ function wildcardDirectory(value: string) {
 export function permissionAlwaysLines(input: { action: string; save?: ReadonlyArray<string> }): string[] {
   const save = input.save ?? []
   if (save.length === 1 && save[0] === "*") {
-    return [`This will allow ${input.action} until OpenCode is restarted.`]
+    return [`This will always allow ${input.action} for this project.`]
   }
-  return ["This will allow the following patterns until OpenCode is restarted.", ...save.map((item) => `- ${item}`)]
+  return ["This will always allow the following patterns for this project.", ...save.map((item) => `- ${item}`)]
 }
 
 export function permissionOptionLabel(option: "once" | "always" | "reject" | "confirm" | "cancel") {
   if (option === "once") return "Allow once"
-  if (option === "always") return "Allow always"
+  if (option === "always") return "Always allow"
   if (option === "reject") return "Reject"
   if (option === "confirm") return "Confirm"
   return "Cancel"

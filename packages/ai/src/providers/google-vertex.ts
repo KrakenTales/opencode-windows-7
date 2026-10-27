@@ -1,11 +1,26 @@
-import type { ProviderPackage } from "../provider-package"
-import { Gemini } from "../protocols/gemini"
-import { Auth } from "../route/auth"
-import { Route, type RouteDefaultsInput } from "../route/client"
-import { Endpoint } from "../route/endpoint"
-import { Framing } from "../route/framing"
-import { ProviderID, type ModelID, type ProviderOptions } from "../schema"
-import { GoogleVertexShared } from "./google-vertex-shared"
+import { Effect } from "effect"
+import type { ProviderPackage } from "../provider-package.js"
+import { Gemini } from "../protocols/gemini.js"
+import { GoogleImages } from "../protocols/google-images.js"
+import { ProviderShared } from "../protocols/shared.js"
+import { Auth } from "../route/auth.js"
+import { Route, type RouteDefaultsInput } from "../route/client.js"
+import { Endpoint } from "../route/endpoint.js"
+import { MediaRoute } from "../route/media.js"
+import {
+  ProviderConfigurationError,
+  ProviderID,
+  type LLMRequest,
+  type ModelID,
+  type ProviderOptions,
+} from "../schema/index.js"
+import { GoogleVertexShared } from "./google-vertex-shared.js"
+
+export interface GeminiOptionsInput extends Gemini.OptionsInput {
+  readonly labels?: Readonly<Record<string, string>>
+}
+
+export type GeminiProviderOptionsInput = GeminiOptionsInput
 
 export const id = ProviderID.make("google-vertex")
 
@@ -14,9 +29,11 @@ export type Config = RouteDefaultsInput &
     readonly baseURL?: string
     readonly location?: string
     readonly project?: string
+    readonly providerOptions?: GeminiProviderOptionsInput
   }
 
 export type Settings = ProviderPackage.Settings &
+  GeminiProviderOptionsInput &
   (
     | { readonly accessToken?: string; readonly apiKey?: never }
     | { readonly accessToken?: never; readonly apiKey?: string }
@@ -24,20 +41,42 @@ export type Settings = ProviderPackage.Settings &
     readonly baseURL?: string
     readonly location?: string
     readonly project?: string
-    readonly providerOptions?: ProviderOptions
   }
+
+const fromRequest = Effect.fn("GoogleVertex.fromRequest")(function* (request: LLMRequest) {
+  const { serviceTier: _, ...body } = yield* Gemini.protocol.body.from(request)
+  const value = request.providerOptions?.labels
+  const labels = ProviderShared.isRecord(value)
+    ? Object.fromEntries(
+        Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+      )
+    : undefined
+  return { ...body, labels }
+})
+
+const protocol = {
+  ...Gemini.protocol,
+  body: {
+    ...Gemini.protocol.body,
+    from: fromRequest,
+  },
+}
 
 const route = Route.make({
   id: "google-vertex-gemini",
   provider: id,
-  providerMetadataKey: "google",
-  protocol: Gemini.protocol,
+  providerMetadataKey: "vertex",
+  protocol,
   endpoint: Endpoint.path(({ request }) => {
-    const model = String(request.model.id)
+    const model = request.model.id
     return `/${model.startsWith("endpoints/") ? model : `models/${model}`}:streamGenerateContent?alt=sse`
   }),
   auth: Auth.none,
-  framing: Framing.sse,
+  headers: ({ request }): Record<string, string> => {
+    const serviceTier = request.providerOptions?.serviceTier
+    return typeof serviceTier === "string" ? { "x-vertex-ai-llm-shared-request-type": serviceTier } : {}
+  },
+  transport: Gemini.transport,
 })
 
 export const routes = [route]
@@ -47,33 +86,48 @@ const configuredRoute = (input: Config, modelID: string | ModelID) => {
     accessToken: _accessToken,
     apiKey: _apiKey,
     auth: _auth,
-    baseURL,
-    location: inputLocation,
-    project: inputProject,
+    baseURL: _baseURL,
+    location: _location,
+    project: _project,
     ...rest
   } = input
+  return route.with({ ...rest, ...connection(input, modelID) })
+}
+
+const connection = (input: Config, modelID: string | ModelID) => {
   const apiKey = GoogleVertexShared.apiKey(input)
-  const endpointModel = String(modelID).startsWith("endpoints/")
+  const endpointModel = modelID.startsWith("endpoints/")
   if (apiKey !== undefined && endpointModel)
-    throw new Error("Google Vertex tuned models do not support Express Mode API keys")
-  const location = GoogleVertexShared.location(inputLocation, "us-central1")
-  const project = GoogleVertexShared.project(inputProject)
-  const endpoint =
-    baseURL ??
+    throw new ProviderConfigurationError({
+      provider: id,
+      message: "Google Vertex tuned models do not support Express Mode API keys",
+    })
+  const location = GoogleVertexShared.location(input.location)
+  const project = GoogleVertexShared.project(input.project)
+  const baseURL =
+    input.baseURL ??
     (apiKey
       ? "https://aiplatform.googleapis.com/v1/publishers/google"
       : `https://${GoogleVertexShared.host(location)}/v1beta1/projects/${GoogleVertexShared.requireProject(project)}/locations/${location}${endpointModel ? "" : "/publishers/google"}`)
-  return route.with({
-    ...rest,
-    endpoint: { baseURL: endpoint },
+  return {
+    endpoint: { baseURL },
     auth: apiKey === undefined ? GoogleVertexShared.oauth(input, project) : Auth.header("x-goog-api-key", apiKey),
-  })
+  }
 }
 
 export const configure = (input: Config = {}) => {
   return {
     id,
-    model: (modelID: string | ModelID) => configuredRoute(input, modelID).model({ id: modelID }),
+    model: (modelID: string | ModelID) =>
+      configuredRoute(input, modelID).model<GeminiProviderOptionsInput>({ id: modelID }),
+    image: (modelID: string | ModelID, providerOptions?: ProviderOptions) => {
+      const target = connection(input, modelID)
+      return GoogleImages.model({
+        ...MediaRoute.deployment({ ...input, baseURL: target.endpoint.baseURL }, target.auth),
+        id: modelID,
+        providerOptions,
+      })
+    },
     configure,
   }
 }
@@ -82,17 +136,26 @@ export const provider = {
   id,
   configure,
 }
-export const model: ProviderPackage.Definition<Settings>["model"] = (modelID, settings) => {
-  if (settings.apiKey !== undefined && settings.accessToken !== undefined)
-    throw new Error("Google Vertex apiKey cannot be combined with accessToken or auth")
-  return configure({
-    ...(settings.apiKey === undefined ? { accessToken: settings.accessToken } : { apiKey: settings.apiKey }),
-    baseURL: settings.baseURL,
-    headers: settings.headers === undefined ? undefined : { ...settings.headers },
-    http: settings.body === undefined ? undefined : { body: { ...settings.body } },
-    limits: settings.limits,
-    location: settings.location,
-    project: settings.project,
-    providerOptions: settings.providerOptions,
-  }).model(modelID)
+export const model: ProviderPackage.Definition<Settings, GeminiProviderOptionsInput>["model"] = (modelID, settings) =>
+  configure(config(settings)).model(modelID)
+export const imageModel = (modelID: string, settings: Settings) => {
+  const input = config(settings)
+  return configure(input).image(modelID, input.providerOptions)
+}
+
+function config({ accessToken, apiKey, baseURL, body, headers, location, project, ...providerOptions }: Settings) {
+  if (apiKey !== undefined && accessToken !== undefined)
+    throw new ProviderConfigurationError({
+      provider: id,
+      message: "Google Vertex apiKey cannot be combined with accessToken or auth",
+    })
+  return {
+    ...(apiKey === undefined ? { accessToken: accessToken } : { apiKey: apiKey }),
+    baseURL,
+    headers,
+    http: body === undefined ? undefined : { body },
+    location,
+    project,
+    providerOptions,
+  }
 }

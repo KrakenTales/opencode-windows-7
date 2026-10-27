@@ -1,12 +1,18 @@
 import { Context, Layer } from "effect"
 import { networkInterfaces } from "node:os"
+import type { ServerOptions } from "./options"
 
-export class Service extends Context.Service<Service, { readonly urls: () => ReadonlyArray<string> }>()(
-  "@opencode-ai/server/ServerInfo",
-) {}
+export class Service extends Context.Service<
+  Service,
+  {
+    readonly urls: () => ReadonlyArray<string>
+    readonly app: NonNullable<ServerOptions["app"]>
+    readonly paths: { readonly tmp: string }
+  }
+>()("@opencode/server/ServerInfo") {}
 
-export function layer(urls: () => ReadonlyArray<string>) {
-  return Layer.succeed(Service, Service.of({ urls }))
+export function layer(urls: () => ReadonlyArray<string>, tmp: string, app: ServerOptions["app"] = {}) {
+  return Layer.succeed(Service, Service.of({ urls, app, paths: { tmp } }))
 }
 
 export function connectionURLs(value: string, requestedHostname?: string) {
@@ -15,9 +21,12 @@ export function connectionURLs(value: string, requestedHostname?: string) {
   const family = hostname === "0.0.0.0" ? "IPv4" : hostname === "::" || hostname === "[::]" ? "IPv6" : undefined
   if (family === undefined) return [value]
 
+  const loopback = new URL(value)
+  loopback.hostname = family === "IPv6" ? "[::1]" : "127.0.0.1"
   return [
-    ...new Set(
-      Object.values(networkInterfaces())
+    ...new Set([
+      loopback.toString().replace(/\/$/, ""),
+      ...Object.values(networkInterfaces())
         .flatMap((entries) => entries ?? [])
         .filter((entry) => !entry.internal && entry.family === family)
         .map((entry) => {
@@ -25,7 +34,7 @@ export function connectionURLs(value: string, requestedHostname?: string) {
           result.hostname = family === "IPv6" ? `[${entry.address}]` : entry.address
           return result.toString().replace(/\/$/, "")
         }),
-    ),
+    ]),
   ]
 }
 

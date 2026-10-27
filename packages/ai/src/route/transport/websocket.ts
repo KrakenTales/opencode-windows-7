@@ -1,8 +1,14 @@
-import { Cause, Context, Effect, Layer, Queue, Stream } from "effect"
-import { Headers } from "effect/unstable/http"
-import { LLMError, TransportReason } from "../../schema"
-import * as HttpTransport from "./http"
-import type { Transport } from "./index"
+import { Cause, Effect, Queue, Stream } from "effect"
+import { Headers } from "effect/http"
+import { Socket } from "effect/socket"
+import {
+  AIError,
+  AIErrorReason,
+  TransportError,
+  type HttpContext,
+  type TransportOperation,
+} from "../../schema/index.js"
+import type { ChannelObservation, WebSocketChannelExecutor } from "./websocket-channel.js"
 
 export interface WebSocketRequest {
   readonly url: string
@@ -10,36 +16,62 @@ export interface WebSocketRequest {
 }
 
 export interface WebSocketConnection {
-  readonly sendText: (message: string) => Effect.Effect<void, LLMError>
-  readonly messages: Stream.Stream<string | Uint8Array, LLMError>
+  readonly http?: HttpContext
+  readonly sendText: (message: string) => Effect.Effect<void, AIError>
+  readonly messages: Stream.Stream<string | Uint8Array, AIError>
   readonly close: Effect.Effect<void, never>
 }
 
-export interface Interface {
-  readonly open: (input: WebSocketRequest) => Effect.Effect<WebSocketConnection, LLMError>
+export interface WebSocketConnector {
+  readonly open: (input: WebSocketRequest) => Effect.Effect<WebSocketConnection, AIError>
 }
 
-type WebSocketConstructorWithHeaders = new (
-  url: string,
-  options?: { readonly headers?: Headers.Headers },
-) => globalThis.WebSocket
-
-export class Service extends Context.Service<Service, Interface>()("@opencode/LLM/WebSocketExecutor") {}
-
+const MAX_FRAME_BYTES = 16 * 1024 * 1024
 const transportError = (
-  method: string,
   message: string,
-  input: { readonly url?: string; readonly kind?: string } = {},
+  input: {
+    readonly operation: TransportOperation
+    readonly url?: string
+    readonly code?: string
+    readonly phase?: TransportError["phase"]
+    readonly delivery?: TransportError["delivery"]
+    readonly body?: string
+    readonly cause?: unknown
+  },
 ) =>
-  new LLMError({
-    module: "WebSocketExecutor",
-    method,
-    reason: new TransportReason({ message, url: input.url, kind: input.kind }),
+  new AIError({
+    reason: new TransportError({
+      message,
+      body: input.body,
+      cause: input.cause,
+      transport: "websocket",
+      operation: input.operation,
+      url: input.url,
+      code: input.code,
+      phase: input.phase,
+      delivery: input.delivery,
+    }),
   })
 
-const eventMessage = (event: Event) => {
+const annotateTransportError = (
+  error: AIError,
+  input: { readonly phase: TransportError["phase"]; readonly delivery: TransportError["delivery"] },
+) =>
+  error.reason._tag === "Transport"
+    ? new AIError({
+        reason: new TransportError({
+          ...error.reason,
+          message: error.reason.message,
+          cause: error.reason.cause,
+          phase: input.phase,
+          delivery: input.delivery,
+        }),
+      })
+    : error
+
+const eventMessage = (event: Socket.WebSocketEvent) => {
   if ("message" in event && typeof event.message === "string") return event.message
-  return event.type
+  return event.type ?? "error"
 }
 
 const binaryMessage = (data: unknown) => {
@@ -49,17 +81,20 @@ const binaryMessage = (data: unknown) => {
   return undefined
 }
 
-const waitOpen = (ws: globalThis.WebSocket, input: WebSocketRequest) => {
+const waitOpen = (ws: Socket.WebSocketLike, input: WebSocketRequest) => {
   if (ws.readyState === globalThis.WebSocket.OPEN) return Effect.void
   if (ws.readyState === globalThis.WebSocket.CLOSING || ws.readyState === globalThis.WebSocket.CLOSED) {
     return Effect.fail(
-      transportError("open", `WebSocket closed before opening (state ${ws.readyState})`, {
+      transportError(`WebSocket closed before opening (state ${ws.readyState})`, {
         url: input.url,
-        kind: "open",
+        operation: "request",
+        code: "closed",
+        phase: "connect",
+        delivery: "not-sent",
       }),
     )
   }
-  return Effect.callback<void, LLMError>((resume, signal) => {
+  return Effect.callback<void, AIError>((resume, signal) => {
     const cleanup = () => {
       ws.removeEventListener("open", onOpen)
       ws.removeEventListener("error", onError)
@@ -68,28 +103,42 @@ const waitOpen = (ws: globalThis.WebSocket, input: WebSocketRequest) => {
     }
     const onAbort = () => {
       cleanup()
-      if (ws.readyState !== globalThis.WebSocket.CLOSED && ws.readyState !== globalThis.WebSocket.CLOSING)
-        ws.close(1000)
+      if (ws.readyState === globalThis.WebSocket.CLOSED || ws.readyState === globalThis.WebSocket.CLOSING) return
+      // Node's ws reports an aborted handshake as an error event on the next tick; with no listener left
+      // after cleanup, EventEmitter would throw it as an uncaught exception.
+      ws.addEventListener("error", () => {}, { once: true })
+      ws.close(1000)
     }
     const onOpen = () => {
       cleanup()
       resume(Effect.void)
     }
-    const onError = (event: Event) => {
+    const onError = (event: Socket.WebSocketEvent) => {
       cleanup()
       resume(
         Effect.fail(
-          transportError("open", `Failed to open WebSocket: ${eventMessage(event)}`, { url: input.url, kind: "open" }),
+          transportError(`Failed to open WebSocket: ${eventMessage(event)}`, {
+            cause: "error" in event ? (event.error ?? event) : event,
+            url: input.url,
+            operation: "request",
+            phase: "connect",
+            delivery: "not-sent",
+          }),
         ),
       )
     }
-    const onClose = (event: CloseEvent) => {
+    const onClose = (event: Socket.WebSocketEvent) => {
       cleanup()
       resume(
         Effect.fail(
-          transportError("open", `WebSocket closed before opening with code ${event.code}`, {
+          transportError(`WebSocket closed before opening with code ${event.code}`, {
+            body: event.reason,
+            cause: event,
             url: input.url,
-            kind: "open",
+            operation: "request",
+            code: String(event.code),
+            phase: "connect",
+            delivery: "not-sent",
           }),
         ),
       )
@@ -101,7 +150,7 @@ const waitOpen = (ws: globalThis.WebSocket, input: WebSocketRequest) => {
   })
 }
 
-const webSocketUrl = (value: string) =>
+export const toWebSocketUrl = (value: string) =>
   Effect.try({
     try: () => {
       const url = new URL(value)
@@ -116,58 +165,110 @@ const webSocketUrl = (value: string) =>
       throw new Error(`Unsupported WebSocket URL protocol ${url.protocol}`)
     },
     catch: (error) =>
-      transportError("prepare", error instanceof Error ? error.message : "Invalid WebSocket URL", {
+      transportError(error instanceof Error ? error.message : "Invalid WebSocket URL", {
+        cause: error,
         url: value,
-        kind: "websocket",
+        operation: "request",
+        code: "invalid-url",
+        phase: "prepare",
+        delivery: "not-sent",
       }),
   })
 
 export const open = (input: WebSocketRequest) =>
-  Effect.try({
-    try: () =>
-      new (globalThis.WebSocket as unknown as WebSocketConstructorWithHeaders)(input.url, { headers: input.headers }),
-    catch: (error) =>
-      transportError("open", error instanceof Error ? error.message : "Failed to construct WebSocket", {
-        url: input.url,
-        kind: "open",
-      }),
-  }).pipe(Effect.flatMap((ws) => fromWebSocket(ws, input)))
-
-export const layer: Layer.Layer<Service> = Layer.succeed(Service, Service.of({ open }))
+  Effect.gen(function* () {
+    const constructor = yield* Socket.WebSocketConstructor
+    const ws = yield* Effect.try({
+      try: () => constructor(input.url, { headers: input.headers }),
+      catch: (error) =>
+        transportError(error instanceof Error ? error.message : "Failed to construct WebSocket", {
+          cause: error,
+          url: input.url,
+          operation: "request",
+          phase: "connect",
+          delivery: "not-sent",
+        }),
+    })
+    return yield* fromWebSocket(ws, input)
+  })
 
 export const fromWebSocket = (
-  ws: globalThis.WebSocket,
+  ws: Socket.WebSocketLike,
   input: WebSocketRequest,
-): Effect.Effect<WebSocketConnection, LLMError> =>
+): Effect.Effect<WebSocketConnection, AIError> =>
   Effect.gen(function* () {
     yield* waitOpen(ws, input)
-    const messages = yield* Queue.bounded<string | Uint8Array, LLMError | Cause.Done<void>>(128)
+    // The socket pushes frames synchronously and cannot be paused, so the hand-off to the consumer
+    // fiber must absorb whole read buffers. Bun delivers over a thousand small frames in one tick.
+    const messages = yield* Queue.unbounded<string | Uint8Array, AIError | Cause.Done<void>>()
 
-    const onMessage = (event: MessageEvent) => {
-      if (typeof event.data === "string") return Queue.offerUnsafe(messages, event.data)
+    const oversized = (message: string | Uint8Array) =>
+      typeof message === "string" ? new Blob([message]).size > MAX_FRAME_BYTES : message.byteLength > MAX_FRAME_BYTES
+    const rejectOversized = (message: string | Uint8Array) => {
+      if (!oversized(message)) return false
+      Queue.failCauseUnsafe(
+        messages,
+        Cause.fail(
+          transportError("WebSocket message exceeds the 16 MiB limit", {
+            body: typeof message === "string" ? message : new TextDecoder().decode(message),
+            url: input.url,
+            operation: "read",
+            code: "message-too-large",
+            phase: "receive",
+          }),
+        ),
+      )
+      if (ws.readyState === globalThis.WebSocket.OPEN) ws.close(1009, "Message too large")
+      return true
+    }
+    const offer = (message: string | Uint8Array) => {
+      if (rejectOversized(message)) return
+      Queue.offerUnsafe(messages, message)
+    }
+
+    const onMessage = (event: Socket.WebSocketEvent) => {
+      if (typeof event.data === "string") return offer(event.data)
       const binary = binaryMessage(event.data)
-      if (binary) return Queue.offerUnsafe(messages, binary)
+      if (binary) return offer(binary)
       Queue.failCauseUnsafe(
         messages,
         Cause.fail(
-          transportError("message", "Unsupported WebSocket message payload", { url: input.url, kind: "message" }),
+          transportError("Unsupported WebSocket message payload", {
+            cause: event,
+            url: input.url,
+            operation: "read",
+            code: "message",
+            phase: "receive",
+          }),
         ),
       )
     }
-    const onError = (event: Event) => {
+    const onError = (event: Socket.WebSocketEvent) => {
       Queue.failCauseUnsafe(
         messages,
         Cause.fail(
-          transportError("message", `WebSocket error: ${eventMessage(event)}`, { url: input.url, kind: "message" }),
+          transportError(`WebSocket error: ${eventMessage(event)}`, {
+            cause: "error" in event ? (event.error ?? event) : event,
+            url: input.url,
+            operation: "read",
+            code: "message",
+            phase: "receive",
+          }),
         ),
       )
     }
-    const onClose = (event: CloseEvent) => {
-      if (event.code === 1000 || event.code === 1005) return Queue.endUnsafe(messages)
+    const onClose = (event: Socket.WebSocketEvent) => {
       Queue.failCauseUnsafe(
         messages,
         Cause.fail(
-          transportError("message", `WebSocket closed with code ${event.code}`, { url: input.url, kind: "close" }),
+          transportError(`WebSocket closed with code ${event.code}`, {
+            body: event.reason,
+            cause: event,
+            url: input.url,
+            operation: "read",
+            code: String(event.code),
+            phase: "close",
+          }),
         ),
       )
     }
@@ -183,13 +284,27 @@ export const fromWebSocket = (
 
     return {
       sendText: (message) =>
-        Effect.try({
-          try: () => ws.send(message),
-          catch: (error) =>
-            transportError("sendText", error instanceof Error ? error.message : "Failed to send WebSocket message", {
-              url: input.url,
-              kind: "write",
-            }),
+        Effect.suspend(() => {
+          if (ws.readyState !== globalThis.WebSocket.OPEN)
+            return Effect.fail(
+              transportError(`WebSocket is not open (state ${ws.readyState})`, {
+                url: input.url,
+                operation: "write",
+                phase: "send",
+                delivery: "not-sent",
+              }),
+            )
+          return Effect.try({
+            try: () => ws.send(message),
+            catch: (error) =>
+              transportError(error instanceof Error ? error.message : "Failed to send WebSocket message", {
+                cause: error,
+                url: input.url,
+                operation: "write",
+                phase: "send",
+                delivery: "not-sent",
+              }),
+          })
         }),
       messages: Stream.fromQueue(messages),
       close: cleanup.pipe(
@@ -206,75 +321,115 @@ export const fromWebSocket = (
 export const messageText = (message: string | Uint8Array, decoder: TextDecoder) =>
   typeof message === "string" ? message : decoder.decode(message)
 
-export interface JsonPrepared {
-  readonly url: string
-  readonly headers: Headers.Headers
-  readonly message: string
+const observationFrame = (observation: ChannelObservation) => {
+  if (observation.type === "frame" || observation.type === "completed" || observation.type === "incomplete")
+    return Effect.succeed(observation.frame)
+  return Effect.fail(observation.error)
 }
 
-export interface JsonInput<Body, Message> {
-  readonly toMessage: (body: Body | Record<string, unknown>) => Effect.Effect<Message, LLMError>
-  readonly encodeMessage: (message: Message) => string
-}
+const observationTerminal = (observation: ChannelObservation) => observation.type !== "frame"
 
-export type JsonPatch<Body, Message> = Partial<JsonInput<Body, Message>>
-
-export interface JsonTransport<Body, Message> extends Transport<Body, JsonPrepared, string> {
-  readonly with: (patch: JsonPatch<Body, Message>) => JsonTransport<Body, Message>
-}
-
-export const json = <Body, Message>(input: JsonInput<Body, Message>): JsonTransport<Body, Message> => ({
-  id: "websocket-json",
-  with: (patch) => json({ ...input, ...patch }),
-  prepare: (prepareInput) =>
+export const makeDirect = (connector: WebSocketConnector): WebSocketChannelExecutor => ({
+  execute: (exchange) =>
     Effect.gen(function* () {
-      const parts = yield* HttpTransport.jsonRequestParts({
-        ...prepareInput,
-      })
+      const connection = yield* Effect.acquireRelease(
+        connector
+          .open(exchange.connect)
+          .pipe(Effect.mapError((error) => annotateTransportError(error, { phase: "connect", delivery: "not-sent" }))),
+        (connection) => connection.close,
+      )
+      const create = yield* exchange.driver.create(undefined)
+      yield* connection.sendText(create.message).pipe(
+        Effect.mapError(
+          (error) =>
+            new AIError({
+              reason: AIErrorReason.make({
+                ...error.reason,
+                message: error.reason.message,
+                cause: error.reason.cause,
+                http: error.reason.http ?? connection.http,
+              }),
+            }),
+        ),
+      )
+      const decoder = new TextDecoder()
+      let observed = false
       return {
-        url: yield* webSocketUrl(parts.url),
-        headers: parts.headers,
-        message: input.encodeMessage(yield* input.toMessage(parts.jsonBody)),
+        http: connection.http,
+        frames: connection.messages.pipe(
+          Stream.map((message) => {
+            observed = true
+            return messageText(message, decoder)
+          }),
+          Stream.mapError((error) =>
+            annotateTransportError(error, {
+              phase: error.reason._tag === "Transport" && error.reason.phase === "close" ? "close" : "receive",
+              delivery: observed ? "accepted" : "ambiguous",
+            }),
+          ),
+          Stream.mapEffect((frame) =>
+            exchange.driver.observe(create, frame).pipe(
+              Effect.mapError(
+                (error) =>
+                  new AIError({
+                    reason: AIErrorReason.make({
+                      ...error.reason,
+                      message: error.reason.message,
+                      cause: error.reason.cause,
+                      body: frame,
+                    }),
+                  }),
+              ),
+              Effect.map((observation) =>
+                "error" in observation
+                  ? {
+                      ...observation,
+                      error: new AIError({
+                        reason: AIErrorReason.make({
+                          ...observation.error.reason,
+                          message: observation.error.reason.message,
+                          cause: observation.error.reason.cause,
+                          body: frame,
+                        }),
+                      }),
+                    }
+                  : observation,
+              ),
+            ),
+          ),
+          Stream.takeUntil(observationTerminal),
+          Stream.mapEffect(observationFrame),
+          Stream.mapError(
+            (error) =>
+              new AIError({
+                reason: AIErrorReason.make({
+                  ...error.reason,
+                  message: error.reason.message,
+                  cause: error.reason.cause,
+                  http: error.reason.http ?? connection.http,
+                }),
+              }),
+          ),
+        ),
+        complete: Effect.void,
       }
     }),
-  frames: (prepared, _request, runtime) => {
-    const webSocket = runtime.webSocket
-    if (!webSocket) {
-      return Stream.fail(
-        transportError("json", "WebSocket JSON transport requires WebSocketExecutor.Service", {
-          url: prepared.url,
-          kind: "websocket",
-        }),
-      )
-    }
-    const decoder = new TextDecoder()
-    return Stream.unwrap(
-      Effect.gen(function* () {
-        const connection = yield* Effect.acquireRelease(
-          webSocket.open({ url: prepared.url, headers: prepared.headers }),
-          (connection) => connection.close,
-        )
-        yield* connection.sendText(prepared.message)
-        return connection.messages.pipe(Stream.map((message) => messageText(message, decoder)))
-      }),
-    )
-  },
 })
 
-export const jsonTransport = {
-  id: "websocket-json",
-  with: json,
-} as const
+export const direct: Effect.Effect<WebSocketChannelExecutor, never, Socket.WebSocketConstructor> = Effect.gen(
+  function* () {
+    const constructor = yield* Socket.WebSocketConstructor
+    return makeDirect({
+      open: (input) => open(input).pipe(Effect.provideService(Socket.WebSocketConstructor, constructor)),
+    })
+  },
+)
 
-export const WebSocketExecutor = {
-  Service,
-  layer,
+export const WebSocketTransport = {
+  direct,
+  makeDirect,
   open,
   fromWebSocket,
   messageText,
-} as const
-
-export const WebSocketTransport = {
-  json,
-  jsonTransport,
+  toWebSocketUrl,
 } as const

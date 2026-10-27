@@ -1,4 +1,4 @@
-import type { FormAnswer, FormField, FormInfo, FormValue } from "@opencode-ai/client/promise"
+import type { FormAnswer, FormField, FormInfo, FormValue } from "@opencode/client/promise"
 import {
   formCustom,
   formDisplayValue,
@@ -14,7 +14,7 @@ import {
 import type { FormAnswerField } from "../util/form"
 import type { FormReply, MiniFormRequest } from "./types"
 
-export { formCustom, formLabel, formRows, formSelected, formTextual, formValidateValue }
+export { formCustom, formLabel, formRows, formTextual, formValidateValue }
 
 export type FormBodyState = {
   formID: string
@@ -97,7 +97,7 @@ export function formSetSelected(state: FormBodyState, selected: number): FormBod
   return { ...state, selected, error: "" }
 }
 
-export function formSetEditing(state: FormBodyState, editing: boolean): FormBodyState {
+function formSetEditing(state: FormBodyState, editing: boolean): FormBodyState {
   return { ...state, editing, error: "" }
 }
 
@@ -232,9 +232,9 @@ export function formDisplay(field: FormAnswerField, value: FormValue | undefined
 export function formErrorMessage(error: unknown) {
   if (typeof error === "string" && error.trim()) return error
   if (error && typeof error === "object") {
-    const message = Reflect.get(error, "message")
+    const message = "message" in error ? error.message : undefined
     if (typeof message === "string" && message.trim()) return message
-    const tag = Reflect.get(error, "_tag")
+    const tag = "_tag" in error ? error._tag : undefined
     if (typeof tag === "string" && tag.trim()) return tag
   }
   return "Form request failed"

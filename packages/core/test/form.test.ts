@@ -1,13 +1,13 @@
 import { describe, expect } from "bun:test"
 import { Deferred, Effect, Exit, Fiber } from "effect"
-import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
-import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { EventV2 } from "@opencode-ai/core/event"
-import { Form } from "@opencode-ai/core/form"
-import { SessionSchema } from "@opencode-ai/core/session/schema"
+import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
+import { LayerNode } from "@opencode/util/effect/layer-node"
+import { Bus } from "@opencode/core/bus"
+import { Form } from "@opencode/core/form"
+import { SessionSchema } from "@opencode/core/session/schema"
 import { testEffect } from "./lib/effect"
 
-const forms = AppNodeBuilder.build(LayerNode.group([EventV2.node, Form.node]))
+const forms = AppNodeBuilder.build(LayerNode.group([Bus.node, Form.node]))
 const it = testEffect(forms)
 
 const formID = Form.ID.create("frm_test")
@@ -19,12 +19,23 @@ const input = {
 } satisfies Form.CreateInput
 
 describe("Form", () => {
+  it.effect("validates absolute URI formats without restricting schemes", () =>
+    Effect.sync(() => {
+      const fields = [{ key: "uri", type: "string", format: "uri" }] satisfies ReadonlyArray<Form.Field>
+
+      expect(Form.validateAnswer(fields, { uri: "https://example.com/path" })).toBeUndefined()
+      expect(Form.validateAnswer(fields, { uri: "mailto:user@example.com" })).toBeUndefined()
+      expect(Form.validateAnswer(fields, { uri: "relative/path" })).toBe("Expected URI for form field: uri")
+      expect(Form.validateAnswer(fields, { uri: "://invalid" })).toBe("Expected URI for form field: uri")
+    }),
+  )
+
   it.effect("returns a terminal cancelled state from ask", () =>
     Effect.gen(function* () {
       const service = yield* Form.Service
-      const events = yield* EventV2.Service
+      const bus = yield* Bus.Service
       const created = yield* Deferred.make<Form.Info>()
-      const unsubscribe = yield* events.listen((event) =>
+      const unsubscribe = yield* bus.listen((event) =>
         event.type === Form.Event.Created.type
           ? Deferred.succeed(created, (event.data as { readonly form: Form.Info }).form).pipe(Effect.asVoid)
           : Effect.void,
@@ -311,8 +322,8 @@ describe("Form", () => {
   it.effect("cleans up created forms when event publication fails", () =>
     Effect.gen(function* () {
       const service = yield* Form.Service
-      const events = yield* EventV2.Service
-      const unsubscribe = yield* events.listen((event) =>
+      const bus = yield* Bus.Service
+      const unsubscribe = yield* bus.listen((event) =>
         event.type === Form.Event.Created.type ? Effect.die("create listener failed") : Effect.void,
       )
       yield* Effect.addFinalizer(() => unsubscribe)
@@ -328,9 +339,9 @@ describe("Form", () => {
   it.effect("keeps forms pending when reply event publication fails", () =>
     Effect.gen(function* () {
       const service = yield* Form.Service
-      const events = yield* EventV2.Service
+      const bus = yield* Bus.Service
       yield* service.create(input)
-      const unsubscribe = yield* events.listen((event) =>
+      const unsubscribe = yield* bus.listen((event) =>
         event.type === Form.Event.Replied.type ? Effect.die("reply listener failed") : Effect.void,
       )
       yield* Effect.addFinalizer(() => unsubscribe)

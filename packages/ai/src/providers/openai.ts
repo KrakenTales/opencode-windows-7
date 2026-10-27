@@ -1,18 +1,33 @@
-import { AuthOptions, type ProviderAuthOption } from "../route/auth-options"
-import type { Route, RouteDefaultsInput } from "../route/client"
-import type { ProviderPackage } from "../provider-package"
-import { HttpOptions, ProviderID, ToolDefinition, mergeHttpOptions, type ModelID } from "../schema"
-import * as OpenAIChat from "../protocols/openai-chat"
-import * as OpenAIResponses from "../protocols/openai-responses"
-import { withOpenAIOptions, type OpenAIProviderOptionsInput } from "./openai-options"
-import { OpenAIImages, type OpenAIImageOptions } from "../protocols/openai-images"
+import { AuthOptions, type ProviderAuthOption } from "../route/auth-options.js"
+import type { Route, RouteDefaultsInput, CompactionOperations } from "../route/client.js"
+import { MediaRoute } from "../route/media.js"
+import type { ProviderPackage } from "../provider-package.js"
+import {
+  HttpOptions,
+  ProviderID,
+  ToolDefinition,
+  mergeHttpOptions,
+  type ModelID,
+  type OpenString,
+  type ProviderOptions,
+} from "../schema/index.js"
+import * as OpenAIChat from "../protocols/openai-chat.js"
+import * as OpenAIResponses from "../protocols/openai-responses.js"
+import { withOpenAIOptions, type OpenAIProviderOptionsInput } from "./openai-options.js"
+import { OpenAIImages } from "../protocols/openai-images.js"
+import { OpenAISpeech } from "../protocols/openai-speech.js"
+import { OpenAITranscription } from "../protocols/openai-transcription.js"
+import { OpenAIDecisions, type OptionsInput as OpenAIDecisionOptionsInput } from "../protocols/openai-decisions.js"
 
-export type { OpenAIOptionsInput, OpenAIResponseIncludable } from "./openai-options"
-export type { OpenAIImageOptions } from "../protocols/openai-images"
+export type { OpenAIOptionsInput, OpenAIResponseIncludable, OpenAIServiceTier } from "./openai-options.js"
+export type { OpenAIImageOptions } from "../protocols/openai-images.js"
+export type { OpenAISpeechOptions } from "../protocols/openai-speech.js"
+export type { OpenAITranscriptionOptions } from "../protocols/openai-transcription.js"
+export type { OptionsInput as OpenAIDecisionOptions } from "../protocols/openai-decisions.js"
 
 export const id = ProviderID.make("openai")
 
-export const routes = [OpenAIResponses.route, OpenAIResponses.webSocketRoute, OpenAIChat.route]
+export const routes = [OpenAIResponses.route, OpenAIChat.route]
 
 // This provider facade wraps the lower-level Responses and Chat model factories
 // with OpenAI-specific conveniences: typed options, API-key sugar, env fallback,
@@ -22,22 +37,19 @@ export type Config = RouteDefaultsInput &
     readonly baseURL?: string
     readonly queryParams?: Record<string, string>
     readonly providerOptions?: OpenAIProviderOptionsInput
-    readonly image?: ImageConfig
   }
 
-export interface ImageConfig {
-  readonly providerOptions?: OpenAIImageOptions
-}
-
 export interface ImageGenerationOptions {
-  readonly action?: "auto" | "generate" | "edit"
-  readonly background?: "auto" | "opaque" | "transparent"
-  readonly inputFidelity?: "low" | "high"
+  readonly action?: OpenString<"auto" | "generate" | "edit">
+  readonly background?: OpenString<"auto" | "opaque" | "transparent">
+  readonly inputFidelity?: OpenString<"low" | "high">
   readonly outputCompression?: number
-  readonly outputFormat?: "png" | "jpeg" | "webp"
+  readonly outputFormat?: OpenString<"png" | "jpeg" | "webp">
   readonly partialImages?: number
-  readonly quality?: "auto" | "low" | "medium" | "high"
-  readonly size?: string
+  readonly quality?: OpenString<"auto" | "low" | "medium" | "high" | "standard" | "hd">
+  readonly size?: OpenString<
+    "auto" | "256x256" | "512x512" | "1024x1024" | "1536x1024" | "1024x1536" | "1792x1024" | "1024x1792"
+  >
 }
 
 export const imageGeneration = (options: ImageGenerationOptions = {}) =>
@@ -60,24 +72,26 @@ export const imageGeneration = (options: ImageGenerationOptions = {}) =>
     },
   })
 
-export interface Settings extends ProviderPackage.Settings {
-  readonly apiKey?: string
-  readonly baseURL?: string
-  readonly organization?: string
-  readonly project?: string
-  readonly queryParams?: Readonly<Record<string, string>>
-  readonly transport?: "http" | "websocket"
-  readonly providerOptions?: OpenAIProviderOptionsInput
-}
+export type Settings = ProviderPackage.Settings &
+  OpenAIProviderOptionsInput & {
+    readonly apiKey?: string
+    readonly baseURL?: string
+    readonly organization?: string
+    readonly project?: string
+    readonly queryParams?: Readonly<Record<string, string>>
+  }
 
 const auth = (options: ProviderAuthOption<"optional">) => AuthOptions.bearer(options, "OPENAI_API_KEY")
 
 const defaults = (input: Config) => {
-  const { apiKey: _, auth: _auth, baseURL: _baseURL, queryParams: _queryParams, image: _image, ...rest } = input
+  const { apiKey: _, auth: _auth, baseURL: _baseURL, queryParams: _queryParams, ...rest } = input
   return rest
 }
 
-const configuredRoute = <Body, Prepared>(route: Route<Body, Prepared>, input: Config) =>
+const configuredRoute = <Body, Prepared, Compact extends CompactionOperations | undefined>(
+  route: Route<Body, Prepared, Compact>,
+  input: Config,
+) =>
   route.with({
     auth: auth(input),
     endpoint: { baseURL: input.baseURL, query: input.queryParams },
@@ -85,70 +99,99 @@ const configuredRoute = <Body, Prepared>(route: Route<Body, Prepared>, input: Co
 
 export const configure = (input: Config = {}) => {
   const responsesRoute = configuredRoute(OpenAIResponses.route, input)
-  const responsesWebSocketRoute = configuredRoute(OpenAIResponses.webSocketRoute, input)
   const chatRoute = configuredRoute(OpenAIChat.route, input)
   const modelDefaults = defaults(input)
   const responses = (id: string | ModelID) =>
-    responsesRoute.with(withOpenAIOptions(id, modelDefaults, { textVerbosity: true })).model({ id })
-  const responsesWebSocket = (id: string | ModelID) =>
-    responsesWebSocketRoute.with(withOpenAIOptions(id, modelDefaults, { textVerbosity: true })).model({ id })
-  const chat = (id: string | ModelID) => chatRoute.with(withOpenAIOptions(id, modelDefaults)).model({ id })
-  const image = (modelID: string | ModelID) =>
-    OpenAIImages.model({
-      id: modelID,
-      auth: auth(input),
-      baseURL: input.baseURL,
-      headers: input.headers,
-      defaults: {
-        providerOptions:
-          input.image?.providerOptions === undefined ? undefined : { openai: { ...input.image.providerOptions } },
-        http: mergeHttpOptions(
-          input.http === undefined ? undefined : HttpOptions.make(input.http),
-          input.queryParams === undefined ? undefined : new HttpOptions({ query: input.queryParams }),
-        ),
-      },
+    responsesRoute.with(withOpenAIOptions(id, modelDefaults)).model<OpenAIProviderOptionsInput>({ id })
+  const chat = (id: string | ModelID) =>
+    chatRoute.with(withOpenAIOptions(id, modelDefaults)).model<OpenAIProviderOptionsInput>({
+      id,
+      compatibility: { supportsPromptCacheKey: true },
     })
+  const deployment = MediaRoute.deployment(input, auth(input))
+  const media = {
+    ...deployment,
+    http: mergeHttpOptions(
+      deployment.http,
+      input.queryParams === undefined ? undefined : new HttpOptions({ query: input.queryParams }),
+    ),
+  }
+  const image = (modelID: string | ModelID, providerOptions?: ProviderOptions) =>
+    OpenAIImages.model({ ...media, id: modelID, providerOptions })
+  const speech = (modelID: string | ModelID) => OpenAISpeech.model({ ...media, id: modelID })
+  const transcription = (modelID: string | ModelID) => OpenAITranscription.model({ ...media, id: modelID })
+  const decisionRoute = OpenAIDecisions.route.with({
+    endpoint: { baseURL: media.baseURL },
+    auth: media.auth,
+    headers: media.headers,
+    http: media.http,
+  })
+  const decision = (modelID: string | ModelID, providerOptions?: ProviderOptions) =>
+    decisionRoute.model<OpenAIDecisionOptionsInput>({ id: modelID, providerOptions })
 
   return {
     id,
     model: responses,
     responses,
-    responsesWebSocket,
     chat,
     image,
+    speech,
+    transcription,
+    decision,
     configure,
   }
 }
 
 export const provider = configure()
 
-const config = (settings: Settings): Config => {
+const config = ({
+  apiKey,
+  baseURL,
+  body,
+  headers: given,
+  organization,
+  project,
+  queryParams,
+  ...providerOptions
+}: Settings): Config => {
   const headers = {
-    ...(settings.organization === undefined ? {} : { "OpenAI-Organization": settings.organization }),
-    ...(settings.project === undefined ? {} : { "OpenAI-Project": settings.project }),
-    ...settings.headers,
+    ...(organization === undefined ? {} : { "OpenAI-Organization": organization }),
+    ...(project === undefined ? {} : { "OpenAI-Project": project }),
+    ...given,
   }
   return {
-    apiKey: settings.apiKey,
-    baseURL: settings.baseURL,
+    apiKey,
+    baseURL,
     headers: Object.keys(headers).length === 0 ? undefined : headers,
-    http: settings.body === undefined ? undefined : { body: { ...settings.body } },
-    limits: settings.limits,
-    providerOptions: settings.providerOptions,
-    queryParams: settings.queryParams === undefined ? undefined : { ...settings.queryParams },
+    http: body === undefined ? undefined : { body },
+    providerOptions,
+    queryParams,
   }
 }
 
-export const model: ProviderPackage.Definition<Settings>["model"] = (modelID, settings) => {
-  const configured = configure(config(settings))
-  if (settings.transport === undefined || settings.transport === "http") return configured.responses(modelID)
-  if (settings.transport === "websocket") return configured.responsesWebSocket(modelID)
-  throw new Error(`Unsupported OpenAI Responses transport: ${String(settings.transport)}`)
+export const model: ProviderPackage.Definition<
+  Settings,
+  OpenAIProviderOptionsInput,
+  typeof OpenAIResponses.route.compact
+>["model"] = (modelID, settings) => {
+  return configure(config(settings)).responses(modelID)
 }
 
-export const chatModel: ProviderPackage.Definition<Settings>["model"] = (modelID, settings) =>
-  configure(config(settings)).chat(modelID)
+export const chatModel: ProviderPackage.Definition<Settings, OpenAIProviderOptionsInput>["model"] = (
+  modelID,
+  settings,
+) => configure(config(settings)).chat(modelID)
+export const imageModel = (modelID: string, settings: Settings) => {
+  const input = config(settings)
+  return configure(input).image(modelID, input.providerOptions)
+}
+export const decisionModel = (modelID: string, settings: Settings) => {
+  const input = config(settings)
+  return configure(input).decision(modelID, input.providerOptions)
+}
 export const responses = provider.responses
-export const responsesWebSocket = provider.responsesWebSocket
 export const chat = provider.chat
 export const image = provider.image
+export const speech = provider.speech
+export const transcription = provider.transcription
+export const decision = provider.decision

@@ -1,25 +1,25 @@
-export * as ShellSelect from "./select"
+export * as ShellSelect from "./select.js"
 
 import path from "path"
-import { spawn, type ChildProcess } from "child_process"
 import { readFile } from "fs/promises"
 import { statSync } from "fs"
-import { setTimeout } from "node:timers/promises"
-import { Flag } from "../flag/flag"
-import { FSUtil } from "../fs-util"
-import { which } from "../util/which"
+import { Context, Effect, Layer, Schema } from "effect"
+import { makeLocationNode } from "@opencode/util/effect/app-node"
+import { FSUtil } from "@opencode/util/fs-util"
+import { Global } from "@opencode/util/global"
+import { State } from "../state.js"
+import { which } from "../util/which.js"
 
-const SIGKILL_TIMEOUT_MS = 200
-const META: Record<string, { deny?: boolean; login?: boolean; posix?: boolean; ps?: boolean }> = {
-  bash: { login: true, posix: true },
-  dash: { login: true, posix: true },
+const META: Record<string, { deny?: boolean; login?: boolean; ps?: boolean }> = {
+  bash: { login: true },
+  dash: { login: true },
   fish: { deny: true, login: true },
-  ksh: { login: true, posix: true },
+  ksh: { login: true },
   nu: { deny: true },
   powershell: { ps: true },
   pwsh: { ps: true },
-  sh: { login: true, posix: true },
-  zsh: { login: true, posix: true },
+  sh: { login: true },
+  zsh: { login: true },
 }
 
 export type Item = {
@@ -28,57 +28,54 @@ export type Item = {
   acceptable: boolean
 }
 
-export async function killTree(proc: ChildProcess, opts?: { exited?: () => boolean }): Promise<void> {
-  const pid = proc.pid
-  if (!pid || opts?.exited?.()) return
+export const Options = Schema.Struct({
+  gitbash: Schema.optional(Schema.String),
+})
+export type Options = typeof Options.Type
 
-  if (process.platform === "win32") {
-    await new Promise<void>((resolve) => {
-      const killer = spawn("taskkill", ["/pid", String(pid), "/f", "/t"], {
-        stdio: "ignore",
-        windowsHide: true,
-      })
-      killer.once("exit", () => resolve())
-      killer.once("error", () => resolve())
-    })
-    return
-  }
-
-  try {
-    process.kill(-pid, "SIGTERM")
-    await setTimeout(SIGKILL_TIMEOUT_MS)
-    if (!opts?.exited?.()) {
-      process.kill(-pid, "SIGKILL")
-    }
-  } catch {
-    proc.kill("SIGTERM")
-    await setTimeout(SIGKILL_TIMEOUT_MS)
-    if (!opts?.exited?.()) {
-      proc.kill("SIGKILL")
-    }
-  }
+type Data = {
+  shell?: string
 }
+
+export type Editor = {
+  configure: (shell: string) => void
+}
+
+export type ResolveInput = {
+  priority: "config" | "compat"
+}
+
+export interface Interface extends State.Transformable<Editor> {
+  readonly resolve: (input: ResolveInput) => Effect.Effect<string>
+  readonly list?: () => Effect.Effect<Item[]>
+}
+
+export class Service extends Context.Service<Service, Interface>()("@opencode/ShellSelect") {}
 
 function stat(file: string) {
   return statSync(file, { throwIfNoEntry: false }) ?? undefined
 }
 
-function full(file: string) {
+function findExecutable(name: string, bin?: string) {
+  return which(name, undefined, bin)
+}
+
+function full(file: string, options?: Options, bin?: string) {
   if (process.platform !== "win32") return file
   const shell = FSUtil.windowsPath(file)
   if (path.win32.dirname(shell) !== ".") {
-    if (shell.startsWith("/") && name(shell) === "bash") return gitbash() || shell
+    if (shell.startsWith("/") && name(shell) === "bash") return gitbash(options, bin) || shell
     return shell
   }
-  if (name(shell) === "bash") return gitbash() || which(shell) || shell
-  return which(shell) || shell
+  if (name(shell) === "bash") return gitbash(options, bin) || findExecutable(shell, bin) || shell
+  return findExecutable(shell, bin) || shell
 }
 
 function meta(file: string) {
   return META[name(file)]
 }
 
-function ok(file: string) {
+function compatible(file: string) {
   return meta(file)?.deny !== true
 }
 
@@ -86,21 +83,26 @@ function rooted(file: string) {
   return path.isAbsolute(FSUtil.windowsPath(file))
 }
 
-function resolve(file: string) {
-  const shell = full(file)
+function executable(file: string, options?: Options, bin?: string) {
+  const shell = full(file, options, bin)
   if (rooted(shell)) {
     if (stat(shell)?.isFile()) return shell
     return
   }
-  return which(shell) ?? undefined
+  return findExecutable(shell, bin) ?? undefined
 }
 
-function win() {
+function win(options?: Options, bin?: string) {
   return Array.from(
     new Set(
-      [which("pwsh"), which("powershell"), gitbash(), process.env.COMSPEC || "cmd.exe"]
+      [
+        findExecutable("pwsh", bin),
+        findExecutable("powershell", bin),
+        gitbash(options, bin),
+        process.env.COMSPEC || "cmd.exe",
+      ]
         .filter((item): item is string => Boolean(item))
-        .map(full),
+        .map((file) => full(file, options, bin)),
     ),
   )
 }
@@ -111,27 +113,27 @@ async function unix() {
   return ["/bin/bash", "/bin/zsh", "/bin/sh"]
 }
 
-function select(file: string | undefined, opts?: { acceptable?: boolean }) {
-  if (file && (!opts?.acceptable || ok(file))) {
-    const shell = resolve(file)
+function select(file: string | undefined, options?: Options, opts?: { compatible?: boolean }, bin?: string) {
+  if (file && (!opts?.compatible || compatible(file))) {
+    const shell = executable(file, options, bin)
     if (shell) return shell
   }
-  if (process.platform === "win32") return win()[0]
-  return fallback()
+  if (process.platform === "win32") return win(options, bin)[0]
+  return fallback(bin)
 }
 
-export function gitbash() {
+export function gitbash(options?: Options, bin?: string) {
   if (process.platform !== "win32") return
-  if (Flag.OPENCODE_GIT_BASH_PATH) return Flag.OPENCODE_GIT_BASH_PATH
-  const git = which("git")
+  if (options?.gitbash) return options.gitbash
+  const git = findExecutable("git", bin)
   if (!git) return
   const file = path.join(git, "..", "..", "bin", "bash.exe")
   if (stat(file)?.size) return file
 }
 
-function fallback() {
+function fallback(bin?: string) {
   if (process.platform === "darwin") return "/bin/zsh"
-  const bash = which("bash")
+  const bash = findExecutable("bash", bin)
   if (bash) return bash
   return "/bin/sh"
 }
@@ -145,55 +147,81 @@ export function login(file: string) {
   return meta(file)?.login === true
 }
 
-export function posix(file: string) {
-  return meta(file)?.posix === true
-}
-
 export function ps(file: string) {
   return meta(file)?.ps === true
 }
 
-function info(file: string): Item {
-  const item = full(file)
+function info(file: string, options?: Options, bin?: string): Item {
+  const item = full(file, options, bin)
   const n = name(item)
   return {
     path: item,
-    name: resolve(n) ? n : item,
-    acceptable: ok(item),
+    name: executable(n, options, bin) ? n : item,
+    acceptable: compatible(item),
   }
 }
 
 export function args(file: string, command: string) {
   const n = name(file)
-  if (n === "nu" || n === "fish") return ["-c", command]
-  if (n === "zsh" || n === "bash") return ["-c", command]
   if (n === "cmd") return ["/c", command]
-  if (ps(file)) return ["-NoProfile", "-Command", command]
+  if (ps(file)) return ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command]
   return ["-c", command]
 }
 
-let defaultPreferred: string | undefined
-let defaultAcceptable: string | undefined
-
-export function preferred(configShell?: string) {
-  if (configShell) return select(configShell)
-  defaultPreferred ??= select(process.env.SHELL)
-  return defaultPreferred
-}
-preferred.reset = () => {
-  defaultPreferred = undefined
+// Resolve afresh so removing a shell does not leave terminals using a stale cached path.
+export function environment(bin?: string, filter?: { compatible?: boolean }) {
+  return select(process.env.SHELL, undefined, filter, bin) ?? fallback(bin)
 }
 
-export function acceptable(configShell?: string) {
-  if (configShell) return select(configShell, { acceptable: true })
-  defaultAcceptable ??= select(process.env.SHELL, { acceptable: true })
-  return defaultAcceptable
+let defaultConfigured: { bin?: string; value: string } | undefined
+let defaultCompatible: { bin?: string; value: string } | undefined
+
+export function resolve(input: ResolveInput, configShell?: string, options?: Options, bin?: string) {
+  const filter = input.priority === "compat" ? { compatible: true } : undefined
+  if (configShell) return select(configShell, options, filter, bin)
+  if (options?.gitbash) return select(process.env.SHELL, options, filter, bin)
+  const cached = input.priority === "compat" ? defaultCompatible : defaultConfigured
+  if (cached && cached.bin === bin) return cached.value
+  const value = environment(bin, filter)
+  if (input.priority === "compat") defaultCompatible = { bin, value }
+  if (input.priority === "config") defaultConfigured = { bin, value }
+  return value
 }
-acceptable.reset = () => {
-  defaultAcceptable = undefined
+resolve.reset = () => {
+  defaultConfigured = undefined
+  defaultCompatible = undefined
 }
 
-export async function list(): Promise<Item[]> {
-  const shells = process.platform === "win32" ? win() : await unix()
-  return shells.filter((s) => resolve(s)).map(info)
+export async function list(options?: Options, bin?: string): Promise<Item[]> {
+  const shells = process.platform === "win32" ? win(options, bin) : await unix()
+  return shells.filter((shell) => executable(shell, options, bin)).map((shell) => info(shell, options, bin))
 }
+
+const layer = (options?: Options) =>
+  Layer.effect(
+    Service,
+    Effect.gen(function* () {
+      const global = yield* Global.Service
+      const state = State.create<Data, Editor>({
+        name: "shell-select",
+        initial: () => ({}),
+        editor: (editor) => ({
+          configure: (shell) => {
+            editor.shell = shell
+          },
+        }),
+      })
+      return Service.of({
+        transform: state.transform,
+        reload: state.reload,
+        resolve: (input) => Effect.sync(() => resolve(input, state.get().shell, options, global.bin)),
+        list: () => Effect.promise(() => list(options, global.bin)),
+      })
+    }),
+  )
+
+export function configured(options?: Options) {
+  return makeLocationNode({ service: Service, layer: layer(options), deps: [Global.node] })
+}
+
+export const node = configured()

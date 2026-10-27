@@ -1,15 +1,17 @@
-import { Service, type Endpoint } from "@opencode-ai/client/effect/service"
-import { OpenCode, type OpenCodeClient, type SessionMessageAssistantTool } from "@opencode-ai/client/promise"
-import { FSUtil } from "@opencode-ai/core/fs-util"
+import { Service, type Endpoint } from "@opencode/client/effect/service"
+import { OpenCode, type SessionMessageAssistantTool } from "@opencode/client/promise"
+import { FSUtil } from "@opencode/util/fs-util"
+import { noTimeoutFetch } from "@opencode/util/no-timeout-fetch"
 import { open } from "node:fs/promises"
 import path from "node:path"
 import { readStdin } from "../util/io"
 import { ServerConnection } from "../services/server-connection"
-import { waitForCatalogReady } from "../services/catalog"
 import { parseSessionTargetModel, resolveSessionTarget } from "../session-target"
-import { toolInlineInfo } from "@opencode-ai/tui/mini/tool"
+import { toolInlineInfo } from "@opencode/tui/mini/tool"
 import { runNonInteractivePrompt } from "./noninteractive"
 import { UI } from "./ui"
+import { Env } from "../env"
+import { errorMessage } from "../util/error"
 
 export type RunCommandInput = {
   server: ServerConnection.Resolved
@@ -80,7 +82,12 @@ async function run(input: RunCommandInput, options: ExecutionOptions) {
 }
 
 async function execute(input: RunCommandInput, prepared: Prepared, endpoint: Endpoint, options: ExecutionOptions) {
-  const client = OpenCode.make({ baseUrl: endpoint.url, headers: Service.headers(endpoint) })
+  const client = OpenCode.make({
+    baseUrl: endpoint.url,
+    headers: Service.headers(endpoint),
+    // Bun's default five-minute deadline terminates the event stream used by long-running sessions.
+    fetch: noTimeoutFetch,
+  })
   const explicit = parseRunModel(input.model)
   const target = await resolveSessionTarget({
     client,
@@ -92,12 +99,15 @@ async function execute(input: RunCommandInput, prepared: Prepared, endpoint: End
       ? { providerID: explicit.model.providerID, id: explicit.model.modelID, variant: explicit.variant }
       : undefined,
     agent: input.agent,
+    environment: input.server.service ? Env.session() : undefined,
     prepare: async (next) => {
       const selected =
         next.model ??
-        (await client.model
-          .default({ location: { directory: next.location.directory, workspace: next.location.workspaceID } })
-          .then((result) => result.data))
+        (options.variant
+          ? await client.model
+              .default({ location: { directory: next.location.directory } })
+              .then((result) => result.data)
+          : undefined)
       const model = selected
         ? {
             providerID: selected.providerID,
@@ -107,25 +117,7 @@ async function execute(input: RunCommandInput, prepared: Prepared, endpoint: End
         : undefined
       if ((options.variant ?? explicit?.variant) && !model)
         throw new RunTargetError("Cannot select a variant before selecting a model", next.session?.id)
-      if (model) {
-        await waitForCatalogReady({
-          sdk: client,
-          directory: next.location.directory,
-          workspace: next.location.workspaceID,
-          model: { providerID: model.providerID, modelID: model.id },
-        })
-        const available = await client.model.list({
-          location: { directory: next.location.directory, workspace: next.location.workspaceID },
-        })
-        if (!available.data.some((item) => item.providerID === model.providerID && item.id === model.id))
-          throw new RunTargetError(`Model unavailable: ${model.providerID}/${model.id}`, next.session?.id)
-      }
-      return {
-        model,
-        agent: input.agent
-          ? await validateAgent(client, next.location.directory, next.location.workspaceID, input.agent)
-          : next.agent,
-      }
+      return { model, agent: next.agent }
     },
   }).catch((error) => {
     if (!(error instanceof RunTargetError)) throw error
@@ -136,7 +128,7 @@ async function execute(input: RunCommandInput, prepared: Prepared, endpoint: End
   const model = target.model ? { providerID: target.model.providerID, modelID: target.model.id } : undefined
   const variant = target.model?.variant
   if (!target.resume && input.title !== undefined) {
-    await client.session.rename({
+    await client.session.update({
       sessionID: target.session.id,
       title: input.title || prepared.message.slice(0, 50) + (prepared.message.length > 50 ? "..." : ""),
     })
@@ -188,28 +180,6 @@ export function parseRunModel(value?: string) {
     model: { providerID: ref.providerID, modelID: ref.id },
     variant: ref.variant,
   }
-}
-
-async function validateAgent(client: OpenCodeClient, directory: string, workspace: string | undefined, name?: string) {
-  if (!name) return
-  const agents = await client.agent
-    .list({ location: { directory, workspace } })
-    .then((result) => result.data)
-    .catch(() => undefined)
-  if (!agents) {
-    warning("failed to list agents. Falling back to default agent")
-    return
-  }
-  const agent = agents.find((item) => item.id === name)
-  if (!agent) {
-    warning(`agent "${name}" not found. Falling back to default agent`)
-    return
-  }
-  if (agent.mode === "subagent") {
-    warning(`agent "${name}" is a subagent, not a primary agent. Falling back to default agent`)
-    return
-  }
-  return name
 }
 
 async function prepareFile(input: string, directory: string, options: ExecutionOptions): Promise<FilePart> {
@@ -272,17 +242,6 @@ async function renderTool(part: SessionMessageAssistantTool, directory: string) 
 async function renderToolError(part: SessionMessageAssistantTool, directory: string) {
   const info = toolInlineInfo(part, directory)
   UI.println(UI.Style.TEXT_NORMAL + "✗", UI.Style.TEXT_NORMAL + `${info.title} failed`)
-}
-
-function warning(message: string) {
-  UI.println(UI.Style.TEXT_WARNING_BOLD + "!", UI.Style.TEXT_NORMAL, message)
-}
-
-function errorMessage(error: unknown) {
-  if (error instanceof Error) return error.message
-  if (typeof error === "object" && error !== null && "message" in error && typeof error.message === "string")
-    return error.message
-  return String(error)
 }
 
 /** @internal Used by the V1 command boundary before a Session exists. */

@@ -27,7 +27,7 @@ const echo = Tool.make({
   description: "Echo the input",
   input: Schema.Struct({ id: Schema.Number }),
   output: Schema.Number,
-  run: (input: { id: number }) => Effect.succeed(input.id),
+  execute: (input: { id: number }) => Effect.succeed(input.id),
 })
 const withTool = (code: string) => Effect.runPromise(CodeMode.make({ tools: { host: { echo } } }).execute(code))
 const toolError = async (code: string) => {
@@ -63,8 +63,10 @@ describe("built-in method references as callbacks", () => {
     expect(logs[1]).toContain("b")
   })
 
-  test("intrinsic method references keep their receiver, unlike detached JS methods", async () => {
-    expect(await value(`return ["a", "z"].filter("abc".includes)`)).toEqual(["a"])
+  test("detached method references lose their receiver, like JS", async () => {
+    expect((await error(`return ["a", "z"].filter("abc".includes)`)).message).toContain(
+      "String.prototype.includes called on null or undefined",
+    )
   })
 
   test("promise reactions accept built-in references", async () => {
@@ -124,9 +126,9 @@ describe("constructors callable without new, like JS", () => {
     expect(await value(`return [7].map(Array)`)).toEqual([[7, 0, [7]]])
   })
 
-  test("array length boundaries match JS", async () => {
-    expect(await value(`return Array(4294967295).length`)).toBe(4294967295)
-    const diagnostic = await error(`return Array(4294967296)`)
+  test("array length is bounded below the JS maximum, so one call cannot materialize an unbounded array", async () => {
+    expect(await value(`return Array(10000000).length`)).toBe(10_000_000)
+    const diagnostic = await error(`return Array(10000001)`)
     expect(diagnostic.message).toContain("Invalid array length")
     expect((await error(`try { Array(-1) } catch (e) { throw Error(e.name) }`)).message).toContain("RangeError")
   })
@@ -269,10 +271,8 @@ describe("still-rejected callables get the wrap hint", () => {
   test("built-in references work as replacers", async () => {
     // Like real JS: JSON.stringify(match, offset, string) quotes the match.
     expect(await value(`return "abc".replace(/b/, JSON.stringify)`)).toBe('a"b"c')
-    // Math methods stay strict about consumed arguments: a match string is not coerced.
-    expect((await error(`return "3.7".replace(/\\d\\.\\d/, Math.floor)`)).message).toContain(
-      "Math.floor expects number arguments",
-    )
+    // Math methods coerce the match string, as in JS.
+    expect(await value(`return "3.7".replace(/\\d\\.\\d/, Math.floor)`)).toBe("3")
   })
 
   test("non-callables still get the plain callback error", async () => {
@@ -285,21 +285,21 @@ describe("still-rejected callables get the wrap hint", () => {
     expect(diagnostic.message).toContain("wrap it in an arrow function")
   })
 
-  test("callable JSON.stringify replacers are rejected, never silently ignored", async () => {
-    expect((await error(`return JSON.stringify({ a: 1 }, Math.abs)`)).message).toContain(
-      "JSON.stringify replacers are not supported",
-    )
+  test("JSON callbacks use the unified callback gate", async () => {
+    expect(
+      await value(`return JSON.stringify({ a: -1 }, (key, item) => typeof item === "number" ? Math.abs(item) : item)`),
+    ).toBe('{"a":1}')
     expect((await toolError(`return JSON.stringify({ a: 1 }, tools.host.echo)`)).message).toContain(
-      "JSON.stringify replacers are not supported",
+      "wrap it in an arrow function",
+    )
+    expect((await toolError(`return JSON.parse('{"a":1}', tools.host.echo)`)).message).toContain(
+      "wrap it in an arrow function",
     )
   })
 
-  test("callable JSON.parse revivers are rejected, never silently ignored", async () => {
-    expect((await error(`return JSON.parse('{"a":1}', (key, v) => 99)`)).message).toContain(
-      "JSON.parse revivers are not supported",
-    )
+  test("non-callable JSON callback arguments are ignored", async () => {
     expect(await value(`return JSON.parse('{"a":1}', undefined)`)).toEqual({ a: 1 })
-    // A non-callable reviver is silently ignored, matching JS's IsCallable check.
     expect(await value(`return JSON.parse('{"a":1}', 42)`)).toEqual({ a: 1 })
+    expect(await value(`return JSON.stringify({ a: 1 }, 42)`)).toBe('{"a":1}')
   })
 })

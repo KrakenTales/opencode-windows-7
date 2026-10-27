@@ -1,7 +1,6 @@
-import { InstallationVersion } from "@opencode-ai/core/installation/version"
-import { SdkPlugins } from "@opencode-ai/core/plugin/sdk"
-import { Plugin } from "@opencode-ai/plugin/v2/effect"
-import { Tool } from "@opencode-ai/plugin/v2/effect/tool"
+import { SdkPlugins } from "@opencode/core/plugin/sdk"
+import { Tool } from "@opencode/core/tool"
+import { Plugin } from "@opencode/plugin/effect"
 import { createHash } from "node:crypto"
 import {
   Cause,
@@ -32,7 +31,7 @@ export type ProviderResponseEvent =
   | SimulationProtocol.Backend.Item
   | { readonly type: "finish"; readonly reason: SimulationProtocol.Backend.FinishReason }
 
-export class ProviderDisconnectedError extends Schema.TaggedErrorClass<ProviderDisconnectedError>()(
+export class ProviderDisconnectedError extends Schema.TaggedError<ProviderDisconnectedError>()(
   "SimulatedProvider.ProviderDisconnectedError",
   { message: Schema.String },
 ) {}
@@ -132,27 +131,26 @@ interface ToolDriver {
   readonly shutdown: Effect.Effect<void>
 }
 
-class InvocationNotFoundError extends Schema.TaggedErrorClass<InvocationNotFoundError>()(
+class InvocationNotFoundError extends Schema.TaggedError<InvocationNotFoundError>()(
   "SimulatedProvider.InvocationNotFoundError",
   { id: Schema.String, message: Schema.String },
 ) {}
 
-class ControllerDisconnectedError extends Schema.TaggedErrorClass<ControllerDisconnectedError>()(
+class ControllerDisconnectedError extends Schema.TaggedError<ControllerDisconnectedError>()(
   "SimulatedProvider.ControllerDisconnectedError",
   { message: Schema.String },
 ) {}
 
-class ToolInvocationNotFoundError extends Schema.TaggedErrorClass<ToolInvocationNotFoundError>()(
+class ToolInvocationNotFoundError extends Schema.TaggedError<ToolInvocationNotFoundError>()(
   "SimulatedProvider.ToolInvocationNotFoundError",
   { id: Schema.String, message: Schema.String },
 ) {}
 
-class ToolControllerError extends Schema.TaggedErrorClass<ToolControllerError>()(
-  "SimulatedProvider.ToolControllerError",
-  { message: Schema.String },
-) {}
+class ToolControllerError extends Schema.TaggedError<ToolControllerError>()("SimulatedProvider.ToolControllerError", {
+  message: Schema.String,
+}) {}
 
-export const layerDrive = (options: { readonly endpoint: string }) =>
+export const layerDrive = (options: { readonly endpoint: string; readonly version: string }) =>
   Layer.effect(
     Service,
     Effect.gen(function* () {
@@ -277,7 +275,8 @@ export const layerDrive = (options: { readonly endpoint: string }) =>
         label: "opencode drive backend websocket",
         data: () => ({}),
         decode: SimulationProtocol.Backend.decodeRequestEffect,
-        handle: (socket, request) => handle(driver, tools, fibers, activeController, controllerLock, socket, request),
+        handle: (socket, request) =>
+          handle(driver, tools, fibers, activeController, controllerLock, socket, request, options.version),
         close: (socket) =>
           Effect.all([releaseController(activeController, controllerLock, socket), tools.release(socket)], {
             discard: true,
@@ -306,13 +305,14 @@ function handle(
   controllerLock: Semaphore.Semaphore,
   socket: ControlSocket,
   request: SimulationProtocol.Backend.Request,
+  version: string,
 ) {
   switch (request.method) {
     case "simulation.handshake":
       return SimulationProtocol.Handshake.dispatch(
         {
           role: "backend",
-          server: { name: "opencode", version: InstallationVersion },
+          server: { name: "opencode", version },
           capabilities: SimulationProtocol.Backend.Capabilities,
         },
         request.params,
@@ -330,9 +330,7 @@ function handle(
             fibers,
             driver.requests.pipe(
               Stream.runForEach((invocation) =>
-                Effect.sync(() => {
-                  socket.send(JSON.stringify({ jsonrpc: "2.0", method: "llm.request", params: invocation }))
-                }),
+                socket.send(JSON.stringify({ jsonrpc: "2.0", method: "llm.request", params: invocation })),
               ),
             ),
           )
@@ -403,10 +401,7 @@ const makeToolDriver = Effect.fn("SimulatedProvider.makeToolDriver")(function* (
     socket: ControlSocket,
     method: "tool.invocation" | "tool.cancel",
     params: SimulationProtocol.Backend.ToolInvocation | SimulationProtocol.Backend.ToolCancellation,
-  ) =>
-    Effect.sync(() => {
-      socket.send(JSON.stringify({ jsonrpc: "2.0", method, params }))
-    })
+  ) => socket.send(JSON.stringify({ jsonrpc: "2.0", method, params }))
 
   const requireController = (socket: ControlSocket) =>
     Effect.gen(function* () {
@@ -450,10 +445,10 @@ const makeToolDriver = Effect.fn("SimulatedProvider.makeToolDriver")(function* (
     name: string,
     input: unknown,
     context: Tool.Context,
-  ): Effect.Effect<Tool.DynamicOutput, Tool.Failure> =>
+  ): Effect.Effect<Tool.Result, Tool.Error> =>
     Effect.gen(function* () {
       const encoded = yield* Schema.decodeUnknownEffect(Schema.Json)(input).pipe(
-        Effect.mapError((error) => new Tool.Failure({ message: `Simulated tool input is not JSON: ${error.message}` })),
+        Effect.mapError((error) => new Tool.Error({ message: `Simulated tool input is not JSON: ${error.message}` })),
       )
       const invocation = yield* Effect.uninterruptibleMask((restore) =>
         attachmentLock
@@ -463,7 +458,7 @@ const makeToolDriver = Effect.fn("SimulatedProvider.makeToolDriver")(function* (
                 const current = yield* Ref.get(state)
                 if (current.generation !== registrationGeneration)
                   yield* Effect.fail(
-                    new Tool.Failure({ message: `Simulated tool registration is no longer active: ${name}` }),
+                    new Tool.Error({ message: `Simulated tool registration is no longer active: ${name}` }),
                   )
                 const id = `tool_${current.counter + 1}`
                 const completion = yield* Deferred.make<ToolCompletion>()
@@ -475,7 +470,7 @@ const makeToolDriver = Effect.fn("SimulatedProvider.makeToolDriver")(function* (
                     sessionID: context.sessionID,
                     agent: context.agent,
                     messageID: context.messageID,
-                    callID: context.callID,
+                    id: context.id,
                   },
                 }
                 const pending: PendingToolInvocation = {
@@ -517,8 +512,27 @@ const makeToolDriver = Effect.fn("SimulatedProvider.makeToolDriver")(function* (
             ),
           ),
       )
-      if (invocation.type === "success") return invocation.output
-      return yield* Effect.fail(new Tool.Failure({ message: invocation.message }))
+      // The simulation wire protocol keeps its historical field names; map to the
+      // canonical output at this boundary.
+      if (invocation.type === "success")
+        return {
+          output: invocation.output.structured,
+          ...(invocation.output.content.length === 0
+            ? {}
+            : {
+                content: invocation.output.content.map((part) =>
+                  part.type === "text"
+                    ? part
+                    : {
+                        type: "file" as const,
+                        uri: `data:${part.mime};base64,${part.data}`,
+                        mime: part.mime,
+                        ...(part.name === undefined ? {} : { name: part.name }),
+                      },
+                ),
+              }),
+        }
+      return yield* new Tool.Error({ message: invocation.message })
     })
 
   yield* plugins.register(
@@ -541,25 +555,23 @@ const makeToolDriver = Effect.fn("SimulatedProvider.makeToolDriver")(function* (
                   ctx.tool
                     .transform((draft) => {
                       for (const registration of nextRegistrations)
-                        draft.add(
-                          registration.name,
-                          Tool.make({
-                            description: registration.description,
-                            jsonSchema: registration.inputSchema,
-                            ...(registration.outputSchema === undefined
-                              ? {}
-                              : { outputSchema: registration.outputSchema }),
-                            ...(registration.permission === undefined ? {} : { permission: registration.permission }),
-                            execute: (input, context) =>
-                              invoke(
-                                generation,
-                                SimulationProtocol.Backend.exposedToolName(registration),
-                                input,
-                                context,
-                              ),
-                          }),
-                          registration.options,
-                        )
+                        draft.add({
+                          name: registration.name,
+                          options:
+                            registration.permission === undefined
+                              ? registration.options
+                              : { ...registration.options, permission: registration.permission },
+                          description: registration.description,
+                          input: registration.inputSchema,
+                          output: registration.outputSchema ?? {},
+                          execute: (input, context) =>
+                            invoke(
+                              generation,
+                              SimulationProtocol.Backend.exposedToolName(registration),
+                              input,
+                              context,
+                            ),
+                        })
                     })
                     .pipe(Scope.provide(nextScope)),
                 )

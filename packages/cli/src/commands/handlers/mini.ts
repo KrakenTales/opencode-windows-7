@@ -3,15 +3,18 @@ import { Commands } from "../commands"
 import { Runtime } from "../../framework/runtime"
 import { ServerConnection } from "../../services/server-connection"
 import { Config } from "../../config"
-import { resolve } from "@opencode-ai/tui/config"
+import { resolve } from "@opencode/tui/config"
+import { Global } from "@opencode/util/global"
 
 export default Runtime.handler(Commands.commands.mini, (input) =>
   Effect.gen(function* () {
     const { runMini, validateMiniTerminal } = yield* Effect.promise(() => import("../../mini"))
     yield* Effect.promise(async () => validateMiniTerminal())
-    const serverURL = Option.getOrUndefined(input.server)
-    const server = yield* ServerConnection.resolve({ server: serverURL, standalone: input.standalone })
+    const server = yield* ServerConnection.resolve({
+      mismatch: "replace",
+    })
     const config = yield* Config.Service
+    const global = yield* Global.Service
     const resolved = resolve(yield* config.get(), { terminalSuspend: process.platform !== "win32" })
     const fileSystem = yield* FileSystem.FileSystem
     const runServicePromise = Effect.runPromiseWith(Context.make(FileSystem.FileSystem, fileSystem))
@@ -28,10 +31,14 @@ export default Runtime.handler(Commands.commands.mini, (input) =>
         model: Option.getOrUndefined(input.model),
         agent: Option.getOrUndefined(input.agent),
         prompt: Option.getOrUndefined(input.prompt),
-        replay: input.replay,
-        replayLimit: Option.getOrUndefined(input.replayLimit),
+        replay: Option.getOrUndefined(input.replay) ?? resolved.mini?.replay ?? true,
+        replayLimit: Option.getOrUndefined(input.replayLimit) ?? resolved.mini?.replay_limit,
         demo: input.demo,
         tuiConfig: resolved,
+        config: {
+          update: (update) => runServicePromise(config.update(update)),
+        },
+        paths: { home: global.home, state: global.state, log: global.log },
       }),
     )
   }),

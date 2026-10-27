@@ -14,31 +14,33 @@
 import os from "os"
 import path from "path"
 import stripAnsi from "strip-ansi"
-import type { SessionMessageAssistantTool } from "@opencode-ai/client/promise"
+import type { SessionMessageAssistantTool } from "@opencode/client/promise"
 import { LANGUAGE_EXTENSIONS } from "../util/filetype"
 import { Locale } from "../util/locale"
 import {
   canonicalToolName,
   finiteNumber,
   primitiveInputSummary,
+  toolDisplayContent,
   toolDisplayMetadata,
   webSearchProviderLabel,
 } from "../util/tool-display"
 import { formatPath } from "../util/path-format"
+import { isRecord } from "../util/record"
+import { parseTodos, todoMarker } from "../util/todo"
 import type { RunEntryBody, StreamCommit, ToolSnapshot } from "./types"
 
-export type { MiniToolPart } from "./types"
 export { canonicalToolName } from "../util/tool-display"
 
-export type ToolView = {
+type ToolView = {
   output: boolean
   final: boolean
   snap?: "code" | "diff" | "structured"
 }
 
-export type ToolPhase = "start" | "progress" | "final"
+type ToolPhase = "start" | "progress" | "final"
 
-export type ToolDict = Record<string, unknown>
+type ToolDict = Record<string, unknown>
 
 type PatchFile = {
   status?: string
@@ -49,6 +51,7 @@ type PatchFile = {
 }
 
 type ToolInput = ToolDict & {
+  id?: string
   path?: string
   pattern?: string
   url?: string
@@ -67,6 +70,7 @@ type ToolInput = ToolDict & {
 }
 
 type ToolMetadata = ToolDict & {
+  name?: string
   count?: number
   matches?: number
   diff?: string
@@ -76,7 +80,7 @@ type ToolMetadata = ToolDict & {
   exit?: number
 }
 
-export type ToolFrame = {
+type ToolFrame = {
   directory?: string
   raw: string
   name: string
@@ -92,7 +96,7 @@ export type ToolFrame = {
   }
 }
 
-export type ToolInline = {
+type ToolInline = {
   icon: string
   title: string
   description?: string
@@ -100,7 +104,7 @@ export type ToolInline = {
   body?: string
 }
 
-export type ToolProps = {
+type ToolProps = {
   input: ToolInput
   metadata: ToolMetadata
   frame: ToolFrame
@@ -114,6 +118,7 @@ type ToolName =
   | "patch"
   | "batch"
   | "subagent"
+  | "todowrite"
   | "question"
   | "read"
   | "glob"
@@ -123,7 +128,6 @@ type ToolName =
   | "webfetch"
   | "websearch"
   | "skill"
-  | "plan_exit"
 
 type ToolRule = {
   view: ToolView
@@ -137,11 +141,7 @@ type ToolRegistry = Record<ToolName, ToolRule>
 type AnyToolRule = ToolRule
 
 function dict(v: unknown): ToolDict {
-  if (!v || typeof v !== "object" || Array.isArray(v)) {
-    return {}
-  }
-
-  return { ...v }
+  return isRecord(v) ? { ...v } : {}
 }
 
 function props(frame: ToolFrame): ToolProps {
@@ -156,15 +156,41 @@ function text(v: unknown): string {
   return typeof v === "string" ? v : ""
 }
 
-export function toolOutputText(name: string, content: ReadonlyArray<{ type: string; text?: string }>) {
+export function toolOutputText(name: string, content: ReadonlyArray<{ type: string; text?: string }> | undefined) {
+  if (!content) return ""
   // V2 shell content appends model-only status after the user-visible command output.
   if (canonicalToolName(name) === "shell") return content.find((item) => item.type === "text")?.text ?? ""
-  return content.flatMap((item) => (item.type === "text" && item.text ? [item.text] : [])).join("\n")
+  const joined = content.flatMap((item) => (item.type === "text" && item.text ? [item.text] : [])).join("\n")
+  if (canonicalToolName(name) === "read") return readDisplayText(joined) ?? joined
+  return joined
+}
+
+/** Read's model content is a JSON page envelope; unwrap the human-facing text. */
+export function readDisplayText(text: string): string | undefined {
+  if (!text.startsWith("{")) return undefined
+  const parsed = (() => {
+    try {
+      return JSON.parse(text) as unknown
+    } catch {
+      return undefined
+    }
+  })()
+  const envelope = dict(parsed)
+  if (typeof envelope.content === "string" && (envelope.type === "text-page" || envelope.encoding === "utf8"))
+    return envelope.content
+  if (!Array.isArray(envelope.entries)) return undefined
+  return envelope.entries
+    .flatMap((entry): string[] => {
+      if (typeof entry === "string") return [entry]
+      const path = dict(entry).path
+      return typeof path === "string" ? [path] : []
+    })
+    .join("\n")
 }
 
 function normalizeInput(name: string, value: unknown) {
   const input = dict(value)
-  const path = typeof input.path === "string" ? input.path : text(input.filePath) || text(input.filepath)
+  const path = typeof input.path === "string" ? input.path : text(input.filePath)
   const agent = typeof input.agent === "string" ? input.agent : text(input.subagent_type)
   return {
     ...input,
@@ -189,7 +215,7 @@ function normalizeFile(value: unknown): PatchFile | undefined {
           : legacy === "move"
             ? "moved"
             : legacy)
-  const patch = typeof file.patch === "string" ? file.patch : text(file.diff) || undefined
+  const patch = typeof file.patch === "string" ? file.patch : undefined
   const deletions = finiteNumber(file.deletions)
   return {
     ...file,
@@ -201,22 +227,17 @@ function normalizeFile(value: unknown): PatchFile | undefined {
   }
 }
 
-function normalizeStructured(name: string, value: unknown) {
-  const structured = dict(value)
-  const files = list(structured.files).flatMap((item) => {
+function normalizeMetadata(name: string, value: unknown) {
+  const metadata = dict(value)
+  const files = list(metadata.files).flatMap((item) => {
     const file = normalizeFile(item)
     return file ? [file] : []
   })
-  const sessionID = text(structured.sessionID) || text(structured.sessionId)
+  const sessionID = text(metadata.sessionID) || text(metadata.sessionId)
   return {
-    ...structured,
-    ...(["edit", "patch"].includes(name) && Array.isArray(structured.files) ? { files } : {}),
+    ...metadata,
+    ...(["edit", "patch"].includes(name) && Array.isArray(metadata.files) ? { files } : {}),
     ...(name === "subagent" && sessionID ? { sessionID } : {}),
-    ...(name === "shell" &&
-    finiteNumber(structured.exit) === undefined &&
-    finiteNumber(structured.exitCode) !== undefined
-      ? { exit: finiteNumber(structured.exitCode) }
-      : {}),
   }
 }
 
@@ -229,7 +250,7 @@ export function normalizeTool(tool: SessionMessageAssistantTool): SessionMessage
     state: {
       ...tool.state,
       input: normalizeInput(name, tool.state.input),
-      structured: normalizeStructured(name, toolDisplayMetadata(tool.state)),
+      metadata: normalizeMetadata(name, toolDisplayMetadata(tool.state)),
     },
   } as SessionMessageAssistantTool
 }
@@ -416,9 +437,10 @@ function runTask(p: ToolProps): ToolInline {
 }
 
 function runSkill(p: ToolProps): ToolInline {
+  const name = p.metadata.name ?? p.input.id ?? ""
   return {
     icon: "→",
-    title: `Skill "${p.input.name ?? ""}"`,
+    title: `Skill "${name}"`,
   }
 }
 
@@ -434,6 +456,17 @@ function runPatch(p: ToolProps): ToolInline {
   return {
     icon: "%",
     title: `Patch ${files} file${files === 1 ? "" : "s"}`,
+  }
+}
+
+function runTodo(p: ToolProps): ToolInline {
+  return {
+    icon: "#",
+    title: "Todos",
+    mode: "block",
+    body: parseTodos(p.frame.input.todos)
+      .map((item) => `${todoMarker(item.status)} ${item.content}`)
+      .join("\n"),
   }
 }
 
@@ -489,15 +522,6 @@ function runLsp(p: ToolProps): ToolInline {
   return {
     icon: "→",
     title: lspTitle(p.input, { directory: p.frame.directory }),
-  }
-}
-
-function runPlanExit(p: ToolProps): ToolInline {
-  return {
-    icon: "→",
-    title: "Switching to build agent",
-    mode: "block",
-    body: p.frame.status === "completed" ? p.frame.output : undefined,
   }
 }
 
@@ -600,6 +624,13 @@ function snapTask(p: ToolProps): ToolSnapshot {
   }
 }
 
+function snapTodo(p: ToolProps): ToolSnapshot {
+  return {
+    kind: "todo",
+    items: parseTodos(p.frame.input.todos),
+  }
+}
+
 function snapQuestion(p: ToolProps): ToolSnapshot {
   const answers = list<unknown[]>(p.frame.meta.answers)
   const items = list<{ question?: string }>(p.frame.input.questions).map((item, i) => {
@@ -620,17 +651,17 @@ function snapQuestion(p: ToolProps): ToolSnapshot {
 function scrollBashStart(p: ToolProps): string {
   const cmd = p.input.command ?? ""
   const wd = p.input.workdir ?? ""
-  const formatted = wd && wd !== "." ? displayPath(p, wd) : ""
+  const formatted = wd && wd !== "." ? displayPath(p, wd, { home: true }) : ""
   const dir = formatted === "." ? "" : formatted
   if (cmd && !dir) {
     return `$ ${cmd}`
   }
 
   if (!cmd) {
-    return dir ? `# Running in ${dir}` : ""
+    return dir ? `${dir}$` : ""
   }
 
-  return `# Running in ${dir}\n$ ${cmd}`
+  return `${dir}$ ${cmd}`
 }
 
 function scrollBashProgress(p: ToolProps): string {
@@ -646,7 +677,7 @@ function scrollBashProgress(p: ToolProps): string {
   }
 
   const wdRaw = (p.input.workdir ?? "").trim()
-  const wd = wdRaw ? displayPath(p, wdRaw) : ""
+  const wd = wdRaw ? displayPath(p, wdRaw, { home: true }) : ""
   const lines = out.split("\n")
   const first = (lines[0] || "").trim()
   const second = (lines[1] || "").trim()
@@ -671,7 +702,7 @@ function scrollShellFinal(p: ToolProps): string {
     return fail(p.frame)
   }
 
-  const code = p.metadata.exit ?? finiteNumber(p.frame.meta.exitCode) ?? finiteNumber(p.frame.meta.exit_code)
+  const code = p.metadata.exit
   const time = span(p.frame)
   if (code === undefined) {
     if (!time) {
@@ -737,7 +768,7 @@ function scrollPatchFinal(p: ToolProps): string {
   const shown = files.filter((file) => showModified || file.status !== "modified")
   const rows = shown.slice(0, 6).map((file) => patchLine(file, p.frame.directory))
   if (shown.length > 6) {
-    rows.push(`... and ${shown.length - 6} more`)
+    rows.push(`… and ${shown.length - 6} more`)
   }
 
   if (rows.length > 0) {
@@ -783,6 +814,10 @@ function scrollTaskFinal(p: ToolProps): string {
   return `# ${kind} Subagent\n${row}`
 }
 
+function scrollTodoStart(_: ToolProps): string {
+  return ""
+}
+
 function scrollQuestionStart(_: ToolProps): string {
   return ""
 }
@@ -808,7 +843,7 @@ function scrollQuestionFinal(p: ToolProps): string {
   }
 
   if (q.length > 4) {
-    rows.push(`... and ${q.length - 4} more`)
+    rows.push(`… and ${q.length - 4} more`)
   }
 
   return rows.join("\n")
@@ -819,7 +854,7 @@ function scrollLspStart(p: ToolProps): string {
 }
 
 function scrollSkillStart(p: ToolProps): string {
-  return `→ Skill "${p.input.name ?? ""}"`
+  return `→ Skill "${p.metadata.name ?? p.input.id ?? ""}"`
 }
 
 function scrollGlobStart(p: ToolProps): string {
@@ -959,6 +994,18 @@ const TOOL_RULES = {
       final: scrollTaskFinal,
     },
   },
+  todowrite: {
+    view: {
+      output: false,
+      final: true,
+      snap: "structured",
+    },
+    run: runTodo,
+    snap: snapTodo,
+    scroll: {
+      start: scrollTodoStart,
+    },
+  },
   question: {
     view: {
       output: false,
@@ -1053,16 +1100,6 @@ const TOOL_RULES = {
       start: scrollSkillStart,
     },
   },
-  plan_exit: {
-    view: {
-      output: true,
-      final: false,
-    },
-    run: runPlanExit,
-    scroll: {
-      start: () => "",
-    },
-  },
 } as const satisfies ToolRegistry
 
 function key(name: string): name is ToolName {
@@ -1092,13 +1129,13 @@ function frame(part: SessionMessageAssistantTool, directory?: string): ToolFrame
       output: "",
       time: { start: tool.time.created },
     }
-  const output = toolOutputText(tool.name, tool.state.content)
+  const output = toolOutputText(tool.name, toolDisplayContent(tool.state))
   return {
     directory,
     raw: output,
     name: tool.name,
     input: normalizeInput(tool.name, tool.state.input),
-    meta: normalizeStructured(tool.name, tool.state.structured),
+    meta: normalizeMetadata(tool.name, tool.state.metadata),
     state: dict(tool.state),
     status: tool.state.status,
     error: tool.state.status === "error" ? tool.state.error.message : "",
@@ -1110,7 +1147,7 @@ function frame(part: SessionMessageAssistantTool, directory?: string): ToolFrame
   }
 }
 
-export function toolFrame(commit: StreamCommit, raw: string): ToolFrame {
+function toolFrame(commit: StreamCommit, raw: string): ToolFrame {
   const current = commit.part ? frame(commit.part, commit.directory) : undefined
   return {
     directory: commit.directory,
@@ -1195,7 +1232,7 @@ export function toolScroll(phase: ToolPhase, ctx: ToolFrame): string {
   return fallbackFinal(ctx)
 }
 
-export function toolSnapshot(commit: StreamCommit, raw: string): ToolSnapshot | undefined {
+function toolSnapshot(commit: StreamCommit, raw: string): ToolSnapshot | undefined {
   const ctx = toolFrame(commit, raw)
   const draw = rule(ctx.name)?.snap
   if (!draw) {
@@ -1249,7 +1286,7 @@ function structuredFallback(value: ToolDict): RunEntryBody | undefined {
   if (Object.keys(value).length === 0) return
   const content = JSON.stringify(value, null, 2)
   if (!content) return
-  const suffix = "\n... [truncated]"
+  const suffix = "\n… [truncated]"
   return {
     type: "code",
     content:
@@ -1273,7 +1310,11 @@ function shellOutput(command: string, raw: string): string | undefined {
   return `\n${body}`
 }
 
-export function toolEntryBody(commit: StreamCommit, raw: string): RunEntryBody | undefined {
+export function toolEntryBody(
+  commit: StreamCommit,
+  raw: string,
+  options?: { shellOutput?: boolean },
+): RunEntryBody | undefined {
   if (commit.shell) {
     if (commit.phase === "start") {
       return textBody(`$ ${commit.shell.command}`)
@@ -1293,6 +1334,8 @@ export function toolEntryBody(commit: StreamCommit, raw: string): RunEntryBody |
 
   const ctx = toolFrame(commit, raw)
   const view = toolView(ctx.name)
+
+  if (ctx.name === "shell" && commit.phase === "progress" && options?.shellOutput === false) return undefined
 
   if (ctx.name === "subagent") {
     if (commit.phase === "start") {

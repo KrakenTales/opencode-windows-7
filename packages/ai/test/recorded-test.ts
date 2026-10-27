@@ -1,23 +1,40 @@
-import { HttpRecorder } from "@opencode-ai/http-recorder"
-import { Layer } from "effect"
+import { HttpRecorder } from "@opencode/http-recorder"
+import { NodeSocket } from "@effect/platform-node"
+import { Effect, Layer } from "effect"
+import { Socket } from "effect/socket"
 import * as path from "node:path"
 import { fileURLToPath } from "node:url"
-import { LLMClient, RequestExecutor, WebSocketExecutor } from "../src/route"
-import { ImageClient } from "../src/image-client"
-import type { Service as ImageClientService } from "../src/image-client"
-import type { Service as LLMClientService } from "../src/route/client"
-import type { Service as RequestExecutorService } from "../src/route/executor"
-import type { Service as WebSocketExecutorService } from "../src/route/transport/websocket"
+import { LLMClient, RequestExecutor } from "../src/route.js"
+import { ImageClient } from "../src/image-client.js"
+import { VideoClient } from "../src/video-client.js"
+import { SpeechClient } from "../src/speech-client.js"
+import { TranscriptionClient } from "../src/transcription-client.js"
+import { DecisionClient } from "../src/decision-client.js"
+import type { Service as DecisionClientService } from "../src/decision-client.js"
+import type { Service as ImageClientService } from "../src/image-client.js"
+import type { Service as VideoClientService } from "../src/video-client.js"
+import type { Service as SpeechClientService } from "../src/speech-client.js"
+import type { Service as TranscriptionClientService } from "../src/transcription-client.js"
+import type { Service as LLMClientService } from "../src/route/client.js"
+import type { Service as RequestExecutorService } from "../src/route/executor.js"
 import {
   recordedEffectGroup,
   type RecordedCaseOptions as RunnerCaseOptions,
   type RecordedGroupOptions,
-} from "./recorded-runner"
+} from "./recorded-runner.js"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const FIXTURES_DIR = path.resolve(__dirname, "fixtures", "recordings")
 
-type RecordedEnv = RequestExecutorService | WebSocketExecutorService | LLMClientService | ImageClientService
+type RecordedEnv =
+  | RequestExecutorService
+  | LLMClientService
+  | ImageClientService
+  | VideoClientService
+  | SpeechClientService
+  | TranscriptionClientService
+  | DecisionClientService
+  | Socket.WebSocketConstructor
 
 type RecordedTestsOptions = RecordedGroupOptions & {
   readonly options?: HttpRecorder.RecorderOptions
@@ -69,10 +86,7 @@ export const recordedTests = (options: RecordedTestsOptions) =>
         ...recorderOptions?.metadata,
         ...metadata,
       }
-      if (recording) {
-        if (process.env.CI !== undefined) throw new Error("Unset CI before recording HTTP cassettes")
-        HttpRecorder.removeCassetteSync(cassette, { directory: FIXTURES_DIR })
-      }
+      if (recording && process.env.CI !== undefined) throw new Error("Unset CI before recording cassettes")
       const requestExecutor = RequestExecutor.layer.pipe(
         Layer.provide(
           HttpRecorder.layerFetch(cassette, {
@@ -82,11 +96,28 @@ export const recordedTests = (options: RecordedTestsOptions) =>
           }),
         ),
       )
-      const deps = Layer.mergeAll(requestExecutor, WebSocketExecutor.layer)
-      return Layer.mergeAll(
-        deps,
-        LLMClient.layer.pipe(Layer.provide(deps)),
-        ImageClient.layer.pipe(Layer.provide(deps)),
+      const webSocket = HttpRecorder.layerWebSocketConstructor(cassette, {
+        ...recorderOptions,
+        directory: FIXTURES_DIR,
+        metadata: recorderMetadata,
+      }).pipe(Layer.provide(NodeSocket.layerWebSocketConstructorWS))
+      const layer = Layer.mergeAll(
+        requestExecutor,
+        LLMClient.layer.pipe(Layer.provide(requestExecutor)),
+        ImageClient.layer.pipe(Layer.provide(requestExecutor)),
+        VideoClient.layer.pipe(Layer.provide(requestExecutor)),
+        SpeechClient.layer.pipe(Layer.provide(requestExecutor)),
+        TranscriptionClient.layer.pipe(Layer.provide(requestExecutor)),
+        DecisionClient.layer.pipe(Layer.provide(requestExecutor)),
+        webSocket,
+      )
+      if (!recording) return layer
+      // Remove the cassette when the test runs, not when it is registered, so tests filtered out by `-t` keep theirs.
+      return Layer.unwrap(
+        Effect.sync(() => {
+          HttpRecorder.removeCassetteSync(cassette, { directory: FIXTURES_DIR })
+          return layer
+        }),
       )
     },
   })

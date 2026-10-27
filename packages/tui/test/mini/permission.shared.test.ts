@@ -34,7 +34,7 @@ describe("run permission shared", () => {
     expect(out.reply).toEqual({
       sessionID: "session-1",
       requestID: "perm-1",
-      reply: "once",
+      decision: "once",
     })
   })
 
@@ -47,7 +47,7 @@ describe("run permission shared", () => {
     expect(permissionRun(next.state, "perm-1", "confirm").reply).toEqual({
       sessionID: "session-1",
       requestID: "perm-1",
-      reply: "always",
+      decision: "always",
     })
 
     expect(permissionRun(next.state, "perm-1", "cancel").state).toMatchObject({
@@ -64,7 +64,7 @@ describe("run permission shared", () => {
     expect(out).toEqual({
       sessionID: "session-1",
       requestID: "perm-1",
-      reply: "reject",
+      decision: "reject",
       message: "use rg",
     })
 
@@ -89,14 +89,13 @@ describe("run permission shared", () => {
       permissionInfo(
         req({
           action: "shell",
-          source: { type: "tool", messageID: "msg-shell", callID: "call-shell" },
+          source: { type: "tool", messageID: "msg-shell", id: "call-shell" },
           tool: canonicalToolPart(
             "shell",
             {
               status: "running",
               input: { command: "git status --short" },
-              structured: {},
-              content: [],
+              metadata: {},
             },
             "call-shell",
           ),
@@ -135,58 +134,60 @@ describe("run permission shared", () => {
         req({
           action: "websearch",
           metadata: { provider: "parallel" },
-          source: { type: "tool", messageID: "msg-search", callID: "call-search" },
+          source: { type: "tool", messageID: "msg-search", id: "call-search" },
           tool: canonicalToolPart(
             "websearch",
             {
               status: "running",
               input: { query: "current releases" },
-              structured: { provider: "exa", retained: true },
-              content: [],
+              metadata: { provider: "exa", retained: true },
             },
             "call-search",
           ),
         }),
       ),
     ).toMatchObject({
-      title: 'Parallel Web Search "current releases"',
+      title: 'Web Search via Parallel "current releases"',
       lines: ["Query: current releases"],
     })
   })
 
   test("uses source patch text when an edit has no generated diff", () => {
-    expect(
-      permissionInfo(
-        req({
-          action: "edit",
-          resources: ["src/index.ts"],
-          source: { type: "tool", messageID: "msg-edit", callID: "call-edit" },
-          tool: canonicalToolPart(
-            "edit",
-            {
-              status: "running",
-              input: { patchText: "*** Begin Patch\n*** Update File: src/index.ts\n@@\n-old\n+new\n*** End Patch" },
-              structured: {},
-              content: [],
-            },
-            "call-edit",
-          ),
-        }),
+    const patch = '*** Begin Patch\n*** Update File: src/index.ts\n@@\n-old\n+const arrow = "→"\n*** End Patch'
+    const request = req({
+      action: "edit",
+      resources: ["src/index.ts"],
+      source: { type: "tool", messageID: "msg-edit", id: "call-edit" },
+      tool: canonicalToolPart(
+        "edit",
+        {
+          status: "running",
+          input: { patchText: patch },
+          metadata: {},
+        },
+        "call-edit",
       ),
-    ).toMatchObject({
+    })
+    expect(permissionInfo(request)).toMatchObject({
       title: "Edit src/index.ts",
       diff: undefined,
-      patch: "*** Begin Patch\n*** Update File: src/index.ts\n@@\n-old\n+new\n*** End Patch",
+      patch,
+    })
+    expect(permissionInfo(request, undefined, true)).toMatchObject({
+      title: "Edit src/index.ts",
+      lines: [patch],
+      diff: undefined,
+      patch: undefined,
     })
   })
 
   test("formats always-allow copy for wildcard and explicit patterns", () => {
     expect(permissionAlwaysLines(req({ action: "bash", save: ["*"] }))).toEqual([
-      "This will allow bash until OpenCode is restarted.",
+      "This will always allow bash for this project.",
     ])
 
     expect(permissionAlwaysLines(req({ save: ["src/**/*.ts", "src/**/*.tsx"] }))).toEqual([
-      "This will allow the following patterns until OpenCode is restarted.",
+      "This will always allow the following patterns for this project.",
       "- src/**/*.ts",
       "- src/**/*.tsx",
     ])

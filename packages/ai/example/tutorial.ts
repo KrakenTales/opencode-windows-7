@@ -1,30 +1,38 @@
-import { Config, Effect, Formatter, Layer, Schema, Stream } from "effect"
-import { LLM, LLMClient, Message, ProviderID, Tool, ToolRuntime } from "@opencode-ai/ai"
-import { Route, Auth, Endpoint, Framing, Protocol, RequestExecutor, WebSocketExecutor } from "@opencode-ai/ai/route"
-import { OpenAI } from "@opencode-ai/ai/providers"
+import { Config, Effect, Formatter, Schema, Stream } from "effect"
+import { HttpClientResponse } from "effect/http"
+import { NodeFileSystem } from "@effect/platform-node"
+import { AIClient, Image, LLM, LLMRequest, Media, Message, ProviderID, Tool, ToolRuntime } from "@opencode/ai/effect"
+import { Route, Auth, Endpoint, Framing, Protocol, RequestExecutor } from "@opencode/ai/route"
+import { OpenAI } from "@opencode/ai/providers"
 
 /**
  * A runnable walkthrough of the LLM package use-site API.
  *
  * Run from `packages/ai` with an OpenAI key in the environment:
  *
- *   OPENAI_API_KEY=... bun example/tutorial.ts
+ *   OPENAI_API_KEY=... bun example/tutorial.ts [example]
+ *
+ * where `example` is one of the keys of `examples` at the bottom (default
+ * `tools`). The `fake` example runs offline and needs no key.
  *
  * The file is intentionally written as a normal TypeScript program. You can
  * hover imports and local values to see how the public API is typed.
  */
 
-const apiKey = Config.redacted("OPENAI_API_KEY")
+const apiKey = Config.Redacted("OPENAI_API_KEY")
 
-// 1. Pick a model. The provider helper records provider identity, protocol
-// choice, capabilities, deployment options, authentication, and defaults.
-const model = OpenAI.configure({
+// 1. Configure a provider. The configured facade records provider identity,
+// deployment options, authentication, and defaults. Per-modality selectors pick
+// the API: `.responses(...)` / `.chat(...)` for LLM calls and `.image(...)` for
+// image generation.
+const openai = OpenAI.configure({
   apiKey,
   generation: { maxTokens: 160 },
   providerOptions: {
-    openai: { store: false },
+    store: false,
   },
-}).model("gpt-4o-mini")
+})
+const model = openai.responses("gpt-4o-mini")
 
 // 2. Build a provider-neutral request. This is useful when reusing one request
 // across generate and stream examples.
@@ -33,9 +41,10 @@ const model = OpenAI.configure({
 //
 //   - `generation`: common controls such as max tokens, temperature, topP/topK,
 //     penalties, seed, and stop sequences.
-//   - `providerOptions`: namespaced provider-native behavior. For example,
-//     OpenAI cache keys and store behavior, Anthropic thinking, Gemini thinking
-//     config, or OpenRouter routing/reasoning.
+//   - `promptCacheKey`: stable cache affinity for protocols that support it.
+//   - `providerOptions`: model-typed provider-native behavior. For example,
+//     OpenAI store behavior, Anthropic thinking, Gemini thinking config, or
+//     OpenRouter routing/reasoning.
 //   - `http`: last-resort serializable overlays for final request body, headers,
 //     and query params. Prefer typed `providerOptions` when a field is stable.
 //
@@ -45,21 +54,7 @@ const request = LLM.request({
   system: "You are concise and practical.",
   prompt: "Tell me a joke",
   generation: { maxTokens: 80, temperature: 0.7 },
-  providerOptions: {
-    openai: { promptCacheKey: "tutorial-joke" },
-  },
-})
-
-// `http` is intentionally not needed for normal calls. This shows the shape for
-// newly released provider fields before they deserve a typed provider option.
-const rawOverlayExample = LLM.request({
-  model,
-  prompt: "Show the final HTTP overlay shape.",
-  http: {
-    body: { metadata: { example: "tutorial" } },
-    headers: { "x-opencode-tutorial": "1" },
-    query: { debug: "1" },
-  },
+  promptCacheKey: "tutorial-joke",
 })
 
 // 3. `generate` sends the request and collects the event stream into one
@@ -78,7 +73,10 @@ const streamText = LLM.stream(request).pipe(
   Stream.tap((event) =>
     Effect.sync(() => {
       if (event.type === "text-delta") process.stdout.write(`\ntext: ${event.text}`)
-      if (event.type === "finish") process.stdout.write(`\nfinish: ${event.reason}\n`)
+      if (event.type === "finish")
+        process.stdout.write(
+          `\nfinish: ${event.reason.normalized}${event.reason.raw ? ` (${event.reason.raw})` : ""}\n`,
+        )
     }),
   ),
   Stream.runDrain,
@@ -113,7 +111,7 @@ const streamWithTools = Effect.gen(function* () {
 
     // A durable agent would persist these messages before starting another
     // raw model turn. This tutorial keeps the boundary visible instead.
-    const followUp = LLM.updateRequest(request, {
+    const followUp = LLMRequest.update(request, {
       messages: [
         ...request.messages,
         Message.assistant([event]),
@@ -194,11 +192,11 @@ const FakeProtocol = Protocol.make<FakeBody, string, string, void>({
     event: Schema.String,
     initial: () => undefined,
     step: (_, frame) => Effect.succeed([undefined, [{ type: "text-delta", id: "text-0", text: frame }]] as const),
-    onHalt: () => [{ type: "finish", reason: "stop" }],
+    onHalt: () => Effect.succeed([{ type: "finish", reason: { normalized: "stop" } }]),
   },
 })
 
-// An route is the runnable binding for that protocol. It adds the deployment
+// A route is the runnable binding for that protocol. It adds the deployment
 // axes that the protocol deliberately does not know: URL, auth, and framing.
 const FakeAdapter = Route.make({
   id: "fake-echo",
@@ -219,37 +217,63 @@ const FakeEcho = {
   }),
 }
 
-// `LLMClient.prepare` is the lower-level inspection hook: it compiles through
-// body conversion, validation, endpoint, auth, and HTTP construction without
-// sending anything over the network.
-const inspectFakeProvider = Effect.gen(function* () {
-  const prepared = yield* LLMClient.prepare(
-    LLM.request({
-      model: FakeEcho.configure().model("tiny-echo"),
-      prompt: "Show me the provider pipeline.",
-    }),
-  )
+// 7. Run the fake provider offline. `RequestExecutor.middleware` sees every HTTP
+// request before it is sent; here it answers with two SSE frames instead of
+// calling the network.
+const fakeExecutor = RequestExecutor.middleware((request) =>
+  Effect.succeed(
+    HttpClientResponse.fromWeb(
+      request,
+      new Response("data: hello\n\ndata: from fake-echo\n\n", { headers: { "content-type": "text/event-stream" } }),
+    ),
+  ),
+)
 
-  console.log("\n== fake provider prepare ==")
-  console.log("route:", prepared.route)
-  console.log("body:", Formatter.formatJson(prepared.body, { space: 2 }))
+const generateFake = Effect.gen(function* () {
+  const response = yield* LLM.generate({ model: FakeEcho.configure().model("echo-1"), prompt: "Say hello." })
+  console.log("\n== fake provider ==")
+  console.log("generated text:", response.text)
 })
 
-// Provide the LLM runtime and the HTTP request executor once. Keep one path
-// enabled at a time so the tutorial can demonstrate generate, prepare, stream,
-// or tool-loop behavior without spending tokens on every example.
-const requestExecutorLayer = RequestExecutor.fetchLayer
-const llmDeps = Layer.mergeAll(requestExecutorLayer, WebSocketExecutor.layer)
-const llmClientLayer = LLMClient.layer.pipe(Layer.provide(llmDeps))
+// 8. Image generation uses the same facade and the same request/generate shape.
+// `response.image` is a `Media.Asset`: bytes decode lazily and are cached, and
+// `Media.write` persists them through the Effect `FileSystem`.
+const generateImage = Effect.gen(function* () {
+  const response = yield* Image.generate({
+    model: openai.image("gpt-image-1-mini"),
+    prompt: "A flat black circle centered on a plain white background.",
+    aspect: "1:1",
+    // Exact pixel sizes and output formats are provider options.
+    providerOptions: { quality: "low", outputFormat: "jpeg" },
+  })
 
-const program = Effect.gen(function* () {
-  // yield* generateOnce
-  // yield* inspectFakeProvider
-  // yield* LLMClient.prepare(rawOverlayExample).pipe(Effect.andThen((prepared) => Effect.sync(() => console.log(prepared.body))))
-  // yield* streamText
-  // yield* generateStructuredObject
-  // yield* generateDynamicObject.pipe(Effect.andThen((response) => Effect.sync(() => console.log(response.object))))
-  yield* streamWithTools
-}).pipe(Effect.provide(Layer.mergeAll(llmDeps, llmClientLayer)))
+  console.log("\n== image ==")
+  console.log("media type:", response.image.mediaType)
+  console.log("bytes:", (yield* response.image.bytes()).byteLength)
+  console.log("usage", Formatter.formatJson(response.usage, { space: 2 }))
+  yield* Media.write(response.image, "tutorial-image.jpg").pipe(Effect.provide(NodeFileSystem.layer))
+})
 
-Effect.runPromise(program)
+// Provide every modality client and the HTTP request executor once with
+// `AIClient.layer`; `AIClient.layerWith(executor)` swaps the executor, as the
+// fake example does. One example runs at a time so the tutorial does not spend
+// tokens on every path.
+const examples: Record<string, Effect.Effect<void, unknown, AIClient.Services>> = {
+  generate: generateOnce,
+  stream: streamText,
+  tools: streamWithTools,
+  object: generateStructuredObject,
+  "dynamic-object": generateDynamicObject.pipe(
+    Effect.andThen((response) => Effect.sync(() => console.log(response.object))),
+  ),
+  image: generateImage,
+  fake: generateFake,
+}
+
+const name = process.argv[2] ?? "tools"
+if (!Object.hasOwn(examples, name))
+  throw new Error(`Unknown example ${name}; pick one of ${Object.keys(examples).join(", ")}`)
+
+Effect.runPromise(
+  examples[name].pipe(Effect.provide(name === "fake" ? AIClient.layerWith(fakeExecutor) : AIClient.layer)),
+)

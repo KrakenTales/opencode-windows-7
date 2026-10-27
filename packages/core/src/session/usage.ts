@@ -1,11 +1,12 @@
-export * as SessionUsage from "./usage"
+export * as SessionUsage from "./usage.js"
 
-import type { Usage } from "@opencode-ai/ai"
-import { Money } from "@opencode-ai/schema/money"
-import type { TokenUsage } from "@opencode-ai/schema/token-usage"
-import type { ModelV2 } from "../model"
+import type { Usage } from "@opencode/ai/effect"
+import { Money } from "@opencode/schema/money"
+import type { TokenUsage } from "@opencode/schema/token-usage"
+import type { Model } from "@opencode/schema/model"
 
-const safe = (value: number | undefined) => Math.max(0, Number.isFinite(value) ? (value ?? 0) : 0)
+const finite = (value: number) => (Number.isFinite(value) ? value : 0)
+const safe = (value: number | undefined) => Math.max(0, finite(value ?? 0))
 
 export const tokens = (usage: Usage | undefined): TokenUsage.Info => ({
   input: safe(usage?.nonCachedInputTokens),
@@ -17,8 +18,9 @@ export const tokens = (usage: Usage | undefined): TokenUsage.Info => ({
   },
 })
 
-// TODO(#35765): Use Copilot's reported billed amount once billing has a dedicated typed runtime contract.
-export function calculateCost(costs: ModelV2.Info["cost"], usage: TokenUsage.Info) {
+// Catalog pricing is the fallback for endpoints that don't report what they charged (`Usage.cost`).
+// TODO(#35765): Normalize Copilot's reported billed amount into `Usage.cost`.
+export function calculateCost(costs: Model.Info["cost"], usage: TokenUsage.Info) {
   const context = usage.input + usage.cache.read + usage.cache.write
   const tier = costs
     .filter((cost) => cost.tier?.type === "context" && context > cost.tier.size)
@@ -26,19 +28,27 @@ export function calculateCost(costs: ModelV2.Info["cost"], usage: TokenUsage.Inf
   const cost = tier ?? costs.find((cost) => cost.tier === undefined)
   if (!cost) return Money.USD.zero
   return Money.USD.make(
-    (usage.input * cost.input +
-      (usage.output + usage.reasoning) * cost.output +
-      usage.cache.read * cost.cache.read +
-      usage.cache.write * cost.cache.write) /
+    (usage.input * finite(cost.input) +
+      (usage.output + usage.reasoning) * finite(cost.output) +
+      usage.cache.read * finite(cost.cache.read) +
+      usage.cache.write * finite(cost.cache.write)) /
       1_000_000,
   )
 }
 
-export type Recorded = { readonly tokens: TokenUsage.Info; readonly cost: Money.USD }
+export type Recorded = {
+  readonly tokens: TokenUsage.Info
+  readonly cost: Money.USD
+}
 
-export const record = (usage: Usage | undefined, costs: ModelV2.Info["cost"]): Recorded => {
+export const record = (usage: Usage | undefined, costs: Model.Info["cost"]): Recorded => {
   const normalized = tokens(usage)
-  return { tokens: normalized, cost: calculateCost(costs, normalized) }
+  return {
+    tokens: normalized,
+    // What an endpoint says it charged beats the catalog, which can't see its peak pricing, subscriptions or routing.
+    // A reported zero is authoritative.
+    cost: usage?.cost === undefined ? calculateCost(costs, normalized) : Money.USD.make(usage.cost),
+  }
 }
 
 export const add = (a: Recorded, b: Recorded): Recorded => ({

@@ -17,8 +17,8 @@ export type Endpoint = {
 export type DiscoverOptions = {
   /** Absolute registration file path. Defaults to the XDG state directory. */
   readonly file?: string
-  /** Required service version. */
-  readonly version?: string
+  /** Required exact service version or compatibility predicate. */
+  readonly version?: string | ((version: string) => boolean)
 }
 
 /** Reason ensuring the service requires a new process. */
@@ -28,6 +28,8 @@ export type EnsureReason = "missing" | "version-mismatch"
 export type EnsureOptions = DiscoverOptions & {
   /** Service command and arguments. Defaults to `opencode serve --service`. */
   readonly command?: ReadonlyArray<string>
+  /** Environment variables added to the inherited service process environment. */
+  readonly env?: Readonly<Record<string, string>>
   /** Called once before spawning a new service process. */
   readonly onStart?: (reason: EnsureReason, previousVersion?: string) => void
 }
@@ -36,6 +38,8 @@ export type EnsureOptions = DiscoverOptions & {
 export type StopOptions = {
   /** Absolute registration file path. Defaults to the XDG state directory. */
   readonly file?: string
+  /** How to handle persistent terminals before stopping the service. */
+  readonly pty?: "clear" | "handoff"
 }
 
 /** Contents of the local service registration file. */

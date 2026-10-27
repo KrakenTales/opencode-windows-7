@@ -1,10 +1,12 @@
-import { Service, type Endpoint, type EnsureOptions } from "@opencode-ai/client/effect/service"
-import { ClientError, isUnauthorizedError, OpenCode } from "@opencode-ai/client/promise"
-import { InstallationVersion } from "@opencode-ai/core/installation/version"
-import { Effect, Redacted } from "effect"
+import { Service, type Endpoint, type EnsureOptions } from "@opencode/client/effect/service"
+import { ClientError, isUnauthorizedError, OpenCode } from "@opencode/client/promise"
+import { OPENCODE_VERSION } from "../version"
+import { Effect, Option, Redacted } from "effect"
+import { Server as ServerFlag, Standalone as StandaloneFlag } from "../commands/commands"
 import { Env } from "../env"
 import { ServiceConfig } from "./service-config"
 import { Standalone } from "./standalone"
+import { errorMessage } from "../util/error"
 
 export type Args = {
   readonly server?: string
@@ -18,33 +20,38 @@ export type Resolved = {
   readonly service?: ReturnType<typeof managedService>
 }
 
-export const resolve = Effect.fn("cli.server-connection.resolve")(function* (args: Args) {
-  if (args.server !== undefined && args.standalone)
+export const resolve = Effect.fn("cli.server-connection.resolve")(function* (args: Args = {}) {
+  const serverFlag = yield* Effect.serviceOption(ServerFlag).pipe(Effect.map(Option.flatten))
+  const standaloneFlag = yield* Effect.serviceOption(StandaloneFlag)
+  const server = args.server ?? Option.getOrUndefined(serverFlag)
+  const standalone = args.standalone ?? Option.getOrElse(standaloneFlag, () => false)
+  if (server !== undefined && standalone)
     return yield* Effect.fail(new Error("--server and --standalone cannot be combined"))
-  if (args.server !== undefined) {
+  if (server !== undefined) {
     const password = yield* Env.password
     const endpoint = {
-      url: args.server,
+      url: server,
       auth: password ? { type: "basic" as const, username: "opencode", password: Redacted.value(password) } : undefined,
     } satisfies Endpoint
     const client = OpenCode.make({ baseUrl: endpoint.url, headers: Service.headers(endpoint) })
     const health = yield* Effect.tryPromise({
-      try: () => client.health.get({ signal: AbortSignal.timeout(5_000) }),
+      try: () => client.server.info({ signal: AbortSignal.timeout(5_000) }),
       catch: (cause) => connectError(endpoint, cause),
     })
-    if (health.version !== InstallationVersion)
+    if (health.version !== OPENCODE_VERSION)
       process.stderr.write(
-        `Warning: Server at ${endpoint.url} has version ${health.version}; this client is ${InstallationVersion}. Continuing anyway.\n`,
+        `Warning: Server at ${endpoint.url} has version ${health.version}; this client is ${OPENCODE_VERSION}. Continuing anyway.\n`,
       )
     return { endpoint } satisfies Resolved
   }
-  if (args.standalone) {
+  if (standalone || (yield* ServiceConfig.read()).disabled === true) {
     return { endpoint: yield* Standalone.start() } satisfies Resolved
   }
 
-  const options = yield* ServiceConfig.options()
+  const mismatch = args.mismatch ?? "ignore"
+  const options = yield* ServiceConfig.options({ checkVersion: mismatch !== "ignore" })
   return {
-    endpoint: yield* resolveManaged({ ...options, onStart: args.onStart }, args.mismatch ?? "replace"),
+    endpoint: yield* resolveManaged({ ...options, onStart: args.onStart }, mismatch),
     service: managedService(options),
   } satisfies Resolved
 })
@@ -55,16 +62,22 @@ function managedService(options: EnsureOptions) {
     reconnect: () => Service.ensure(reconnectOptions),
     restart: () =>
       Effect.gen(function* () {
-        yield* Service.stop(options)
+        yield* Service.stop({ file: options.file, pty: "handoff" })
         yield* Service.ensure(reconnectOptions)
       }),
   }
 }
 
-const resolveManaged = Effect.fnUntraced(function* (
+export const shutdownPersistentPty = Effect.fn("cli.server-connection.shutdown-persistent-pty")(function* (
   options: EnsureOptions,
-  mismatch: NonNullable<Args["mismatch"]>,
 ) {
+  const endpoint = yield* Service.discover({ ...options, version: undefined })
+  if (!endpoint) return
+  const client = OpenCode.make({ baseUrl: endpoint.url, headers: Service.headers(endpoint) })
+  yield* Effect.tryPromise(() => client.experimental.persistentPty.shutdown())
+})
+
+const resolveManaged = Effect.fnUntraced(function* (options: EnsureOptions, mismatch: NonNullable<Args["mismatch"]>) {
   if (mismatch === "replace") return yield* Service.ensure(options)
   if (mismatch === "ignore") return yield* Service.ensure({ ...options, version: undefined })
 
@@ -86,8 +99,11 @@ function connectError(endpoint: Endpoint, cause: unknown) {
     )
   }
   if (cause instanceof ClientError && cause.reason === "Transport")
-    return new Error(`Could not reach server at ${endpoint.url}`, { cause })
-  return new Error(`Server at ${endpoint.url} did not provide a compatible V2 health response`, { cause })
+    return new Error(`Could not reach server at ${endpoint.url}: ${errorMessage(cause.cause ?? cause)}`, { cause })
+  return new Error(
+    `Server at ${endpoint.url} did not provide a compatible V2 health response: ${errorMessage(cause)}`,
+    { cause },
+  )
 }
 
 export * as ServerConnection from "./server-connection"

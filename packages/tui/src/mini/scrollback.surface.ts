@@ -1,19 +1,21 @@
 // Retained streaming append logic for direct-mode scrollback.
 //
-// Static entries are rendered through `scrollback.writer.tsx`. This file only
-// keeps the retained-surface machinery needed for streaming assistant,
-// reasoning, and tool progress entries that need stable markdown/code layout
-// while content is still arriving.
+// Static text entries are rendered through `scrollback.writer.tsx`. Retained
+// surfaces keep streaming markdown/code layout stable and wait for image loads
+// before their snapshots enter scrollback.
 import {
   CodeRenderable,
+  ImageRenderable,
   MarkdownRenderable,
   TextRenderable,
   getTreeSitterClient,
   type TreeSitterClient,
   type CliRenderer,
   type ScrollbackSurface,
+  type SyntaxStyle,
 } from "@opentui/core"
 import { entryBody, entryCanStream, entryDone, entryFlags } from "./entry.body"
+import { monoMarkdownRenderable, monoMarkdownTableOptions } from "./mono"
 import { entryColor, entryLook, entrySyntax } from "./scrollback.shared"
 import { turnSummaryCommit } from "./turn-summary"
 import { entryWriter, sameEntryGroup, separatorRows, spacerWriter, turnSummaryWriter } from "./scrollback.writer"
@@ -27,6 +29,7 @@ type ActiveEntry = {
   commit: StreamCommit
   surface: ScrollbackSurface
   renderable: TextRenderable | CodeRenderable | MarkdownRenderable
+  syntax?: SyntaxStyle
   content: string
   committedRows: number
   committedBlocks: number
@@ -86,9 +89,15 @@ export class RunScrollbackStream {
   private tail: StreamCommit | undefined
   private rendered: StreamCommit | undefined
   private active: ActiveEntry | undefined
+  private imageSurface: ScrollbackSurface | undefined
   private treeSitterClient: TreeSitterClient | undefined
   private wrote: boolean
+  private shellOutput: () => boolean
+  private mono: boolean
+  private imagePreview: boolean
+  private destroyed = false
   private pendingThemes: RunTheme[] = []
+  private pendingStyles: SyntaxStyle[] = []
 
   constructor(
     private renderer: CliRenderer,
@@ -97,16 +106,39 @@ export class RunScrollbackStream {
       wrote?: boolean
       treeSitterClient?: TreeSitterClient
       onThemeRelease?: (theme: RunTheme) => void
+      shellOutput?: () => boolean
+      mono?: boolean
+      imagePreview?: boolean
     } = {},
   ) {
     this.treeSitterClient = options.treeSitterClient
     this.wrote = options.wrote ?? false
+    this.shellOutput = options.shellOutput ?? (() => true)
+    this.mono = options.mono ?? false
+    this.imagePreview = options.imagePreview ?? false
     this.onThemeRelease = options.onThemeRelease
   }
 
   private onThemeRelease: ((theme: RunTheme) => void) | undefined
 
+  public async setMono(mono: boolean): Promise<void> {
+    if (this.mono === mono) return
+    const active = this.active
+    if (active?.body.type !== "markdown") await this.complete()
+    this.mono = mono
+    if (active?.body.type !== "markdown") return
+
+    // Rebuild the Markdown tree, keeping its source and printed block boundary.
+    // Mono hooks are one-way, and ending the entry would lose open fence/list context.
+    const next = this.createEntry(active.commit, active.body)
+    this.active = { ...active, surface: next.surface, renderable: next.renderable, syntax: next.syntax }
+    active.surface.destroy()
+    active.syntax?.destroy()
+    this.releasePendingThemes()
+  }
+
   private releasePendingThemes(): void {
+    for (const style of this.pendingStyles.splice(0)) style.destroy()
     if (this.pendingThemes.length === 0) {
       return
     }
@@ -137,7 +169,10 @@ export class RunScrollbackStream {
     }
 
     active.renderable.fg = entryColor(active.commit, theme)
-    active.renderable.syntaxStyle = entrySyntax(theme)
+    const syntax = entrySyntax(theme, active.surface.renderContext.nativeScene)
+    if (active.syntax) this.pendingStyles.push(active.syntax)
+    active.syntax = syntax
+    active.renderable.syntaxStyle = syntax
   }
 
   private createEntry(commit: StreamCommit, body: ActiveBody): ActiveEntry {
@@ -145,6 +180,7 @@ export class RunScrollbackStream {
       startOnNewLine: entryFlags(commit).startOnNewLine,
     })
     const style = entryLook(commit, this.theme.entry)
+    const syntax = body.type === "text" ? undefined : entrySyntax(this.theme, surface.renderContext.nativeScene)
     const treeSitterClient = body.type === "text" ? undefined : (this.treeSitterClient ??= getTreeSitterClient())
     const renderable =
       body.type === "text"
@@ -159,7 +195,7 @@ export class RunScrollbackStream {
           ? new CodeRenderable(surface.renderContext, {
               content: "",
               filetype: body.filetype,
-              syntaxStyle: entrySyntax(this.theme),
+              syntaxStyle: syntax!,
               width: "100%",
               wrapMode: "word",
               drawUnstyledText: false,
@@ -169,15 +205,16 @@ export class RunScrollbackStream {
             })
           : new MarkdownRenderable(surface.renderContext, {
               content: "",
-              syntaxStyle: entrySyntax(this.theme),
+              syntaxStyle: syntax!,
               width: "100%",
               streaming: true,
               internalBlockMode: "top-level",
-              tableOptions: { widthMode: "content" },
+              tableOptions: this.mono ? monoMarkdownTableOptions : { widthMode: "content" },
               fg: entryColor(commit, this.theme),
               treeSitterClient,
             })
 
+    if (this.mono && renderable instanceof MarkdownRenderable) monoMarkdownRenderable(renderable)
     surface.root.add(renderable)
 
     const rows = separatorRows(this.rendered, commit, body)
@@ -187,6 +224,7 @@ export class RunScrollbackStream {
       commit,
       surface,
       renderable,
+      syntax,
       content: "",
       committedRows: 0,
       committedBlocks: 0,
@@ -319,6 +357,7 @@ export class RunScrollbackStream {
       if (!active.surface.isDestroyed) {
         active.surface.destroy()
       }
+      active.syntax?.destroy()
       this.releasePendingThemes()
     }
 
@@ -340,21 +379,93 @@ export class RunScrollbackStream {
     }
   }
 
+  private async writeImage(commit: StreamCommit): Promise<void> {
+    const surface = this.renderer.createScrollbackSurface(entryFlags(commit))
+    this.imageSurface = surface
+
+    try {
+      const image = new ImageRenderable(surface.renderContext, {
+        source: commit.image,
+        fit: "fit",
+        visible: false,
+        alignSelf: "flex-start",
+        flexShrink: 0,
+      })
+      surface.root.add(image)
+      // settle() waits for code highlighting, not image decoding.
+      await image.loadPromise
+      if (surface.isDestroyed) return
+
+      const body = entryBody(commit, { mono: this.mono })
+      if (body.type !== "text") return
+      const style = entryLook(commit, this.theme.entry)
+      const caption = new TextRenderable(surface.renderContext, {
+        content: body.content + (image.image ? "" : "\nNo preview"),
+        width: "100%",
+        wrapMode: "word",
+        fg: style.fg,
+        attributes: style.attrs,
+        flexShrink: 0,
+      })
+      surface.root.add(caption, 0)
+      surface.render()
+
+      if (image.image && !this.mono) {
+        const resolution = this.renderer.resolution
+        const fitted = image.getFittedSize(
+          Math.min(
+            surface.width,
+            resolution?.width
+              ? Math.max(1, Math.floor((image.image.width * this.renderer.terminalWidth) / resolution.width))
+              : Infinity,
+          ),
+          Math.min(
+            Math.max(0, this.renderer.terminalHeight - this.renderer.height - caption.height),
+            resolution?.height
+              ? Math.max(1, Math.floor((image.image.height * this.renderer.terminalHeight) / resolution.height))
+              : Infinity,
+          ),
+          image.cellAspectRatio,
+        )
+        // fit centers within its rectangle, so the rectangle itself must be fitted.
+        image.width = fitted.width
+        image.height = fitted.height
+        image.visible = fitted.width > 0 && fitted.height > 0
+        surface.render()
+      }
+
+      this.writeSpacer(separatorRows(this.rendered, commit, body) || (!this.rendered && this.wrote ? 1 : 0))
+      surface.commitRows(0, surface.height, { trailingNewline: entryFlags(commit).trailingNewline })
+      this.markRendered(commit)
+    } finally {
+      surface.destroy()
+      this.imageSurface = undefined
+    }
+  }
+
   public async append(commit: StreamCommit): Promise<void> {
+    if (this.destroyed || this.renderer.isDestroyed) return
     const same = sameEntryGroup(this.tail, commit)
-    if (!same) {
+    if (!same || commit.image) {
       this.markRendered(await this.finishActive(false))
     }
+    if (this.destroyed || this.renderer.isDestroyed) return
 
     if (commit.summary) {
       this.writeSpacer(1)
-      this.renderer.writeToScrollback(turnSummaryWriter({ ...commit.summary, theme: this.theme }))
+      this.renderer.writeToScrollback(turnSummaryWriter({ ...commit.summary, theme: this.theme, mono: this.mono }))
       this.markRendered(commit)
       this.tail = commit
       return
     }
 
-    const body = entryBody(commit)
+    if (commit.image && this.imagePreview && !this.mono) {
+      await this.writeImage(commit)
+      this.tail = commit
+      return
+    }
+
+    const body = entryBody(commit, { shellOutput: this.shellOutput(), mono: this.mono })
     if (body.type === "none") {
       if (entryDone(commit)) {
         this.markRendered(await this.finishActive(false))
@@ -370,7 +481,7 @@ export class RunScrollbackStream {
     ) {
       await this.writeStreaming(commit, body)
       if (entryDone(commit)) {
-        this.markRendered(await this.finishActive(false))
+        this.markRendered(await this.finishActive(entryFlags(commit).trailingNewline))
       }
       this.tail = commit
       return
@@ -389,6 +500,7 @@ export class RunScrollbackStream {
         commit,
         body: staticBody(commit, body, spaced),
         theme: this.theme,
+        opts: { mono: this.mono },
       }),
     )
     this.markRendered(commit)
@@ -403,6 +515,7 @@ export class RunScrollbackStream {
     if (!this.active.surface.isDestroyed) {
       this.active.surface.destroy()
     }
+    this.active.syntax?.destroy()
 
     this.active = undefined
     this.releasePendingThemes()
@@ -417,6 +530,9 @@ export class RunScrollbackStream {
   }
 
   public destroy(): void {
+    this.destroyed = true
+    this.imageSurface?.destroy()
+    this.imageSurface = undefined
     this.resetActive()
     this.releasePendingThemes()
   }

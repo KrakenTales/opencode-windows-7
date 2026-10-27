@@ -1,9 +1,9 @@
-import { Effect, Layer, Ref } from "effect"
-import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
-import { LLMClient, RequestExecutor, WebSocketExecutor } from "../../src/route"
-import type { Service as LLMClientService } from "../../src/route/client"
-import type { Service as RequestExecutorService } from "../../src/route/executor"
-import type { Service as WebSocketExecutorService } from "../../src/route/transport/websocket"
+import { Effect, Fiber, Layer, Ref } from "effect"
+import * as TestClock from "effect/testing/TestClock"
+import { HttpClient, HttpClientError, HttpClientRequest, HttpClientResponse } from "effect/http"
+import { LLMClient, RequestExecutor } from "../../src/route.js"
+import type { Service as LLMClientService } from "../../src/route/client.js"
+import type { Service as RequestExecutorService } from "../../src/route/executor.js"
 
 export type HandlerInput = {
   readonly request: HttpClientRequest.HttpClientRequest
@@ -14,9 +14,38 @@ export type HandlerInput = {
   ) => HttpClientResponse.HttpClientResponse
 }
 
-export type Handler = (input: HandlerInput) => Effect.Effect<HttpClientResponse.HttpClientResponse>
+export type Handler = (
+  input: HandlerInput,
+) => Effect.Effect<HttpClientResponse.HttpClientResponse, HttpClientError.HttpClientError>
 
-const handlerLayer = (handler: Handler): Layer.Layer<HttpClient.HttpClient> =>
+export interface Call {
+  readonly method: string
+  readonly url: string
+  readonly headers: Headers
+  readonly body: string
+}
+
+/** Record every request and tell the handler how many times this exact method+URL has been seen (1-based). */
+export const observe = (calls: Array<Call>, input: HandlerInput) =>
+  Effect.gen(function* () {
+    const web = yield* HttpClientRequest.toWeb(input.request).pipe(Effect.orDie)
+    const call = { method: web.method, url: web.url, headers: web.headers, body: input.text }
+    calls.push(call)
+    return { call, nth: calls.filter((seen) => seen.method === call.method && seen.url === call.url).length }
+  })
+
+export const json = (input: HandlerInput, value: unknown, init?: ResponseInit) =>
+  input.respond(JSON.stringify(value), { ...init, headers: { "content-type": "application/json", ...init?.headers } })
+
+/** Fork the polling program, let the test clock cover `seconds` of polling, and join. */
+export const settle = <A, E, R>(program: Effect.Effect<A, E, R>, seconds: number) =>
+  Effect.gen(function* () {
+    const fiber = yield* Effect.forkChild(program)
+    yield* TestClock.adjust(`${seconds} seconds`)
+    return yield* Fiber.join(fiber)
+  })
+
+export const handlerLayer = (handler: Handler): Layer.Layer<HttpClient.HttpClient> =>
   Layer.succeed(
     HttpClient.HttpClient,
     HttpClient.make((request) =>
@@ -32,13 +61,18 @@ const handlerLayer = (handler: Handler): Layer.Layer<HttpClient.HttpClient> =>
     ),
   )
 
-export type RuntimeEnv = RequestExecutorService | WebSocketExecutorService | LLMClientService
+export type RuntimeEnv = RequestExecutorService | LLMClientService
+
+export interface SystemError extends Error {
+  readonly code: string
+}
+
+export const systemError = (code: string, message: string): SystemError => Object.assign(new Error(message), { code })
 
 export const runtimeLayer = (layer: Layer.Layer<HttpClient.HttpClient>): Layer.Layer<RuntimeEnv> => {
   const requestExecutorLayer = RequestExecutor.layer.pipe(Layer.provide(layer))
-  const deps = Layer.mergeAll(requestExecutorLayer, WebSocketExecutor.layer)
-  const llmClientLayer = LLMClient.layer.pipe(Layer.provide(deps))
-  return Layer.mergeAll(deps, llmClientLayer)
+  const llmClientLayer = LLMClient.layer.pipe(Layer.provide(requestExecutorLayer))
+  return Layer.mergeAll(requestExecutorLayer, llmClientLayer)
 }
 
 const SSE_HEADERS = { "content-type": "text/event-stream" } as const
@@ -63,14 +97,20 @@ export const dynamicResponse = (handler: Handler) => runtimeLayer(handlerLayer(h
  * Layer that emits the supplied SSE chunks and then aborts mid-stream. Used to
  * exercise transport errors that surface during parsing.
  */
-export const truncatedStream = (chunks: ReadonlyArray<string>) =>
+export const truncatedStream = (chunks: ReadonlyArray<string>, error: Error = new Error("connection reset")) =>
   dynamicResponse((input) =>
     Effect.sync(() => {
       const encoder = new TextEncoder()
+      let index = 0
       const stream = new ReadableStream({
-        start(controller) {
-          for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
-          controller.error(new Error("connection reset"))
+        pull(controller) {
+          const chunk = chunks[index]
+          if (chunk !== undefined) {
+            index++
+            controller.enqueue(encoder.encode(chunk))
+            return
+          }
+          controller.error(error)
         },
       })
       return input.respond(stream, { headers: SSE_HEADERS })

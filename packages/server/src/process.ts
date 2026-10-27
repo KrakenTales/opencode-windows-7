@@ -1,31 +1,32 @@
 export * as ServerProcess from "./process"
 
-import { NodeHttpServer, NodeHttpServerRequest } from "@effect/platform-node"
-import { InstallationVersion } from "@opencode-ai/core/installation/version"
-import { SessionRestart } from "@opencode-ai/core/session/execution/restart"
-import { ServiceStatus } from "@opencode-ai/protocol/groups/health"
-import { hasPtyConnectTicketURL } from "@opencode-ai/protocol/groups/pty"
-import { Cause, Context, Deferred, Effect, Exit, Layer, Option, Ref, Schema, Scope } from "effect"
-import { HttpMiddleware, HttpRouter, HttpServer, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
+import { NodeHttpServer } from "@effect/platform-node"
+import { Bus } from "@opencode/core/bus"
+import { SessionRestart } from "@opencode/core/session/execution/restart"
+import { InstallationEvent } from "@opencode/schema/installation-event"
+import { hasPtyConnectTicketURL } from "@opencode/protocol/groups/pty"
+import { hasPersistentPtyConnectTicketURL } from "@opencode/protocol/groups/persistent-pty"
+import { hasMcpClientTicketURL } from "@opencode/protocol/groups/mcp"
+import { isPairingConnectURL } from "@opencode/protocol/groups/server"
+import { Global } from "@opencode/util/global"
+import { Cause, Context, Effect, Exit, Latch, Layer, Option, Ref, Scope } from "effect"
+import { HttpMiddleware, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http"
+import { NetAddress } from "effect/net"
 import { createServer } from "node:http"
 import { ServerAuth } from "./auth"
-import { authorizedRequest } from "./middleware/authorization"
+import { isAllowedCorsOrigin } from "./cors"
+import { authorizedRequest, unauthorizedResponse } from "./middleware/authorization"
 import { withoutParentSpan } from "./request-tracing"
 import { createRoutes } from "./routes"
 import { ServerInfo } from "./server-info"
 import { Status } from "./service-status"
+import type { ServerOptions } from "./options"
 
-export type Options<E = never, R = never> = {
-  readonly hostname: string
-  readonly port: Option.Option<number>
-  readonly password: string
-  readonly instanceID: string
-  readonly service?: {
-    readonly onListen: (
-      address: HttpServer.Address,
-      shutdown: Effect.Effect<void>,
-    ) => Effect.Effect<Effect.Effect<void>, E, R>
-  }
+export interface Lifecycle<E = never, R = never> {
+  readonly onListen: (
+    address: NetAddress.SocketAddress,
+    shutdown: Effect.Effect<void>,
+  ) => Effect.Effect<Effect.Effect<void>, E, R>
 }
 
 type App = Effect.Effect<
@@ -34,21 +35,50 @@ type App = Effect.Effect<
   HttpServerRequest.HttpServerRequest | Scope.Scope
 >
 
-export const start = Effect.fn("ServerProcess.start")(function* <E, R>(options: Options<E, R>) {
-  if (!options.password) return yield* Effect.fail(new Error("Missing server password"))
-  const shutdown = yield* Deferred.make<void>()
-  const status = yield* Status.make({
-    instanceID: options.instanceID,
-    managed: options.service !== undefined,
-  })
-  const bound = yield* listen(options)
+export type Transform = (app: App) => App
+
+const errorResponseLogger = HttpMiddleware.make((app) =>
+  HttpMiddleware.logger(
+    Effect.tap(app, (response) =>
+      response.status < 400 ? HttpMiddleware.withLoggerDisabled(Effect.void) : Effect.void,
+    ),
+  ),
+)
+
+export const start = Effect.fn("ServerProcess.start")(function* <E, R>(
+  options: ServerOptions,
+  lifecycle?: Lifecycle<E, R>,
+  transform?: Transform,
+  remoteURLs?: () => ReadonlyArray<string>,
+) {
+  const password = options.password
+  if (!password) return yield* Effect.fail(new Error("Missing server password"))
+  const hostname = options.hostname ?? "127.0.0.1"
+  const port = Option.fromNullishOr(options.port)
+  const shutdown = yield* Latch.make()
+  const status = yield* Status.make()
+  const bound = yield* listen({ hostname, port })
+  const localURLs = () => {
+    const address = bound.server.address()
+    if (address === null || typeof address === "string") return []
+    const host = address.family === "IPv6" ? `[${address.address}]` : address.address
+    return ServerInfo.connectionURLs(`http://${host}:${address.port}`, hostname)
+  }
+  const urls = () => [...localURLs(), ...(remoteURLs?.() ?? [])]
   const application = yield* Ref.make(Option.none<App>())
+  const app = dispatch(password, status, application, options.app?.version ?? "unknown", urls, Global.Path.tmp)
   // Request fibers may continue inbound trace context, but must not inherit the server startup parent.
   yield* bound.http
-    .serve(dispatch(options.password, status, application, shutdown), HttpMiddleware.logger)
-    .pipe(withoutParentSpan)
-  if (options.service)
-    yield* options.service.onListen(bound.http.address, Deferred.succeed(shutdown, undefined).pipe(Effect.asVoid)).pipe(
+    .serve(
+      (transform ? transform(app) : app).pipe(
+        HttpMiddleware.compression(),
+        HttpMiddleware.cors({ allowedOrigins: (origin) => isAllowedCorsOrigin(origin, options), maxAge: 86_400 }),
+      ),
+      errorResponseLogger,
+    )
+    .pipe(Effect.provide(NodeHttpServer.layerHttpServices), withoutParentSpan)
+  if (lifecycle)
+    yield* lifecycle.onListen(bound.http.address, shutdown.open.pipe(Effect.asVoid)).pipe(
       Effect.flatMap((cleanup) =>
         Effect.addFinalizer(() => Scope.close(bound.scope, Exit.void).pipe(Effect.andThen(cleanup))),
       ),
@@ -66,25 +96,33 @@ export const start = Effect.fn("ServerProcess.start")(function* <E, R>(options: 
 
   const boot = Effect.gen(function* () {
     const context = yield* Layer.buildWithScope(
-      createRoutes(options.password, () => {
-        const address = bound.server.address()
-        if (address === null || typeof address === "string") return []
-        const host = address.family === "IPv6" ? `[${address.address}]` : address.address
-        return ServerInfo.connectionURLs(`http://${host}:${address.port}`, options.hostname)
-      }).pipe(Layer.provide(NodeHttpServer.layerHttpServices)),
+      createRoutes(
+        {
+          ...options,
+          password,
+        },
+        urls,
+      ).pipe(Layer.provideMerge(NodeHttpServer.layerHttpServices)),
       applicationScope,
     )
-    if (options.service) {
+    if (lifecycle) {
       yield* installRestartContinuity(Context.get(context, SessionRestart.Service)).pipe(
         Effect.provideService(Scope.Scope, applicationScope),
       )
     }
     yield* Ref.set(application, Option.some(Context.get(context, HttpRouter.HttpRouter).asHttpEffect()))
     yield* status.ready
-    return { address: bound.http.address, shutdown: Deferred.await(shutdown) }
+    const bus = Context.get(context, Bus.Service)
+    return {
+      address: bound.http.address,
+      shutdown: shutdown.await,
+      updateAvailable: (version: string) =>
+        bus.publish(InstallationEvent.UpdateAvailable, { version }).pipe(Effect.asVoid),
+      updated: (version: string) => bus.publish(InstallationEvent.Updated, { version }).pipe(Effect.asVoid),
+    }
   }).pipe(
     Effect.catchCause((cause) => {
-      if (!options.service || Cause.hasInterruptsOnly(cause)) return Effect.failCause(cause)
+      if (!lifecycle || Cause.hasInterruptsOnly(cause)) return Effect.failCause(cause)
       return status.fail.pipe(
         Effect.andThen(
           Scope.close(applicationScope, Exit.failCause(cause)).pipe(
@@ -98,8 +136,8 @@ export const start = Effect.fn("ServerProcess.start")(function* <E, R>(options: 
       )
     }),
   )
-  if (!options.service) return yield* boot
-  return yield* Effect.raceFirst(boot, Deferred.await(shutdown).pipe(Effect.andThen(Effect.interrupt)))
+  if (!lifecycle) return yield* boot
+  return yield* Effect.raceFirst(boot, shutdown.await.pipe(Effect.andThen(Effect.interrupt)))
 })
 
 function listen(options: { readonly hostname: string; readonly port: Option.Option<number> }) {
@@ -137,68 +175,42 @@ function dispatch(
   password: string,
   status: Status.Interface,
   application: Ref.Ref<Option.Option<App>>,
-  shutdown: Deferred.Deferred<void>,
+  version: string,
+  urls: () => ReadonlyArray<string>,
+  tmp: string,
 ): App {
-  const auth = ServerAuth.Config.of({ username: "opencode", password: Option.some(password) })
+  const auth = ServerAuth.Config.of({ password: Option.some(password), username: "opencode" })
   return Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest
     const url = new URL(request.url, "http://localhost")
-    const lifecycle =
-      request.method === "GET" && url.pathname === "/api/health"
-        ? "health"
-        : request.method === "POST" && url.pathname === "/api/service/stop"
-          ? "stop"
-          : undefined
-    if (lifecycle !== undefined) {
-      if (!(yield* authorizedRequest(request, auth))) return unauthorized()
-      return yield* control(request, lifecycle, status, () => Deferred.doneUnsafe(shutdown, Effect.void))
-    }
     const state = yield* status.current
     const app = yield* Ref.get(application)
     const ready = state.type === "ready" && Option.isSome(app)
-    if ((!ready || !hasPtyConnectTicketURL(url)) && !(yield* authorizedRequest(request, auth))) return unauthorized()
+    if (request.method === "GET" && url.pathname === "/api/info" && !ready) {
+      if (!(yield* authorizedRequest(request, auth))) return unauthorizedResponse(request)
+      return yield* infoResponse(status, version, urls, tmp)
+    }
+    if (
+      !isPairingConnectURL(url) &&
+      (!ready ||
+        (!hasPtyConnectTicketURL(url) && !hasPersistentPtyConnectTicketURL(url) && !hasMcpClientTicketURL(url))) &&
+      !(yield* authorizedRequest(request, auth))
+    )
+      return unauthorizedResponse(request)
     if (ready) return yield* app.value
     return unavailable(state)
   })
 }
 
-function unauthorized() {
-  return HttpServerResponse.empty({
-    status: 401,
-    headers: { "www-authenticate": 'Basic realm="Secure Area"' },
-  })
-}
-
-const control = Effect.fnUntraced(function* (
-  request: HttpServerRequest.HttpServerRequest,
-  route: "health" | "stop",
+const infoResponse = Effect.fnUntraced(function* (
   status: Status.Interface,
-  stop: () => void,
+  version: string,
+  urls: () => ReadonlyArray<string>,
+  tmp: string,
 ) {
-  if (route === "health") return yield* healthResponse(status)
-  const body = yield* request.json.pipe(Effect.option)
-  const input = Option.isSome(body) ? Schema.decodeUnknownOption(ServiceStatus.StopRequest)(body.value) : Option.none()
-  if (Option.isNone(input)) return HttpServerResponse.jsonUnsafe({ code: "invalid_request" }, { status: 400 })
-  const accepted = yield* status.requestStop(input.value)
-  if (accepted) {
-    const response = NodeHttpServerRequest.toServerResponse(request)
-    yield* Effect.sync(() => {
-      const complete = () => {
-        response.off("finish", complete)
-        response.off("close", complete)
-        stop()
-      }
-      response.once("finish", complete)
-      response.once("close", complete)
-    })
-  }
-  return HttpServerResponse.jsonUnsafe({ accepted })
-})
-
-const healthResponse = Effect.fnUntraced(function* (status: Status.Interface) {
   const state = yield* status.current
   return HttpServerResponse.jsonUnsafe(
-    { healthy: true, version: InstallationVersion, pid: process.pid },
+    { version, pid: process.pid, urls: urls(), paths: { tmp } },
     {
       status: state.type === "ready" ? 200 : state.type === "failed" ? 500 : 503,
       headers: state.type === "starting" || state.type === "stopping" ? { "retry-after": "1" } : undefined,
@@ -223,12 +235,10 @@ function unavailable(status: Status.State) {
 }
 
 /**
- * The managed server owns restart continuity: it resumes Sessions the previous server suspended and
- * suspends its own active Sessions on graceful shutdown. Suspension runs while the drains are still
- * alive: connections close first, this finalizer runs next, and Session execution teardown follows.
+ * The managed server owns restart continuity: at boot it resumes Sessions whose execution claim was
+ * never released. Claims are written when execution starts (see SessionExecution), so recovery covers
+ * graceful restarts and unclean deaths alike — no shutdown hook participates.
  */
 const installRestartContinuity = Effect.fnUntraced(function* (restart: SessionRestart.Interface) {
   yield* Effect.forkScoped(restart.resumeSuspendedSessions)
-  // Registered after the fork so suspension observes still-running resumed drains during teardown.
-  yield* Effect.addFinalizer(() => restart.suspendActiveSessions)
 })

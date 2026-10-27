@@ -10,14 +10,15 @@
 //   /permission [kind] → triggers a permission request variant
 //   /form [kind]       → triggers a canonical Form request variant
 //   /fmt <kind>   → emits a specific tool/text type (text, reasoning, shell,
-//                   write, edit, patch, subagent, question, error, mix)
+//                   write, edit, patch, subagent, todo, question, error, mix)
 //
 // Demo mode handles permission and Form replies locally, completing or failing
 // the synthetic tool parts through the same callbacks used by the live footer.
 import path from "path"
-import type { JsonValue, SessionMessageAssistantTool } from "@opencode-ai/client/promise"
+import type { JsonValue, SessionMessageAssistantTool } from "@opencode/client/promise"
+import { parseSlashHead } from "../prompt/parse"
 import { writeSessionOutput } from "./stream"
-import { toolCommit } from "./stream-v2.subagent"
+import { toolCommit, toolFinalPhase } from "./stream-v2.subagent"
 import type {
   FooterApi,
   FooterView,
@@ -31,6 +32,7 @@ import type {
 } from "./types"
 
 const KINDS = [
+  "motion",
   "markdown",
   "table",
   "text",
@@ -40,6 +42,7 @@ const KINDS = [
   "edit",
   "patch",
   "subagent",
+  "todo",
   "question",
   "error",
   "mix",
@@ -110,7 +113,6 @@ const SAMPLE_TABLE = [
 
 type Ref = {
   msg: string
-  part: string
   call: string
   tool: string
   input: Record<string, JsonValue>
@@ -126,7 +128,6 @@ type FormRequest = {
 type Perm = {
   ref: Ref
   done: {
-    title: string
     output: string
     metadata?: Record<string, JsonValue>
   }
@@ -153,6 +154,7 @@ type State = {
   perms: Map<string, Perm>
   forms: Map<string, FormRequest>
   started: Set<string>
+  motion?: AbortController
 }
 
 type Input = {
@@ -203,7 +205,6 @@ function showSubagent(
           description: input.description,
           status: input.status,
           title: input.title,
-          lastUpdatedAt: Date.now(),
         },
       ],
       details: {
@@ -337,7 +338,6 @@ async function emitReasoning(state: State, body: string, signal?: AbortSignal): 
 function make(state: State, tool: string, input: Record<string, JsonValue>): Ref {
   return {
     msg: open(state),
-    part: take(state, "part", "part"),
     call: take(state, "call", "call"),
     tool,
     input,
@@ -345,13 +345,13 @@ function make(state: State, tool: string, input: Record<string, JsonValue>): Ref
   }
 }
 
-function startTool(state: State, ref: Ref, structured: Record<string, JsonValue> = {}): SessionMessageAssistantTool {
-  state.started.add(ref.part)
+function startTool(state: State, ref: Ref, metadata: Record<string, JsonValue> = {}): SessionMessageAssistantTool {
+  state.started.add(ref.call)
   const part = {
     type: "tool" as const,
     id: ref.call,
     name: ref.tool,
-    state: { status: "running" as const, input: ref.input, structured, content: [] },
+    state: { status: "running" as const, input: ref.input, metadata },
     time: { created: ref.start, ran: ref.start },
   }
   present(state, [toolCommit(part, ref.msg, "start")])
@@ -376,7 +376,7 @@ function askPermission(state: State, item: Permit): void {
       resources: item.patterns,
       metadata: item.metadata ?? {},
       save: item.always,
-      source: { type: "tool", messageID: item.ref.msg, callID: item.ref.call },
+      source: { type: "tool", messageID: item.ref.msg, id: item.ref.call },
       tool,
     },
   })
@@ -386,12 +386,11 @@ function doneTool(
   state: State,
   ref: Ref,
   output: {
-    title: string
     output: string
     metadata?: Record<string, JsonValue>
   },
 ): void {
-  if (!state.started.has(ref.part)) startTool(state, ref)
+  if (!state.started.has(ref.call)) startTool(state, ref)
   const part: SessionMessageAssistantTool = {
     type: "tool",
     id: ref.call,
@@ -399,16 +398,16 @@ function doneTool(
     state: {
       status: "completed",
       input: ref.input,
-      content: output.output ? [{ type: "text", text: output.output }] : [],
-      structured: output.metadata ?? {},
+      content: [{ type: "text", text: output.output }],
+      metadata: output.metadata,
     },
     time: { created: ref.start, ran: ref.start, completed: Date.now() },
   }
-  present(state, [toolCommit(part, ref.msg, output.output ? "progress" : "final")])
+  present(state, [toolCommit(part, ref.msg, toolFinalPhase(part))])
 }
 
 function failTool(state: State, ref: Ref, error: string): void {
-  if (!state.started.has(ref.part)) startTool(state, ref)
+  if (!state.started.has(ref.call)) startTool(state, ref)
   present(state, [
     toolCommit(
       {
@@ -419,8 +418,6 @@ function failTool(state: State, ref: Ref, error: string): void {
           status: "error",
           input: ref.input,
           error: { type: "unknown", message: error },
-          structured: {},
-          content: [],
         },
         time: { created: ref.start, ran: ref.start, completed: Date.now() },
       },
@@ -443,7 +440,6 @@ async function emitBash(state: State, signal?: AbortSignal): Promise<void> {
   startTool(state, ref)
   await wait(70, signal)
   doneTool(state, ref, {
-    title: "git status",
     output: `${process.cwd()}\ngit status\nOn branch demo\nnothing to commit, working tree clean\n`,
     metadata: {
       exit: 0,
@@ -458,7 +454,6 @@ function emitWrite(state: State): void {
     content: "export const demo = 42\n",
   })
   doneTool(state, ref, {
-    title: "write",
     output: "",
     metadata: {},
   })
@@ -470,7 +465,6 @@ function emitEdit(state: State): void {
     path: file,
   })
   doneTool(state, ref, {
-    title: "edit",
     output: "",
     metadata: {
       files: [
@@ -490,7 +484,6 @@ function emitPatch(state: State): void {
     patchText: "*** Begin Patch\n*** End Patch",
   })
   doneTool(state, ref, {
-    title: "patch",
     output: "",
     metadata: {
       files: [
@@ -517,10 +510,9 @@ function emitTask(state: State): void {
     agent: "explore",
   })
   doneTool(state, ref, {
-    title: "Reducer touchpoints found",
     output: "",
     metadata: {
-      sessionID: "sub_demo_1",
+      sessionID: "ses_demo_child",
       status: "completed",
       output: "",
     },
@@ -536,13 +528,12 @@ function emitTask(state: State): void {
         offset: 1,
         limit: 200,
       },
-      structured: {},
-      content: [],
+      metadata: {},
     },
     time: { created: Date.now(), ran: Date.now() },
   } satisfies SessionMessageAssistantTool
   showSubagent(state, {
-    sessionID: "sub_demo_1",
+    sessionID: "ses_demo_child",
     label: "Explore",
     description: "Scan run/* for reducer touchpoints",
     status: "completed",
@@ -562,16 +553,7 @@ function emitTask(state: State): void {
         messageID: "sub_demo_msg_reasoning",
         partID: "sub_demo_reasoning_1",
       },
-      {
-        kind: "tool",
-        text: "running read",
-        phase: "start",
-        source: "tool",
-        messageID: "sub_demo_msg_tool",
-        partID: "sub_demo_tool_1",
-        tool: "read",
-        part,
-      },
+      toolCommit(part, "sub_demo_msg_tool", "start"),
       {
         kind: "assistant",
         text: "Footer updates flow through stream.ts into RunFooter",
@@ -582,6 +564,17 @@ function emitTask(state: State): void {
       },
     ],
   })
+}
+
+function emitTodo(state: State): void {
+  const todos = [
+    { content: "Trigger permission UI", status: "completed" },
+    { content: "Trigger question UI", status: "in_progress" },
+    { content: "Tune tool formatting", status: "pending" },
+    { content: "Rewrite the renderer", status: "cancelled" },
+  ]
+  const ref = make(state, "todowrite", { todos })
+  doneTool(state, ref, { output: "1 completed, 1 in progress, 1 pending, 1 cancelled", metadata: { todos } })
 }
 
 function emitQuestionTool(state: State): void {
@@ -610,7 +603,6 @@ function emitQuestionTool(state: State): void {
     ],
   })
   doneTool(state, ref, {
-    title: "question",
     output: "",
     metadata: {
       answers: [["Diff"], ["Usage", "custom-note"]],
@@ -635,7 +627,6 @@ function emitPermission(state: State, kind: PermissionKind = "edit"): void {
       patterns: [command],
       always: ["*"],
       done: {
-        title: "git status --short",
         output: `${root}\ngit status --short\n M src/demo-format.ts\n?? src/demo-permission.ts\n`,
         metadata: {
           exit: 0,
@@ -658,7 +649,6 @@ function emitPermission(state: State, kind: PermissionKind = "edit"): void {
       patterns: [target],
       always: [target],
       done: {
-        title: "read",
         output: ["1: {", '2:   "name": "opencode",', '3:   "private": true', "4: }"].join("\n"),
         metadata: {},
       },
@@ -677,7 +667,6 @@ function emitPermission(state: State, kind: PermissionKind = "edit"): void {
       patterns: ["explore"],
       always: ["*"],
       done: {
-        title: "Footer spacing checked",
         output: "",
         metadata: {
           sessionID: "sub_demo_perm_1",
@@ -707,7 +696,6 @@ function emitPermission(state: State, kind: PermissionKind = "edit"): void {
       },
       always: [`${dir}/**`],
       done: {
-        title: "read",
         output: `1: # External demo\n2: Shared preview file\nPath: ${target}`,
         metadata: {},
       },
@@ -726,7 +714,6 @@ function emitPermission(state: State, kind: PermissionKind = "edit"): void {
       patterns: ["*"],
       always: ["*"],
       done: {
-        title: "Retry allowed",
         output: "Continuing after repeated failures.\n",
         metadata: {},
       },
@@ -744,7 +731,6 @@ function emitPermission(state: State, kind: PermissionKind = "edit"): void {
     patterns: [file],
     always: [file],
     done: {
-      title: "edit",
       output: "",
       metadata: {
         files: [{ file, status: "modified", patch: diff }],
@@ -833,7 +819,7 @@ function emitForm(state: State, kind: FormKind = "question"): void {
     title: form.title,
     metadata:
       kind === "question"
-        ? { kind: "question", tool: { messageID: ref.msg, callID: ref.call } }
+        ? { kind: "question", tool: { messageID: ref.msg, id: ref.call } }
         : { kind: "mcp", message: `Synthetic ${kind} MCP elicitation` },
     fields: form.fields,
   }
@@ -842,6 +828,17 @@ function emitForm(state: State, kind: FormKind = "question"): void {
 }
 
 async function emitFmt(state: State, kind: string, body: string, signal?: AbortSignal): Promise<boolean> {
+  if (kind === "motion") {
+    note(state.footer, "Working indicator demo: 70 seconds, no model calls. Interrupt to stop early.")
+    const controller = new AbortController()
+    state.motion = controller
+    try {
+      await wait(70_000, signal ? AbortSignal.any([controller.signal, signal]) : controller.signal)
+    } finally {
+      state.motion = undefined
+    }
+    return true
+  }
   if (kind === "text") {
     await emitText(state, body || SAMPLE_MARKDOWN, signal)
     return true
@@ -887,6 +884,11 @@ async function emitFmt(state: State, kind: string, body: string, signal?: AbortS
     return true
   }
 
+  if (kind === "todo") {
+    emitTodo(state)
+    return true
+  }
+
   if (kind === "question") {
     emitQuestionTool(state)
     return true
@@ -907,6 +909,7 @@ async function emitFmt(state: State, kind: string, body: string, signal?: AbortS
     emitEdit(state)
     emitPatch(state)
     emitTask(state)
+    emitTodo(state)
     emitQuestionTool(state)
     emitError(state, "demo mixed scenario error")
     return true
@@ -928,6 +931,7 @@ function intro(state: State): void {
       "- /form question",
       "- /form external",
       "- /fmt markdown",
+      "- /fmt motion",
       "- /fmt table",
       "- /fmt text your custom text",
     ].join("\n"),
@@ -955,10 +959,21 @@ export function createRunDemo(input: Input) {
 
   const prompt = async (line: RunPrompt, signal?: AbortSignal): Promise<boolean> => {
     const text = line.text.trim()
-    const list = text.split(/\s+/)
-    const cmd = list[0] || ""
+    const head = parseSlashHead(text)
+    const list = head?.arguments.split(/\s+/).filter(Boolean) ?? []
+    const cmd = head ? `/${head.name}` : ""
 
     clearSubagent(state.footer)
+
+    if (line.mode !== "shell" && ["/help", "/permission", "/form", "/fmt"].includes(cmd)) {
+      state.footer.append({
+        kind: "user",
+        text: line.text,
+        phase: "start",
+        source: "system",
+        messageID: line.messageID,
+      })
+    }
 
     if (cmd === "/help") {
       intro(state)
@@ -966,7 +981,7 @@ export function createRunDemo(input: Input) {
     }
 
     if (cmd === "/permission") {
-      const kind = permissionKind(list[1])
+      const kind = permissionKind(list[0])
       if (!kind) {
         note(state.footer, `Pick a permission kind: ${PERMISSIONS.join(", ")}`)
         return true
@@ -977,7 +992,7 @@ export function createRunDemo(input: Input) {
     }
 
     if (cmd === "/form") {
-      const kind = formKind(list[1])
+      const kind = formKind(list[0])
       if (!kind) {
         note(state.footer, `Pick a form kind: ${FORMS.join(", ")}`)
         return true
@@ -988,8 +1003,8 @@ export function createRunDemo(input: Input) {
     }
 
     if (cmd === "/fmt") {
-      const kind = (list[1] || "").toLowerCase()
-      const body = list.slice(2).join(" ")
+      const kind = (list[0] || "").toLowerCase()
+      const body = list.slice(1).join(" ")
       if (!kind) {
         note(state.footer, `Pick a kind: ${KINDS.join(", ")}`)
         return true
@@ -1009,14 +1024,14 @@ export function createRunDemo(input: Input) {
 
   const permission = (input: PermissionReply): boolean => {
     const item = state.perms.get(input.requestID)
-    if (!item || !input.reply) {
+    if (!item || !input.decision) {
       return false
     }
 
     state.perms.delete(input.requestID)
     clearBlocker(state)
 
-    if (input.reply === "reject") {
+    if (input.decision === "reject") {
       failTool(state, item.ref, input.message || "permission rejected")
       return true
     }
@@ -1032,7 +1047,6 @@ export function createRunDemo(input: Input) {
     clearBlocker(state)
     if (form.kind === "question") {
       doneTool(state, form.ref, {
-        title: "question",
         output: "",
         metadata: {
           answers: form.request.fields.map((field) => {
@@ -1045,7 +1059,6 @@ export function createRunDemo(input: Input) {
       return true
     }
     doneTool(state, form.ref, {
-      title: form.request.title,
       output: `Form submitted: ${Object.entries(input.answer)
         .map(([key, value]) => `${key}=${Array.isArray(value) ? value.join(", ") : String(value)}`)
         .join("; ")}\n`,
@@ -1066,6 +1079,11 @@ export function createRunDemo(input: Input) {
   return {
     start,
     prompt,
+    interrupt() {
+      if (!state.motion) return false
+      state.motion.abort()
+      return true
+    },
     permission,
     formReply,
     formCancel,

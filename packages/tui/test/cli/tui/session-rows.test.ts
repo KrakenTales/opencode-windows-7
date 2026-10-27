@@ -1,6 +1,179 @@
 import { expect, test } from "bun:test"
-import type { SessionMessageAssistant, SessionMessageInfo } from "@opencode-ai/client"
-import { messageBoundaryIDs, reduceSessionRows } from "../../../src/routes/session/rows"
+import type { SessionMessageAssistant, SessionMessageInfo } from "@opencode/client"
+import { createMemo, createRoot } from "solid-js"
+import { createStore } from "solid-js/store"
+import { SessionTurn } from "@opencode/util/session-turn"
+import { cacheReuseDrop, messageBoundaryIDs, reduceSessionRows, sessionRowID } from "../../../src/routes/session/rows"
+
+test("indexed tail footer calculations do not subscribe to an unrelated history prefix", () => {
+  createRoot((dispose) => {
+    try {
+      const final = assistant("final", [])
+      final.time = { created: 2_000, streamed: 3_000, completed: 5_000 }
+      final.tokens = { input: 1, output: 20, reasoning: 0, cache: { read: 0, write: 0 } }
+      const [messages, setMessages] = createStore<SessionMessageInfo[]>([
+        { type: "user", id: "old-input", text: "Old question", time: { created: 0 } },
+        assistant("old-step", []),
+        { type: "user", id: "input", text: "Current question", time: { created: 1_000 } },
+        final,
+      ])
+      let runs = 0
+      const footer = createMemo(() => {
+        runs++
+        const current = messages[3]
+        if (current.type !== "assistant") throw new Error("Expected an assistant")
+        return [
+          SessionTurn.duration(messages, current, { index: 3 }),
+          SessionTurn.tokensPerSecond(messages, current, { index: 3 }),
+        ]
+      })
+      expect(footer()).toEqual([4_000, 20])
+      setMessages(0, { type: "user", id: "replaced-prefix", text: "Older question", time: { created: 50 } })
+      expect(footer()).toEqual([4_000, 20])
+      expect(runs).toBe(1)
+
+      setMessages(2, "time", "created", 1_500)
+      expect(footer()).toEqual([3_500, 20])
+      setMessages(3, { ...final, time: { ...final.time, streamed: 4_000 }, tokens: { ...final.tokens, output: 60 } })
+      expect(footer()).toEqual([3_500, 30])
+      expect(runs).toBe(3)
+    } finally {
+      dispose()
+    }
+  })
+})
+
+test("filters OpenAI cache quantization from cache reuse drops", () => {
+  const openai = { id: "gpt", providerID: "openai" }
+  expect(cacheReuseDrop(undefined, { read: 10_000, model: openai })).toBeUndefined()
+  expect(cacheReuseDrop({ read: 10_000, model: openai }, { read: 11_000, model: openai })).toBeUndefined()
+  expect(cacheReuseDrop({ read: 10_000, model: openai }, { read: 8_977, model: openai })).toBe(1_023)
+  expect(cacheReuseDrop({ read: 10_000, model: openai }, { read: 8_976, model: openai })).toBeUndefined()
+  expect(cacheReuseDrop({ read: 10_000, model: openai }, { read: 8_500, model: openai })).toBeUndefined()
+  expect(cacheReuseDrop({ read: 10_000, model: openai }, { read: 7_952, model: openai })).toBeUndefined()
+  expect(cacheReuseDrop({ read: 10_000, model: openai }, { read: 7_951, model: openai })).toBe(2_049)
+})
+
+test("compares cache reuse only for the same model", () => {
+  const previous = { read: 10_000, model: { id: "claude", providerID: "anthropic" } }
+  expect(cacheReuseDrop(previous, { read: 8_976, model: { id: "gpt", providerID: "openai" } })).toBeUndefined()
+  expect(cacheReuseDrop(previous, { read: 8_976, model: { id: "claude", providerID: "anthropic" } })).toBe(1_024)
+  expect(
+    cacheReuseDrop(
+      { read: 10_000, model: { id: "gpt", providerID: "openai", variant: "low" } },
+      { read: 8_976, model: { id: "gpt", providerID: "openai", variant: "high" } },
+    ),
+  ).toBeUndefined()
+})
+
+test("carries model identity with the cross-turn cache baseline", () => {
+  const first = assistant("assistant-1", [])
+  first.model = { id: "claude", providerID: "anthropic" }
+  first.finish = "stop"
+  first.tokens = { input: 1, output: 0, reasoning: 0, cache: { read: 10_000, write: 0 } }
+  const second = assistant("assistant-2", [])
+  second.model = { id: "gpt", providerID: "openai" }
+  second.finish = "stop"
+  second.tokens = { input: 1, output: 0, reasoning: 0, cache: { read: 8_976, write: 0 } }
+
+  const rows = reduceSessionRows(
+    [
+      { type: "user", id: "user-1", text: "First", time: { created: 0 } },
+      first,
+      { type: "user", id: "user-2", text: "Second", time: { created: 2 } },
+      second,
+    ],
+    new Set(),
+    true,
+  ).filter((row) => row.type === "turn-usage")
+
+  expect(rows).toEqual([
+    { type: "turn-usage", messageIDs: ["assistant-1"] },
+    {
+      type: "turn-usage",
+      messageIDs: ["assistant-2"],
+      previousCache: { read: 10_000, model: { id: "claude", providerID: "anthropic" } },
+    },
+  ])
+})
+
+test("resets the cross-turn cache baseline after compaction", () => {
+  const first = assistant("assistant-1", [])
+  first.finish = "stop"
+  first.tokens = { input: 1, output: 0, reasoning: 0, cache: { read: 370_176, write: 0 } }
+  const second = assistant("assistant-2", [])
+  second.finish = "stop"
+  second.tokens = { input: 1, output: 0, reasoning: 0, cache: { read: 13_824, write: 0 } }
+
+  const rows = reduceSessionRows(
+    [
+      first,
+      {
+        type: "compaction",
+        id: "compaction-1",
+        status: "completed",
+        reason: "auto",
+        summary: "Compacted context",
+        time: { created: 2 },
+      },
+      second,
+    ],
+    new Set(),
+    true,
+  ).filter((row) => row.type === "turn-usage")
+
+  expect(rows).toEqual([
+    { type: "turn-usage", messageIDs: ["assistant-1"] },
+    { type: "turn-usage", messageIDs: ["assistant-2"] },
+  ])
+})
+
+test("closes turn usage on the idle marker so steered steps share one footer", () => {
+  const step = (id: string, read: number) => ({
+    ...assistant(id, []),
+    finish: "stop" as const,
+    tokens: { input: 1, output: 0, reasoning: 0, cache: { read, write: 0 } },
+  })
+  const idle = (id: string, created: number): SessionMessageInfo => ({
+    type: "idle",
+    id,
+    outcome: "succeeded",
+    time: { created },
+  })
+  const messages: SessionMessageInfo[] = [
+    { type: "user", id: "user-1", text: "First", time: { created: 0 } },
+    step("assistant-1", 1_000),
+    { type: "user", id: "steer", text: "Also this", time: { created: 2 } },
+    step("assistant-2", 2_000),
+    idle("idle-1", 3),
+    { type: "user", id: "user-2", text: "Second", time: { created: 4 } },
+    step("assistant-3", 3_000),
+    { type: "user", id: "steer-2", text: "Wait", time: { created: 5 } },
+    step("assistant-4", 4_000),
+  ]
+
+  expect(reduceSessionRows(messages, new Set(), true)).toEqual([
+    { type: "message", messageID: "user-1" },
+    { type: "assistant-footer", messageID: "assistant-1" },
+    { type: "message", messageID: "steer" },
+    { type: "assistant-footer", messageID: "assistant-2" },
+    { type: "turn-usage", messageIDs: ["assistant-1", "assistant-2"] },
+    { type: "message", messageID: "user-2" },
+    { type: "assistant-footer", messageID: "assistant-3" },
+    { type: "message", messageID: "steer-2" },
+    { type: "assistant-footer", messageID: "assistant-4" },
+  ])
+  expect(
+    reduceSessionRows([...messages, idle("idle-2", 6)], new Set(), true).filter((row) => row.type === "turn-usage"),
+  ).toEqual([
+    { type: "turn-usage", messageIDs: ["assistant-1", "assistant-2"] },
+    {
+      type: "turn-usage",
+      messageIDs: ["assistant-3", "assistant-4"],
+      previousCache: { read: 2_000, model: { id: "model", providerID: "provider" } },
+    },
+  ])
+})
 
 test("assigns assistant boundaries to the first rendered row instead of the first text row", () => {
   const messages: SessionMessageInfo[] = [
@@ -14,6 +187,24 @@ test("assigns assistant boundaries to the first rendered row instead of the firs
   const rows = reduceSessionRows(messages)
 
   expect(messageBoundaryIDs(rows, messages)).toEqual(["user-1", "assistant-1", undefined, undefined])
+})
+
+test("assigns stable IDs to tool rows for direct navigation", () => {
+  const messages: SessionMessageInfo[] = [
+    assistant("assistant-1", [
+      { type: "text", text: "Starting a shell" },
+      { type: "tool", id: "shell-1", name: "shell", state: pending(), time: { created: 2 } },
+    ]),
+    assistant("assistant-2", [{ type: "tool", id: "shell-2", name: "shell", state: pending(), time: { created: 3 } }]),
+  ]
+  const rows = reduceSessionRows(messages)
+  const boundaries = messageBoundaryIDs(rows, messages)
+
+  expect(rows.map((row, index) => sessionRowID(row, boundaries[index]))).toEqual([
+    "assistant-1",
+    "session-part:assistant-1:shell-1",
+    "assistant-2",
+  ])
 })
 
 test("groups exploration parts across assistant messages until a delimiter", () => {
@@ -38,10 +229,11 @@ test("groups exploration parts across assistant messages until a delimiter", () 
       kind: "exploration",
       pending: [],
       completed: true,
-      refs: [
-        { messageID: "assistant-1", partID: "read-1" },
-        { messageID: "assistant-1", partID: "glob-1" },
-        { messageID: "assistant-2", partID: "grep-1" },
+      size: 3,
+      children: [
+        partChild("assistant-1", "read-1"),
+        partChild("assistant-1", "glob-1"),
+        partChild("assistant-2", "grep-1"),
       ],
     },
     { type: "part", ref: { messageID: "assistant-2", partID: "text:0" } },
@@ -63,7 +255,8 @@ test("keeps non-exploration tools as individual part rows", () => {
       kind: "exploration",
       pending: [],
       completed: true,
-      refs: [{ messageID: "assistant-1", partID: "read-1" }],
+      size: 1,
+      children: [partChild("assistant-1", "read-1")],
     },
     { type: "part", ref: { messageID: "assistant-1", partID: "reasoning:0" } },
     {
@@ -71,7 +264,8 @@ test("keeps non-exploration tools as individual part rows", () => {
       kind: "exploration",
       pending: [],
       completed: false,
-      refs: [{ messageID: "assistant-1", partID: "grep-1" }],
+      size: 1,
+      children: [partChild("assistant-1", "grep-1")],
     },
   ])
 })
@@ -92,14 +286,16 @@ test("assigns stable kind ordinals within an assistant message", () => {
       type: "group",
       kind: "reasoning",
       completed: true,
-      refs: [{ messageID: "assistant-1", partID: "reasoning:0" }],
+      size: 1,
+      children: [partChild("assistant-1", "reasoning:0")],
     },
     { type: "part", ref: { messageID: "assistant-1", partID: "text:1" } },
     {
       type: "group",
       kind: "reasoning",
       completed: false,
-      refs: [{ messageID: "assistant-1", partID: "reasoning:1" }],
+      size: 1,
+      children: [partChild("assistant-1", "reasoning:1")],
     },
   ])
 })
@@ -119,17 +315,16 @@ test("groups adjacent reasoning parts until a visible boundary", () => {
       type: "group",
       kind: "reasoning",
       completed: true,
-      refs: [
-        { messageID: "assistant-1", partID: "reasoning:0" },
-        { messageID: "assistant-1", partID: "reasoning:1" },
-      ],
+      size: 2,
+      children: [partChild("assistant-1", "reasoning:0"), partChild("assistant-1", "reasoning:1")],
     },
     { type: "part", ref: { messageID: "assistant-1", partID: "text:0" } },
     {
       type: "group",
       kind: "reasoning",
       completed: false,
-      refs: [{ messageID: "assistant-1", partID: "reasoning:2" }],
+      size: 1,
+      children: [partChild("assistant-1", "reasoning:2")],
     },
   ])
 })
@@ -151,17 +346,16 @@ test("groups across empty assistant reasoning parts", () => {
       type: "group",
       kind: "reasoning",
       completed: true,
-      refs: [{ messageID: "assistant-1", partID: "reasoning:0" }],
+      size: 1,
+      children: [partChild("assistant-1", "reasoning:0")],
     },
     {
       type: "group",
       kind: "exploration",
       pending: [],
       completed: false,
-      refs: [
-        { messageID: "assistant-1", partID: "read-1" },
-        { messageID: "assistant-2", partID: "grep-1" },
-      ],
+      size: 2,
+      children: [partChild("assistant-1", "read-1"), partChild("assistant-2", "grep-1")],
     },
   ])
 })
@@ -183,7 +377,8 @@ test("completes exploration groups when another row follows", () => {
       kind: "exploration",
       pending: [],
       completed: true,
-      refs: [{ messageID: "assistant-1", partID: "read-1" }],
+      size: 1,
+      children: [partChild("assistant-1", "read-1")],
     },
     { type: "message", messageID: "user-1" },
     {
@@ -191,7 +386,8 @@ test("completes exploration groups when another row follows", () => {
       kind: "exploration",
       pending: [],
       completed: true,
-      refs: [{ messageID: "assistant-2", partID: "grep-1" }],
+      size: 1,
+      children: [partChild("assistant-2", "grep-1")],
     },
     { type: "assistant-footer", messageID: "assistant-2" },
   ])
@@ -199,28 +395,38 @@ test("completes exploration groups when another row follows", () => {
 
 test("hides synthetic messages without descriptions", () => {
   const messages: SessionMessageInfo[] = [
+    {
+      id: "shell-message",
+      type: "shell",
+      shellID: "sh_user",
+      command: "pwd",
+      status: "exited",
+      time: { created: 0 },
+    },
     assistant("assistant-1", [{ type: "tool", id: "read-1", name: "read", state: pending(), time: { created: 1 } }]),
     {
       type: "synthetic",
       id: "synthetic-1",
       text: "internal context",
+      metadata: { source: "shell", shellID: "sh_user", state: "completed" },
       time: { created: 2 },
     },
     assistant("assistant-2", [{ type: "tool", id: "grep-1", name: "grep", state: pending(), time: { created: 3 } }]),
   ]
 
-  expect(reduceSessionRows(messages)).toEqual([
+  const rows = reduceSessionRows(messages)
+  expect(rows).toEqual([
+    { type: "message", messageID: "shell-message" },
     {
       type: "group",
       kind: "exploration",
       pending: [],
       completed: false,
-      refs: [
-        { messageID: "assistant-1", partID: "read-1" },
-        { messageID: "assistant-2", partID: "grep-1" },
-      ],
+      size: 2,
+      children: [partChild("assistant-1", "read-1"), partChild("assistant-2", "grep-1")],
     },
   ])
+  expect(reduceSessionRows(messages, new Set(["synthetic-1"]))).toEqual(rows)
 })
 
 test("renders synthetic messages with descriptions", () => {
@@ -242,7 +448,8 @@ test("renders synthetic messages with descriptions", () => {
       kind: "exploration",
       pending: [],
       completed: true,
-      refs: [{ messageID: "assistant-1", partID: "read-1" }],
+      size: 1,
+      children: [partChild("assistant-1", "read-1")],
     },
     { type: "message", messageID: "synthetic-1" },
     {
@@ -250,10 +457,15 @@ test("renders synthetic messages with descriptions", () => {
       kind: "exploration",
       pending: [],
       completed: false,
-      refs: [{ messageID: "assistant-2", partID: "grep-1" }],
+      size: 1,
+      children: [partChild("assistant-2", "grep-1")],
     },
   ])
 })
+
+function partChild(messageID: string, partID: string) {
+  return { type: "entry" as const, entry: { type: "part" as const, ref: { messageID, partID } }, size: 1 as const }
+}
 
 test("renders a footer for a pre-output retry assistant after replay", () => {
   const message = assistant("assistant-retry", [])
@@ -281,7 +493,6 @@ test("places a running compaction barrier before every queued user message", () 
       status: "running",
       reason: "manual",
       summary: "",
-      recent: "",
       time: { created: 2 },
     },
     queued("user-after", "After", 3),

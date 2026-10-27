@@ -1,15 +1,16 @@
 import type {
   EventSubscribeOutput,
   JsonValue,
-  LLMToolContent,
   LocationRef,
   OpenCodeClient,
   SessionMessageAssistantTool,
-} from "@opencode-ai/client/promise"
-import { SessionMessage } from "@opencode-ai/schema/session-message"
+  SessionMessageInfo,
+  ToolContent,
+} from "@opencode/client/promise"
+import { SessionMessage } from "@opencode/schema/session-message"
 import { EOL } from "node:os"
 import { readFile } from "node:fs/promises"
-import { toolOutputText, type MiniToolPart } from "@opencode-ai/tui/mini/tool"
+import { nonEmptyToolContent, toolOutputText, type MiniToolPart } from "@opencode/tui/mini/tool"
 import { UI } from "./ui"
 
 type Model = {
@@ -53,9 +54,9 @@ type ToolState = StartedPart & {
   input: Record<string, JsonValue>
   raw?: string
   provider?: unknown
-  providerState?: SessionMessageAssistantTool["providerState"]
-  structured: Record<string, JsonValue>
-  content: LLMToolContent[]
+  native?: SessionMessageAssistantTool["native"]
+  metadata: Record<string, JsonValue>
+  content: ToolContent[]
 }
 
 type V2Event = EventSubscribeOutput
@@ -66,6 +67,12 @@ type FormRequest = Extract<V2Event, { type: "form.created" }>["data"]["form"]
 // attached client must not cancel input that may belong to another session.
 const GLOBAL_FORM_SESSION_ID = "global"
 
+const QUESTION_CANCELLED_FEEDBACK =
+  "This non-interactive run cannot ask the user questions, so the question was cancelled. Continue without an answer; make reasonable assumptions and state them."
+
+const PERMISSION_REJECTED_FEEDBACK =
+  "This non-interactive run cannot ask the user for permission, so the request was rejected. Continue without this action."
+
 export async function runNonInteractivePrompt(input: Input) {
   const controller = new AbortController()
   const stream = input.client.event.subscribe({ signal: controller.signal })[Symbol.asyncIterator]()
@@ -75,6 +82,9 @@ export async function runNonInteractivePrompt(input: Input) {
   const messageID = SessionMessage.ID.create()
   const starts = new Map<string, StartedPart>()
   const tools = new Map<string, ToolState>()
+  const renderedText = new Map<string, string>()
+  const renderedReasoning = new Map<string, string>()
+  const renderedTools = new Set<string>()
   let submitted = false
   let promoted = false
   let emittedError = false
@@ -82,6 +92,8 @@ export async function runNonInteractivePrompt(input: Input) {
   let formCancelled = false
   let interrupted = false
   let v1InvalidOutput = false
+  let prePromotionError: { message: string; [key: string]: unknown } | undefined
+  let finalizing = false
   let admission: AbortController | undefined
   let pendingStep: { timestamp: number; part: Record<string, unknown>; label: string } | undefined
 
@@ -104,6 +116,17 @@ export async function runNonInteractivePrompt(input: Input) {
     UI.empty()
   }
 
+  const writeReasoning = (part: { text: string; [key: string]: unknown }, timestamp: number) => {
+    if (emit("reasoning", timestamp, { part })) return
+    const text = part.text.trim()
+    if (!text) return
+    const line = `Thinking: ${text}`
+    if (!process.stdout.isTTY) return void process.stdout.write(line + EOL)
+    UI.empty()
+    UI.println(`${UI.Style.TEXT_DIM}\u001b[3m${line}\u001b[0m${UI.Style.TEXT_NORMAL}`)
+    UI.empty()
+  }
+
   const flushStep = () => {
     if (!pendingStep) return
     const value = pendingStep
@@ -115,9 +138,34 @@ export async function runNonInteractivePrompt(input: Input) {
     }
   }
 
-  const replyPermission = async (request: { id: string; action: string; resources: ReadonlyArray<string> }) => {
+  // Subagents run in child sessions; their asks and questions belong to this run too. Other
+  // sessions on a shared server (e.g. the TUI's) must be left alone.
+  const owned = new Map<string, Promise<boolean>>([[input.sessionID, Promise.resolve(true)]])
+  const ownsSession = (sessionID: string): Promise<boolean> => {
+    const known = owned.get(sessionID)
+    if (known) return known
+    const result =
+      sessionID === GLOBAL_FORM_SESSION_ID
+        ? Promise.resolve(false)
+        : input.client.session
+            .get({ sessionID })
+            .then((session) => (session.parentID ? ownsSession(session.parentID) : false))
+            .catch(() => false)
+    owned.set(sessionID, result)
+    return result
+  }
+
+  const replyPermission = async (request: {
+    id: string
+    sessionID: string
+    action: string
+    resources: ReadonlyArray<string>
+  }) => {
+    // Nobody can approve here. Outside V1 compatibility, reject with feedback so the tool fails
+    // as ordinary model-visible output and the model continues without the action.
+    const continuing = !input.auto && input.compatibility !== "v1"
     if (!input.auto) {
-      permissionRejected = true
+      if (!continuing) permissionRejected = true
       UI.println(
         UI.Style.TEXT_WARNING_BOLD + "!",
         UI.Style.TEXT_NORMAL +
@@ -126,26 +174,36 @@ export async function runNonInteractivePrompt(input: Input) {
     }
     await input.client.permission
       .reply({
-        sessionID: input.sessionID,
+        sessionID: request.sessionID,
         requestID: request.id,
-        reply: input.auto ? "once" : "reject",
+        decision: input.auto ? "once" : "reject",
+        ...(continuing ? { message: PERMISSION_REJECTED_FEEDBACK } : {}),
       })
       .catch(() => {})
-    if (!input.auto) {
+    if (!input.auto && !continuing) {
       await input.client.session.interrupt({ sessionID: input.sessionID }).catch(() => {})
     }
   }
 
-  const cancelForm = async (request: Pick<FormRequest, "id" | "sessionID">) => {
+  const cancelForm = async (request: Pick<FormRequest, "id" | "sessionID" | "metadata">) => {
+    // Nobody can answer a question here. Outside V1 compatibility, cancel it with a message so the
+    // question tool fails as ordinary model-visible output and the model continues without an answer.
+    const continuing = request.metadata?.kind === "question" && input.compatibility !== "v1"
     try {
-      await input.client.form.cancel(
-        { sessionID: request.sessionID, formID: request.id },
+      await input.client.session.form.cancel(
+        {
+          sessionID: request.sessionID,
+          formID: request.id,
+          ...(continuing ? { message: QUESTION_CANCELLED_FEEDBACK } : {}),
+        },
         ...formRequestOptions(request.sessionID === GLOBAL_FORM_SESSION_ID ? input.location : undefined),
       )
     } catch (error) {
       if (!formAlreadySettled(error)) throw error
     }
+    if (continuing) return
     formCancelled = true
+    if (input.compatibility !== "v1") process.exitCode = 1
   }
 
   const consume = async () => {
@@ -160,14 +218,14 @@ export async function runNonInteractivePrompt(input: Input) {
       }
       const event = next.value
 
-      if (event.type === "permission.v2.asked" && submitted && event.data.sessionID === input.sessionID) {
+      if (event.type === "permission.asked" && submitted && (await ownsSession(event.data.sessionID))) {
         await replyPermission(event.data)
         continue
       }
       if (
         event.type === "form.created" &&
         submitted &&
-        (event.data.form.sessionID === input.sessionID ||
+        ((await ownsSession(event.data.form.sessionID)) ||
           (!input.attached &&
             event.data.form.sessionID === GLOBAL_FORM_SESSION_ID &&
             sameLocation(event.location, input.location)))
@@ -178,9 +236,10 @@ export async function runNonInteractivePrompt(input: Input) {
       if (!("sessionID" in event.data) || event.data.sessionID !== input.sessionID) continue
       const time = toMillis("created" in event ? event.created : undefined)
 
-      if (event.type === "session.input.promoted") {
-        if (event.data.inputID === messageID) {
+      if (event.type === "session.inbox.delivered") {
+        if (event.data.inboxID === messageID) {
           promoted = true
+          prePromotionError = undefined
           continue
         }
       }
@@ -191,7 +250,19 @@ export async function runNonInteractivePrompt(input: Input) {
       ) {
         return
       }
+      if (!promoted && event.type === "session.execution.failed") {
+        prePromotionError = event.data.error
+        if (finalizing) return
+        continue
+      }
+      if (
+        !promoted &&
+        finalizing &&
+        (event.type === "session.execution.succeeded" || event.type === "session.execution.interrupted")
+      )
+        return
       if (!promoted) continue
+      if (finalizing && !event.type.startsWith("session.execution.")) continue
 
       if (event.type === "session.step.started") {
         const part = {
@@ -219,12 +290,16 @@ export async function runNonInteractivePrompt(input: Input) {
 
       if (event.type === "session.text.started") {
         flushStep()
-        starts.set("text", { id: partID(event.id), timestamp: time })
+        starts.set(`text\u0000${contentKey(event.data.assistantMessageID, event.data.ordinal)}`, {
+          id: partID(event.id),
+          timestamp: time,
+        })
         continue
       }
       if (event.type === "session.text.ended") {
-        const started = starts.get("text")
-        starts.delete("text")
+        const key = contentKey(event.data.assistantMessageID, event.data.ordinal)
+        const started = starts.get(`text\u0000${key}`)
+        starts.delete(`text\u0000${key}`)
         const part = {
           id: started?.id ?? partID(event.id),
           sessionID: input.sessionID,
@@ -233,67 +308,63 @@ export async function runNonInteractivePrompt(input: Input) {
           text: event.data.text,
           time: { start: started?.timestamp ?? time, end: time },
         }
+        renderedText.set(key, event.data.text)
         writeText(part, time)
         continue
       }
 
       if (event.type === "session.reasoning.started") {
         flushStep()
-        starts.set("reasoning", { id: partID(event.id), timestamp: time })
+        starts.set(`reasoning\u0000${contentKey(event.data.assistantMessageID, event.data.ordinal)}`, {
+          id: partID(event.id),
+          timestamp: time,
+        })
         continue
       }
       if (event.type === "session.reasoning.ended" && input.thinking) {
-        const started = starts.get("reasoning")
-        starts.delete("reasoning")
+        const key = contentKey(event.data.assistantMessageID, event.data.ordinal)
+        const started = starts.get(`reasoning\u0000${key}`)
+        starts.delete(`reasoning\u0000${key}`)
         const part = {
           id: started?.id ?? partID(event.id),
           sessionID: input.sessionID,
           messageID: event.data.assistantMessageID,
           type: "reasoning",
           text: event.data.text,
-          metadata: event.data.state,
+          metadata: event.data.native,
           time: { start: started?.timestamp ?? time, end: time },
         }
-        if (emit("reasoning", time, { part })) continue
-        const text = part.text.trim()
-        if (!text) continue
-        const line = `Thinking: ${text}`
-        if (!process.stdout.isTTY) {
-          process.stdout.write(line + EOL)
-          continue
-        }
-        UI.empty()
-        UI.println(`${UI.Style.TEXT_DIM}\u001b[3m${line}\u001b[0m${UI.Style.TEXT_NORMAL}`)
-        UI.empty()
+        renderedReasoning.set(key, event.data.text)
+        writeReasoning(part, time)
         continue
       }
 
       if (event.type === "session.tool.input.started") {
         flushStep()
-        tools.set(toolKey(event.data.assistantMessageID, event.data.callID), {
+        tools.set(toolKey(event.data.assistantMessageID, event.data.id), {
           id: partID(event.id),
           timestamp: time,
           assistantMessageID: event.data.assistantMessageID,
           tool: event.data.name,
           input: {},
-          structured: {},
+          metadata: {},
           content: [],
         })
         continue
       }
       if (event.type === "session.tool.input.ended") {
-        const current = tools.get(toolKey(event.data.assistantMessageID, event.data.callID))
+        const current = tools.get(toolKey(event.data.assistantMessageID, event.data.id))
         if (current) current.raw = event.data.text
         continue
       }
       if (event.type === "session.tool.input.delta") {
-        const current = tools.get(toolKey(event.data.assistantMessageID, event.data.callID))
+        const current = tools.get(toolKey(event.data.assistantMessageID, event.data.id))
         if (current) current.raw = (current.raw ?? "") + event.data.delta
         continue
       }
       if (event.type === "session.tool.called") {
         flushStep()
-        const key = toolKey(event.data.assistantMessageID, event.data.callID)
+        const key = toolKey(event.data.assistantMessageID, event.data.id)
         const current = tools.get(key)
         tools.set(key, {
           id: current?.id ?? partID(event.id),
@@ -302,46 +373,43 @@ export async function runNonInteractivePrompt(input: Input) {
           tool: current?.tool ?? "tool",
           input: event.data.input,
           raw: current?.raw,
-          provider: { executed: event.data.executed, state: event.data.state },
-          providerState: event.data.state,
-          structured: {},
+          provider: { executed: event.data.executed, state: event.data.native },
+          native: event.data.native,
+          metadata: {},
           content: [],
         })
         continue
       }
       if (event.type === "session.tool.progress") {
-        const current = tools.get(toolKey(event.data.assistantMessageID, event.data.callID))
+        const current = tools.get(toolKey(event.data.assistantMessageID, event.data.id))
         if (current) {
-          current.structured = event.data.structured
-          current.content = event.data.content
+          current.metadata = event.data.metadata
         }
         continue
       }
       if (event.type === "session.tool.success") {
-        const key = toolKey(event.data.assistantMessageID, event.data.callID)
+        const key = toolKey(event.data.assistantMessageID, event.data.id)
         const current = tools.get(key) ?? fallbackTool(event)
         const tool: SessionMessageAssistantTool = {
           type: "tool",
-          id: event.data.callID,
+          id: event.data.id,
           name: current.tool,
           executed: event.data.executed,
-          providerState: current.providerState,
-          providerResultState: event.data.resultState,
+          native: event.data.native ? { ...current.native, ...event.data.native } : current.native,
           state: {
             status: "completed",
             input: current.input,
-            structured: event.data.structured,
+            metadata: event.data.metadata,
             content: event.data.content,
-            result: event.data.result,
           },
           time: { created: current.timestamp, ran: current.timestamp, completed: time },
         }
         const part: MiniToolPart = {
-          id: current.id,
+          partID: current.id,
           sessionID: input.sessionID,
           messageID: event.data.assistantMessageID,
           type: "tool",
-          callID: event.data.callID,
+          id: event.data.id,
           tool: current.tool,
           state: {
             status: "completed",
@@ -349,73 +417,72 @@ export async function runNonInteractivePrompt(input: Input) {
             output: toolOutputText(current.tool, event.data.content),
             title: current.tool,
             metadata: {
-              structured: event.data.structured,
+              metadata: event.data.metadata,
               content: event.data.content,
-              result: event.data.result,
               providerCall: current.provider,
-              providerResult: { executed: event.data.executed, state: event.data.resultState },
+              providerResult: { executed: event.data.executed, state: event.data.native },
               rawInput: current.raw,
             },
             time: { start: current.timestamp, end: time },
           },
         }
         tools.delete(key)
+        renderedTools.add(key)
         if (!emit("tool_use", time, { part })) await input.renderTool(tool)
         continue
       }
       if (event.type === "session.tool.failed") {
-        const key = toolKey(event.data.assistantMessageID, event.data.callID)
+        const key = toolKey(event.data.assistantMessageID, event.data.id)
         const current = tools.get(key) ?? fallbackTool(event)
         const error = event.data.error.message
+        const metadata = event.data.metadata ?? current.metadata
+        const content = event.data.content ?? nonEmptyToolContent(current.content)
         const tool: SessionMessageAssistantTool = {
           type: "tool",
-          id: event.data.callID,
+          id: event.data.id,
           name: current.tool,
           executed: event.data.executed,
-          providerState: current.providerState,
-          providerResultState: event.data.resultState,
+          native: event.data.native ? { ...current.native, ...event.data.native } : current.native,
           state: {
             status: "error",
             input: current.input,
-            structured: current.structured,
-            content: current.content,
+            metadata,
+            content,
             error: event.data.error,
-            result: event.data.result,
           },
           time: { created: current.timestamp, ran: current.timestamp, completed: time },
         }
         const part: MiniToolPart = {
-          id: current.id,
+          partID: current.id,
           sessionID: input.sessionID,
           messageID: event.data.assistantMessageID,
           type: "tool",
-          callID: event.data.callID,
+          id: event.data.id,
           tool: current.tool,
           state: {
             status: "error",
             input: current.input,
             error,
             metadata: {
-              result: event.data.result,
               providerCall: current.provider,
-              providerResult: { executed: event.data.executed, state: event.data.resultState },
+              providerResult: { executed: event.data.executed, state: event.data.native },
               rawInput: current.raw,
             },
             time: { start: current.timestamp, end: time },
           },
         }
         tools.delete(key)
+        renderedTools.add(key)
         if (input.compatibility === "v1" && (permissionRejected || formCancelled)) continue
         if (!emit("tool_use", time, { part })) {
-          if (toolOutputText(current.tool, current.content).trim())
+          if (content && toolOutputText(current.tool, content).trim())
             await input.renderTool({
               ...tool,
               state: {
                 status: "completed",
                 input: current.input,
-                structured: current.structured,
-                content: current.content,
-                result: event.data.result,
+                metadata,
+                content,
               },
             })
           await input.renderToolError(tool)
@@ -440,10 +507,7 @@ export async function runNonInteractivePrompt(input: Input) {
         continue
       }
       if (event.type === "session.step.failed") {
-        if (
-          input.compatibility === "v1" &&
-          event.data.error.message === "Provider stream ended without a terminal finish event"
-        ) {
+        if (input.compatibility === "v1" && event.data.error.message === "The provider response ended unexpectedly.") {
           pendingStep = undefined
           v1InvalidOutput = true
           continue
@@ -468,7 +532,8 @@ export async function runNonInteractivePrompt(input: Input) {
       if (event.type === "session.execution.interrupted") {
         if (input.compatibility === "v1" && (permissionRejected || formCancelled)) return
         if (event.data.reason === "user" && interrupted) process.exitCode = 130
-        if (event.data.reason !== "user" && !emittedError) {
+        // A declined tool call ends the step with an interruption; it was already reported above.
+        if (event.data.reason !== "user" && !emittedError && !permissionRejected && !formCancelled) {
           emittedError = true
           process.exitCode = 1
           const error = { type: "aborted" as const, message: `Session interrupted: ${event.data.reason}` }
@@ -477,6 +542,135 @@ export async function runNonInteractivePrompt(input: Input) {
         return
       }
       if (event.type === "session.execution.succeeded") return
+    }
+  }
+
+  const projectedMessages = async () => {
+    const messages: SessionMessageInfo[] = []
+    let cursor: string | undefined
+    while (true) {
+      const page = await input.client.message.list(
+        cursor
+          ? { sessionID: input.sessionID, limit: 200, cursor }
+          : { sessionID: input.sessionID, limit: 200, order: "desc" },
+      )
+      for (const message of page.data) {
+        if (message.id === messageID) return { found: true, messages: messages.toReversed() }
+        messages.push(message)
+      }
+      cursor = page.cursor.next ?? undefined
+      if (!cursor) return { found: false, messages: [] }
+    }
+  }
+
+  const reconcile = async () => {
+    const projected = await projectedMessages()
+    for (const message of projected.messages) {
+      if (message.type !== "assistant") continue
+      const timestamp = message.time.completed ?? message.time.created
+      let textOrdinal = 0
+      let reasoningOrdinal = 0
+      for (const item of message.content) {
+        if (item.type === "text") {
+          const ordinal = textOrdinal++
+          const key = contentKey(message.id, ordinal)
+          const rendered = renderedText.get(key) ?? ""
+          if (rendered === item.text || !item.text.startsWith(rendered)) continue
+          const text = item.text.slice(rendered.length)
+          writeText(
+            {
+              id: projectedPartID(message.id, `text-${ordinal}`),
+              sessionID: input.sessionID,
+              messageID: message.id,
+              type: "text",
+              text,
+              time: { start: message.time.created, end: timestamp },
+            },
+            timestamp,
+          )
+          renderedText.set(key, item.text)
+          continue
+        }
+        if (item.type === "reasoning") {
+          const ordinal = reasoningOrdinal++
+          if (!input.thinking) continue
+          const key = contentKey(message.id, ordinal)
+          const rendered = renderedReasoning.get(key) ?? ""
+          if (rendered === item.text || !item.text.startsWith(rendered)) continue
+          const text = item.text.slice(rendered.length)
+          const part = {
+            id: projectedPartID(message.id, `reasoning-${ordinal}`),
+            sessionID: input.sessionID,
+            messageID: message.id,
+            type: "reasoning",
+            text,
+            metadata: item.native,
+            time: { start: message.time.created, end: timestamp },
+          }
+          renderedReasoning.set(key, item.text)
+          writeReasoning(part, timestamp)
+          continue
+        }
+
+        const key = toolKey(message.id, item.id)
+        if (renderedTools.has(key) || item.state.status === "streaming" || item.state.status === "running") continue
+        const part: MiniToolPart = {
+          partID: projectedPartID(message.id, `tool-${item.id}`),
+          sessionID: input.sessionID,
+          messageID: message.id,
+          type: "tool",
+          id: item.id,
+          tool: item.name,
+          state:
+            item.state.status === "completed"
+              ? {
+                  status: "completed",
+                  input: item.state.input,
+                  output: toolOutputText(item.name, item.state.content),
+                  title: item.name,
+                  metadata: { metadata: item.state.metadata, content: item.state.content },
+                  time: { start: item.time.ran ?? item.time.created, end: item.time.completed ?? timestamp },
+                }
+              : {
+                  status: "error",
+                  input: item.state.input,
+                  error: item.state.error.message,
+                  metadata: { metadata: item.state.metadata, content: item.state.content },
+                  time: { start: item.time.ran ?? item.time.created, end: item.time.completed ?? timestamp },
+                },
+        }
+        renderedTools.add(key)
+        if (emit("tool_use", timestamp, { part })) continue
+        if (item.state.status === "completed") {
+          await input.renderTool(item)
+          continue
+        }
+        if (item.state.content && toolOutputText(item.name, item.state.content).trim()) {
+          await input.renderTool({
+            ...item,
+            state: {
+              status: "completed",
+              input: item.state.input,
+              metadata: item.state.metadata,
+              content: item.state.content,
+            },
+          })
+        }
+        await input.renderToolError(item)
+        UI.error(item.state.error.message)
+      }
+
+      // A declined tool call ends its step with an interrupted-step error that is
+      // only a consequence of our own rejection; it was already reported above.
+      if (message.error && !emittedError && !permissionRejected && !formCancelled) {
+        emittedError = true
+        process.exitCode = 1
+        if (!emit("error", timestamp, { error: message.error })) UI.error(message.error.message)
+      }
+    }
+    return {
+      found: projected.found,
+      responded: projected.messages.some((message) => message.type === "assistant"),
     }
   }
 
@@ -543,12 +737,12 @@ export async function runNonInteractivePrompt(input: Input) {
 
     const [permissions, forms, globals] = await Promise.all([
       input.client.permission.list({ sessionID: input.sessionID }).catch(() => undefined),
-      input.client.form.list({ sessionID: input.sessionID }).catch(() => undefined),
+      input.client.session.form.list({ sessionID: input.sessionID }).catch(() => undefined),
       input.attached
         ? Promise.resolve(undefined)
-        : input.client.form.request
+        : input.client.form
             .list({
-              location: { directory: input.location.directory, workspace: input.location.workspaceID },
+              location: { directory: input.location.directory },
             })
             .catch(() => undefined),
     ])
@@ -559,16 +753,41 @@ export async function runNonInteractivePrompt(input: Input) {
         ? globals.data.filter((form) => form.sessionID === GLOBAL_FORM_SESSION_ID).map(cancelForm)
         : []),
     ])
-    await completed
+    if (input.compatibility === "v1") {
+      await completed
+      return
+    }
+
+    const waiting = input.client.session.wait({ sessionID: input.sessionID })
+    await Promise.race([waiting, completed.then(() => waiting)])
+    finalizing = true
+    const projected = await reconcile()
+    if (
+      !projected.responded &&
+      !interrupted &&
+      !permissionRejected &&
+      !formCancelled &&
+      !emittedError &&
+      !prePromotionError
+    ) {
+      await completed
+    }
+    if (!projected.found && !interrupted && !permissionRejected && !formCancelled && !emittedError) {
+      const error = prePromotionError ?? { type: "unknown", message: "Prompt was not promoted" }
+      emittedError = true
+      process.exitCode = 1
+      if (!emit("error", Date.now(), { error })) UI.error(error.message)
+    }
   } finally {
     process.off("SIGINT", interrupt)
     controller.abort()
-    await stream.return?.(undefined).catch(() => {})
+    if (input.compatibility === "v1") await stream.return?.(undefined).catch(() => {})
+    else void stream.return?.(undefined).catch(() => {})
   }
 }
 
 function sameLocation(left: LocationRef | undefined, right: LocationRef) {
-  return !!left && left.directory === right.directory && left.workspaceID === right.workspaceID
+  return !!left && left.directory === right.directory
 }
 
 function formRequestOptions(location: LocationRef | undefined): [] | [{ headers: Record<string, string> }] {
@@ -577,28 +796,35 @@ function formRequestOptions(location: LocationRef | undefined): [] | [{ headers:
     {
       headers: {
         "x-opencode-directory": encodeURIComponent(location.directory),
-        ...(location.workspaceID ? { "x-opencode-workspace": location.workspaceID } : {}),
       },
     },
   ]
 }
 
 function formAlreadySettled(error: unknown) {
-  return !!error && typeof error === "object" && Reflect.get(error, "_tag") === "FormAlreadySettledError"
+  return !!error && typeof error === "object" && "_tag" in error && error._tag === "FormAlreadySettledError"
 }
 
 function partID(eventID: string) {
   return `prt_${eventID.replace(/^evt_/, "")}`
 }
 
-function toolKey(messageID: string, callID: string) {
-  return `${messageID}\u0000${callID}`
+function toolKey(messageID: string, id: string) {
+  return `${messageID}\u0000${id}`
+}
+
+function contentKey(messageID: string, ordinal: number) {
+  return `${messageID}\u0000${ordinal}`
+}
+
+function projectedPartID(messageID: string, part: string) {
+  return `prt_${messageID.replace(/^msg_/, "")}_${part}`
 }
 
 function fallbackTool(event: {
   id: string
   created: number
-  data: { assistantMessageID: string; callID: string }
+  data: { assistantMessageID: string; id: string }
 }): ToolState {
   return {
     id: partID(event.id),
@@ -606,7 +832,7 @@ function fallbackTool(event: {
     assistantMessageID: event.data.assistantMessageID,
     tool: "tool",
     input: {},
-    structured: {},
+    metadata: {},
     content: [],
   }
 }

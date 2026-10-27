@@ -1,61 +1,108 @@
-import type { SessionMessageAssistant, SessionMessageInfo } from "@opencode-ai/client"
+import type { SessionInboxEnqueued, SessionMessageAssistant, SessionMessageInfo } from "@opencode/client"
 import { createEffect, on, onCleanup, type Accessor } from "solid-js"
 import { createStore, produce, reconcile } from "solid-js/store"
+import { useConfig } from "../../config"
 import { useData } from "../../context/data"
 import { useClient } from "../../context/client"
+import {
+  append,
+  completePrevious,
+  groupRefs,
+  hasPart,
+  messagePath,
+  partitionPending,
+  partPath,
+  projectEntries,
+  type AppendPart,
+  type CacheUsage,
+  type PartRef,
+  type ProjectionEntry,
+  type SessionRow,
+  type Verbosity,
+  defaultVerbosity,
+} from "./grouping/session"
+import { groupID } from "./anchors"
+export type { CacheUsage, PartRef, SessionRow } from "./grouping/session"
 
-export type PartRef = {
-  messageID: string
-  partID: string
+/**
+ * A page boundary can cut a group in half, which would show a partial summary and
+ * give the group a provisional ID (derived from its first part). While the oldest
+ * row is a group, keep loading older pages until something precedes it.
+ */
+export async function completeGroupBoundary(input: {
+  rows: readonly SessionRow[]
+  messages: () => number
+  more: () => boolean
+  loadMore: () => Promise<void>
+  active: () => boolean
+}) {
+  while (input.active() && input.rows[0]?.type === "group" && input.more()) {
+    const before = input.messages()
+    await input.loadMore()
+    // A page that adds nothing would otherwise loop forever.
+    if (input.messages() === before) return
+  }
 }
 
-export type SessionRow =
-  | { type: "message"; messageID: string }
-  | { type: "compaction-queued"; inputID: string }
-  | { type: "part"; ref: PartRef }
-  | {
-      type: "group"
-      kind: "reasoning"
-      refs: PartRef[]
-      completed: boolean
-    }
-  | {
-      type: "group"
-      kind: "exploration"
-      refs: PartRef[]
-      pending: PartRef[]
-      completed: boolean
-    }
-  | { type: "assistant-footer"; messageID: string }
-
-export function createSessionRows(sessionID: Accessor<string>) {
+export function createSessionRows(sessionID: Accessor<string>, onSynced?: (sessionID: string) => void) {
   const data = useData()
   const client = useClient()
-  const [rows, setRows] = createStore<SessionRow[]>([])
+  const config = useConfig()
+  const [rows, setRows] = createStore<(SessionRow & { key?: string })[]>([])
   const revertBoundary = () => data.session.get(sessionID())?.revert?.messageID
+  const turnTokens = () => Boolean(config.data.debug?.turn_tokens)
+  const verbosity = () => config.data.session?.verbosity ?? defaultVerbosity
 
   function reduce() {
     const messages = data.session.message.list(sessionID())
     const inputs = new Set(data.session.input.list(sessionID()))
+    const pending = data.session.pending.list(sessionID())
+    const queued = new Set(
+      pending.flatMap((item) => (item.type === "user" && item.delivery === "queue" ? [item.id] : [])),
+    )
+    const visible = queued.size === 0 ? messages : messages.filter((message) => !queued.has(message.id))
     const boundary = revertBoundary()
-    const rows = reduceSessionRows(boundary ? messages.filter((message) => message.id < boundary) : messages, inputs)
+    const rows = reduceSessionRows(
+      boundary ? visible.filter((message) => message.id < boundary) : visible,
+      inputs,
+      turnTokens(),
+      verbosity(),
+    )
     partitionPending(rows, pendingPermissions())
     const position = rows.findIndex((row) => row.type === "message" && inputs.has(row.messageID))
     rows.splice(
       position === -1 ? rows.length : position,
       0,
-      ...data.session.pending
-        .list(sessionID())
+      ...pending
         .filter((item) => item.type === "compaction")
-        .map((item): SessionRow => ({ type: "compaction-queued", inputID: item.id })),
+        .map((item): SessionRow => ({ type: "compaction-queued", inboxID: item.id })),
     )
     return rows
+  }
+
+  // Rows have no `id`, Solid's default reconcile key. Matching by position instead would move every
+  // row into another store object whenever older history is prepended, remounting the whole transcript.
+  // Rows inserted live carry no key, so key the current rows too before matching.
+  function rebuild() {
+    setRows(
+      produce((draft) => {
+        draft.forEach((row) => {
+          row.key = rowKey(row)
+        })
+      }),
+    )
+    setRows(
+      reconcile(
+        reduce().map((row) => ({ ...row, key: rowKey(row) })),
+        { key: "key" },
+      ),
+    )
   }
 
   function pendingPermissions() {
     return new Set(
       (data.session.permission.list(sessionID()) ?? []).flatMap((request) =>
-        request.source?.type === "tool" ? [request.source.callID] : [],
+        request.source?.type === "tool" ? [request.source.id] : [],
       ),
     )
   }
@@ -72,33 +119,41 @@ export function createSessionRows(sessionID: Accessor<string>) {
   createEffect(
     on([sessionID, () => client.connection.status()], ([id, status]) => {
       if (status !== "connected") return
-      setRows(reconcile(reduce()))
+      rebuild()
       void data.session.pending.sync(id).catch(() => undefined)
-      void data.session.message.sync(id).then(
-        () => {
+      void data.session.message
+        .sync(id)
+        .then(async () => {
           if (sessionID() !== id) return
-          setRows(reconcile(reduce()))
-        },
-        () => undefined,
-      )
+          rebuild()
+          // Restoration waits for complete boundary groups so saved group IDs resolve.
+          await completeGroupBoundary({
+            rows,
+            messages: () => data.session.message.list(id).length,
+            more: () => data.session.message.more(id),
+            loadMore: () => data.session.message.loadMore(id),
+            active: () => sessionID() === id,
+          }).catch(() => undefined)
+          if (sessionID() === id) onSynced?.(id)
+        })
+        .catch(() => undefined)
     }),
   )
 
-  // Re-reduce when the revert boundary changes (stage/clear/commit).
-  createEffect(
-    on(revertBoundary, () => {
-      setRows(reconcile(reduce()))
-    }),
-  )
+  // Re-reduce when the revert boundary changes (stage/clear/commit). These reactions defer
+  // their first run: the mount effect above has already reduced the same state.
+  createEffect(on(revertBoundary, rebuild, { defer: true }))
 
   createEffect(
     on(
       () =>
-        data.session.pending
-          .list(sessionID())
-          .filter((item) => item.type === "compaction")
-          .map((item) => item.id),
-      () => setRows(reconcile(reduce())),
+        data.session.pending.list(sessionID()).flatMap((item) => {
+          if (item.type === "compaction") return [`${item.id}:compaction`]
+          if (item.type === "user" && item.delivery === "queue") return [`${item.id}:queue`]
+          return []
+        }),
+      rebuild,
+      { defer: true },
     ),
   )
 
@@ -114,7 +169,7 @@ export function createSessionRows(sessionID: Accessor<string>) {
                   input: data.session.input.has(sessionID(), message.id),
                 },
               ]
-            : message.type === "compaction"
+            : message.type === "compaction" || message.type === "idle"
               ? [
                   {
                     id: message.id,
@@ -123,9 +178,12 @@ export function createSessionRows(sessionID: Accessor<string>) {
                 ]
               : [],
         ),
-      () => setRows(reconcile(reduce())),
+      rebuild,
+      { defer: true },
     ),
   )
+
+  createEffect(on([turnTokens, verbosity], rebuild, { defer: true }))
 
   const appendMessage = (messageID: string) =>
     setRows(
@@ -143,8 +201,18 @@ export function createSessionRows(sessionID: Accessor<string>) {
   const appendPart = (ref: PartRef, part: AppendPart) =>
     setRows(
       produce((draft) => {
-        if (hasPart(draft, ref)) return
-        append(draft, ref, part, queuedStart(draft))
+        if (!hasPart(draft, ref)) {
+          append(draft, ref, part, queuedStart(draft), verbosity())
+          return
+        }
+        if (part.type !== "reasoning" || part.time?.completed === undefined) return
+        const row = draft.find(
+          (row) =>
+            row.type === "group" &&
+            row.kind === "reasoning" &&
+            groupRefs(row).some((item) => item.messageID === ref.messageID && item.partID === ref.partID),
+        )
+        if (row?.type === "group" && row.kind === "reasoning") row.completed = true
       }),
     )
 
@@ -182,21 +250,16 @@ export function createSessionRows(sessionID: Accessor<string>) {
   const message = (event: { id: string; data: { sessionID: string } }) => {
     if (event.data.sessionID === sessionID()) appendMessage(event.id.replace(/^evt_/, "msg_"))
   }
-  const input = (event: {
-    data: {
-      sessionID: string
-      inputID: string
-      input: { type: "user" } | { type: "synthetic"; data: { description?: string } }
-    }
-  }) => {
+  const input = (event: SessionInboxEnqueued) => {
     if (
       event.data.sessionID === sessionID() &&
-      (event.data.input.type === "user" || event.data.input.data.description?.trim())
+      (event.data.item.type === "user" ||
+        (event.data.item.type === "synthetic" && event.data.item.payload.description?.trim()))
     )
-      appendMessage(event.data.inputID)
+      appendMessage(event.data.inboxID)
   }
   const subscriptions = [
-    data.on("session.input.admitted", input),
+    data.on("session.inbox.enqueued", input),
     data.on("session.compaction.started", (event) => {
       if (event.data.sessionID === sessionID()) appendMessage(event.data.inputID ?? event.id.replace(/^evt_/, "msg_"))
     }),
@@ -227,13 +290,13 @@ export function createSessionRows(sessionID: Accessor<string>) {
       if (event.data.sessionID === sessionID() && event.data.text.trim())
         appendPart(
           { messageID: event.data.assistantMessageID, partID: `reasoning:${event.data.ordinal}` },
-          { type: "reasoning" },
+          { type: "reasoning", time: { completed: event.created } },
         )
     }),
     data.on("session.tool.input.started", (event) => {
       if (event.data.sessionID === sessionID())
         appendPart(
-          { messageID: event.data.assistantMessageID, partID: event.data.callID },
+          { messageID: event.data.assistantMessageID, partID: event.data.id },
           { type: "tool", name: event.data.name },
         )
     }),
@@ -246,9 +309,12 @@ export function createSessionRows(sessionID: Accessor<string>) {
     data.on("session.step.ended", (event) => {
       if (event.data.sessionID !== sessionID() || ["tool-calls", "unknown"].includes(event.data.finish)) return
       appendFooter(event.data.assistantMessageID)
+      if (turnTokens()) rebuild()
     }),
     data.on("session.step.failed", (event) => {
-      if (event.data.sessionID === sessionID()) appendFooter(event.data.assistantMessageID)
+      if (event.data.sessionID !== sessionID()) return
+      appendFooter(event.data.assistantMessageID)
+      if (turnTokens()) rebuild()
     }),
   ]
   onCleanup(() => subscriptions.forEach((unsubscribe) => unsubscribe()))
@@ -256,33 +322,116 @@ export function createSessionRows(sessionID: Accessor<string>) {
   return rows
 }
 
-export function reduceSessionRows(messages: SessionMessageInfo[], inputs = new Set<string>()) {
+function rowKey(row: SessionRow) {
+  switch (row.type) {
+    case "group":
+      return groupID(row, 0)
+    case "part":
+      return JSON.stringify([row.type, row.ref.messageID, row.ref.partID])
+    case "message":
+    case "assistant-footer":
+      return JSON.stringify([row.type, row.messageID])
+    case "compaction-queued":
+      return JSON.stringify([row.type, row.inboxID])
+    case "turn-usage":
+      return JSON.stringify([row.type, row.messageIDs[0]])
+    default:
+      return row satisfies never
+  }
+}
+
+export function reduceSessionRows(
+  messages: SessionMessageInfo[],
+  inputs = new Set<string>(),
+  turnTokens = false,
+  verbosity: Verbosity = defaultVerbosity,
+) {
   const isInput = (message: SessionMessageInfo) => inputs.has(message.id)
   const pendingCompactions = messages.filter((message) => message.type === "compaction" && message.status === "running")
   const pending = new Set([...pendingCompactions.map((message) => message.id), ...inputs])
-  return [
+  const usage = turnTokens
+    ? { steps: [] as SessionMessageAssistant[], previousTurnCache: undefined as CacheUsage | undefined }
+    : undefined
+  // Without any idle marker, history predates markers and a turn ends with its terminal step.
+  // With markers, steers keep the turn open, so usage accumulates until the marker closes it.
+  const legacy = !messages.some((message) => message.type === "idle")
+  const flushTurn = (rows: ProjectionEntry[]) => {
+    if (!usage) return
+    const steps = usage.steps.filter(hasTokenUsage)
+    const last = steps.at(-1)
+    usage.steps.length = 0
+    if (!last) return
+    rows.push({
+      entry: {
+        type: "turn-usage",
+        messageIDs: steps.map((step) => step.id),
+        ...(usage.previousTurnCache === undefined ? {} : { previousCache: usage.previousTurnCache }),
+      },
+    })
+    usage.previousTurnCache = { read: last.tokens.cache.read, model: last.model }
+  }
+  const entries = [
     ...messages.filter((message) => !pending.has(message.id)),
     ...pendingCompactions,
     ...messages.filter(isInput),
-  ].reduce<SessionRow[]>((rows, message) => {
+  ].reduce<ProjectionEntry[]>((rows, message) => {
     if (message.type !== "assistant") {
+      if (message.type === "idle") {
+        flushTurn(rows)
+        return rows
+      }
       if (message.type === "synthetic" && !message.description?.trim()) return rows
-      if (!pending.has(message.id)) completePrevious(rows)
-      rows.push({ type: "message", messageID: message.id })
+      if (message.type === "compaction" && message.status === "completed" && usage) usage.previousTurnCache = undefined
+      rows.push({
+        entry: { type: "message", messageID: message.id },
+        path: messagePath(message, verbosity),
+        closesPrevious: !pending.has(message.id),
+      })
       return rows
     }
+    usage?.steps.push(message)
     const ordinals = { text: 0, reasoning: 0 }
     message.content.forEach((part) => {
       const partID = part.type === "tool" ? part.id : `${part.type}:${ordinals[part.type]++}`
       if ((part.type === "text" || part.type === "reasoning") && !part.text.trim()) return
-      append(rows, { messageID: message.id, partID }, part)
+      rows.push({
+        entry: { type: "part", ref: { messageID: message.id, partID } },
+        part,
+        path: partPath(part, verbosity),
+      })
     })
-    if ((message.finish && !["tool-calls", "unknown"].includes(message.finish)) || message.error || message.retry) {
-      completePrevious(rows)
-      rows.push({ type: "assistant-footer", messageID: message.id })
+    const terminal = (message.finish && !["tool-calls", "unknown"].includes(message.finish)) || message.error
+    if (terminal || message.retry) {
+      rows.push({ entry: { type: "assistant-footer", messageID: message.id } })
     }
+    if (terminal && legacy) flushTurn(rows)
     return rows
   }, [])
+  return projectEntries(entries)
+}
+
+export function cacheReuseDrop(previous: CacheUsage | undefined, current: CacheUsage) {
+  if (previous === undefined) return
+  if (
+    previous.model.providerID !== current.model.providerID ||
+    previous.model.id !== current.model.id ||
+    previous.model.variant !== current.model.variant
+  )
+    return
+  const drop = previous.read - current.read
+  // OpenAI cache reads can move between one and two 1,024-token buckets without a material loss of reuse.
+  if (current.model.providerID === "openai" && drop >= 1_024 && drop <= 2_048) return
+  return drop > 0 ? drop : undefined
+}
+
+function hasTokenUsage(
+  message: SessionMessageAssistant,
+): message is SessionMessageAssistant & { tokens: NonNullable<SessionMessageAssistant["tokens"]> } {
+  return message.tokens !== undefined && tokenTotal(message.tokens) > 0
+}
+
+function tokenTotal(tokens: NonNullable<SessionMessageAssistant["tokens"]>) {
+  return tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write
 }
 
 export function messageBoundaryIDs(rows: SessionRow[], messages: SessionMessageInfo[]) {
@@ -296,6 +445,11 @@ export function messageBoundaryIDs(rows: SessionRow[], messages: SessionMessageI
   })
 }
 
+export function sessionRowID(row: SessionRow, boundaryID?: string) {
+  if (boundaryID) return boundaryID
+  if (row.type === "part") return `session-part:${row.ref.messageID}:${row.ref.partID}`
+}
+
 function rowBoundaryMessageID(row: SessionRow, messages: Map<string, SessionMessageInfo>) {
   if (row.type === "message") {
     const message = messages.get(row.messageID)
@@ -306,10 +460,12 @@ function rowBoundaryMessageID(row: SessionRow, messages: Map<string, SessionMess
     row.type === "part"
       ? row.ref.messageID
       : row.type === "group"
-        ? row.refs[0]?.messageID
+        ? groupRefs(row)[0]?.messageID
         : row.type === "assistant-footer"
           ? row.messageID
-          : undefined
+          : row.type === "turn-usage"
+            ? row.messageIDs[0]
+            : undefined
   if (!messageID) return undefined
   const message = messages.get(messageID)
   if (message?.type === "assistant") return message.id
@@ -322,58 +478,4 @@ export function resolvePart(message: SessionMessageAssistant, partID: string) {
   if (!match) return
   const ordinal = Number(match[2])
   return message.content.filter((part) => part.type === match[1])[ordinal]
-}
-
-type AppendPart = { type: "text" } | { type: "reasoning" } | { type: "tool"; name: string }
-
-function append(rows: SessionRow[], ref: PartRef, part: AppendPart, index = rows.length) {
-  if (part.type === "reasoning") {
-    const previous = rows[index - 1]
-    if (previous?.type === "group" && previous.kind === "reasoning") {
-      previous.refs.push(ref)
-      return
-    }
-    completePrevious(rows, index)
-    rows.splice(index, 0, { type: "group", kind: "reasoning", refs: [ref], completed: false })
-    return
-  }
-  if (part.type === "tool" && exploration(part.name)) {
-    const previous = rows[index - 1]
-    if (previous?.type === "group" && previous.kind === "exploration") {
-      previous.refs.push(ref)
-      return
-    }
-    completePrevious(rows, index)
-    rows.splice(index, 0, { type: "group", kind: "exploration", refs: [ref], pending: [], completed: false })
-    return
-  }
-  completePrevious(rows, index)
-  rows.splice(index, 0, { type: "part", ref })
-}
-
-function completePrevious(rows: SessionRow[], index = rows.length) {
-  const previous = rows[index - 1]
-  if (previous?.type === "group") previous.completed = true
-}
-
-function partitionPending(rows: SessionRow[], pending: Set<string>) {
-  rows.forEach((row) => {
-    if (row.type !== "group" || row.kind !== "exploration") return
-    const refs = [...row.refs, ...row.pending]
-    row.refs = refs.filter((ref) => !pending.has(ref.partID))
-    row.pending = refs.filter((ref) => pending.has(ref.partID))
-  })
-}
-
-function exploration(name: string) {
-  return ["read", "glob", "grep"].includes(name.toLowerCase())
-}
-
-function hasPart(rows: SessionRow[], ref: PartRef) {
-  return rows.some((row) => {
-    if (row.type === "part") return row.ref.messageID === ref.messageID && row.ref.partID === ref.partID
-    if (row.type !== "group") return false
-    const refs = row.kind === "exploration" ? [...row.refs, ...row.pending] : row.refs
-    return refs.some((item) => item.messageID === ref.messageID && item.partID === ref.partID)
-  })
 }

@@ -1,35 +1,31 @@
-import type { ProviderOptions, ReasoningEffort, TextVerbosity } from "../schema"
-import { mergeProviderOptions } from "../schema"
-import type { OpenAIResponseIncludable, OpenAIServiceTier } from "../protocols/utils/openai-options"
+import { mergeProviderOptions, type ProviderOptions } from "../schema/index.js"
+import type { Options, ResponseIncludable, ServiceTier } from "../protocols/utils/open-responses-options.js"
+import type { ContextManagement, ReasoningContext, ReasoningMode } from "../protocols/openai-responses.js"
 
-export type { OpenAIResponseIncludable, OpenAIServiceTier } from "../protocols/utils/openai-options"
+// Mirrors OpenAI's `ResponseIncludable` union from the official SDK. Keep this
+// in lockstep with `openai-node/src/resources/responses/responses.ts`.
+export type OpenAIResponseIncludable = ResponseIncludable
+// Mirrors OpenAI's `ServiceTier` union from the official SDK.
+export type OpenAIServiceTier = ServiceTier | "scale" | "fast" | "ultrafast"
 
-export interface OpenAIOptionsInput {
-  readonly [key: string]: unknown
-  readonly store?: boolean
-  readonly promptCacheKey?: string
-  readonly reasoningEffort?: ReasoningEffort
-  readonly reasoningSummary?: "auto"
-  // OpenAI Responses `include` wire field. Mirrors the official SDK's
-  // `ResponseIncludable[]` union exactly so AI SDK callers and direct
-  // native-SDK callers share one shape and no translation is required.
-  readonly include?: ReadonlyArray<OpenAIResponseIncludable>
-  readonly textVerbosity?: TextVerbosity
+export type OpenAIOptionsInput = Omit<Options, "serviceTier"> & {
+  /** Advanced in-band compaction. The caller owns checkpoint persistence and recovery. */
+  readonly contextManagement?: ContextManagement
+  readonly reasoningMode?: ReasoningMode
+  readonly reasoningContext?: ReasoningContext
   readonly serviceTier?: OpenAIServiceTier
+  readonly [key: string]: unknown
 }
 
-export type OpenAIProviderOptionsInput = ProviderOptions & {
-  readonly openai?: OpenAIOptionsInput
-}
+export type OpenAIProviderOptionsInput = OpenAIOptionsInput
 
 const definedEntries = (input: Record<string, unknown>) =>
   Object.entries(input).filter((entry) => entry[1] !== undefined)
 
 const openAIProviderOptions = (options: OpenAIOptionsInput | undefined): ProviderOptions | undefined => {
-  const openai = Object.fromEntries(
+  const result = Object.fromEntries(
     definedEntries({
       store: options?.store,
-      promptCacheKey: options?.promptCacheKey,
       reasoningEffort: options?.reasoningEffort,
       reasoningSummary: options?.reasoningSummary,
       include: options?.include,
@@ -37,14 +33,11 @@ const openAIProviderOptions = (options: OpenAIOptionsInput | undefined): Provide
       serviceTier: options?.serviceTier,
     }),
   )
-  if (Object.keys(openai).length === 0) return undefined
-  return { openai }
+  if (Object.keys(result).length === 0) return undefined
+  return result
 }
 
-export const gpt5DefaultOptions = (
-  modelID: string,
-  options: { readonly textVerbosity?: boolean } = {},
-): ProviderOptions | undefined => {
+export const gpt5DefaultOptions = (modelID: string): ProviderOptions | undefined => {
   const id = modelID.toLowerCase()
   if (!id.includes("gpt-5") || id.includes("gpt-5-chat") || id.includes("gpt-5-pro")) return undefined
   return openAIProviderOptions({
@@ -56,28 +49,18 @@ export const gpt5DefaultOptions = (
     // this, callers using the default model facade get reasoning summaries
     // they cannot replay statelessly.
     include: ["reasoning.encrypted_content"],
-    textVerbosity:
-      options.textVerbosity === true && id.includes("gpt-5.") && !id.includes("codex") && !id.includes("-chat")
-        ? "low"
-        : undefined,
   })
 }
 
-export const openAIDefaultOptions = (
-  modelID: string,
-  options: { readonly textVerbosity?: boolean } = {},
-): ProviderOptions | undefined =>
-  mergeProviderOptions(openAIProviderOptions({ store: false }), gpt5DefaultOptions(modelID, options))
+export const openAIDefaultOptions = (modelID: string): ProviderOptions | undefined =>
+  mergeProviderOptions(openAIProviderOptions({ store: false }), gpt5DefaultOptions(modelID))
 
-export const withOpenAIOptions = <Options extends { readonly providerOptions?: OpenAIProviderOptionsInput }>(
+export const withOpenAIOptions = <Options extends { readonly providerOptions?: ProviderOptions }>(
   modelID: string,
   options: Options,
-  defaults: { readonly textVerbosity?: boolean } = {},
 ): Omit<Options, "providerOptions"> & { readonly providerOptions?: ProviderOptions } => {
   return {
     ...options,
-    providerOptions: mergeProviderOptions(openAIDefaultOptions(modelID, defaults), options.providerOptions),
+    providerOptions: mergeProviderOptions(openAIDefaultOptions(modelID), options.providerOptions),
   }
 }
-
-export * as OpenAIProviderOptions from "./openai-options"

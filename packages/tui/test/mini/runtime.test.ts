@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test"
-import { OpenCode } from "@opencode-ai/client/promise"
+import { OpenCode } from "@opencode/client/promise"
 import { runInteractiveDeferredMode } from "../../src/mini/runtime"
 import type { LifecycleInput } from "../../src/mini/runtime.lifecycle"
 import type { FooterEvent, MiniHost } from "../../src/mini/types"
 import { catalogModel, catalogProvider, stubCatalogLists } from "./fixture/catalog"
 import { createFooterApiFixture } from "./fixture/footer-api"
-import { createTuiResolvedConfig } from "./fixture/tui-runtime"
+import { createTuiResolvedConfig } from "../fixture/tui-runtime"
 
 function defer<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
@@ -21,6 +21,7 @@ function ok<T>(data: T) {
 
 function host(): MiniHost {
   return {
+    version: "local",
     terminal: { stdin: process.stdin },
     platform: "linux",
     stdout: { write() {} },
@@ -49,14 +50,41 @@ afterEach(() => {
 })
 
 describe("run interactive runtime", () => {
-  test("routes form responses to their owners with global location and local settlement", async () => {
+  test("resolves the default model reactively without blocking catalog startup", async () => {
     const sdk = OpenCode.make({ baseUrl: "https://opencode.test" })
-    const api = footer()
-    const streamStarted = defer<void>()
+    const events: FooterEvent[] = []
+    const ui = createFooterApiFixture({ events })
+    const api = ui.api
+    const selected = defer<Awaited<ReturnType<typeof sdk.model.default>>>()
+    const catalogLoaded = defer<void>()
+    const defaultModelReloaded = defer<void>()
+    const modelShown = defer<void>()
+    const turnStarted = defer<void>()
+    const model = catalogModel({
+      id: "resolved",
+      providerID: "test",
+      name: "Resolved Model",
+      variants: ["low", "high"],
+    })
     let lifecycle!: LifecycleInput
-    const settled: Array<{ sessionID: string; formID: string }> = []
-    stubCatalogLists(sdk)
-    const reply = spyOn(sdk.form, "reply").mockImplementation(() => ok(undefined))
+    let turnAgent: string | undefined
+    let turnModel: { providerID: string; modelID: string } | undefined
+    let refreshCatalog: (() => Promise<unknown>) | undefined
+    stubCatalogLists(sdk, {
+      providers: [catalogProvider("test", "Test Provider")],
+      models: [model],
+    })
+    let defaultModelCalls = 0
+    const defaultModel = spyOn(sdk.model, "default").mockImplementation(() => {
+      defaultModelCalls++
+      if (defaultModelCalls === 2) defaultModelReloaded.resolve()
+      return selected.promise
+    })
+    const emit = api.event.bind(api)
+    api.event = (event) => {
+      emit(event)
+      if (event.type === "model") modelShown.resolve()
+    }
 
     const task = runInteractiveDeferredMode(
       {
@@ -65,7 +93,96 @@ describe("run interactive runtime", () => {
         directory: "/tmp",
         target: async () => ({
           sessionID: "ses_root",
-          location: { directory: "/tmp", project: { id: "pro-1", directory: "/tmp" } },
+          location: { directory: "/tmp", project: { id: "pro-1", directory: "/tmp", canonical: "/tmp" } },
+          agent: "build",
+          model: undefined,
+          variant: undefined,
+          resume: false,
+        }),
+        agent: "build",
+        model: undefined,
+        variant: undefined,
+        files: [],
+      },
+      {
+        createRuntimeLifecycle: async (input) => {
+          lifecycle = input
+          return {
+            footer: api,
+            onResize: () => () => {},
+            refreshTheme: () => {},
+            setTitle: () => {},
+            resetForReplay: () => Promise.resolve(),
+            close: () => Promise.resolve(),
+          }
+        },
+        streamTransport: Promise.resolve({
+          createSessionTransport: async (input) => {
+            refreshCatalog = () => Promise.resolve(input.onCatalogRefresh?.())
+            await refreshCatalog()
+            catalogLoaded.resolve()
+            return {
+              runPromptTurn: async (input) => {
+                turnAgent = input.agent
+                turnModel = input.model
+                turnStarted.resolve()
+                api.close()
+              },
+              admitPromptTurn: async () => {},
+              waitForIdle: async () => {},
+              interruptActiveTurn: async () => {},
+              selectSubagent: () => {},
+              replayOnResize: async () => false,
+              close: async () => {},
+            }
+          },
+          formatUnknownError: (error: unknown) => String(error),
+        }),
+      },
+    )
+
+    await catalogLoaded.promise
+    expect(events.some((event) => event.type === "model")).toBe(false)
+    await refreshCatalog?.()
+    expect(defaultModel).toHaveBeenCalledTimes(1)
+    selected.resolve({
+      location: { directory: "/tmp" },
+      data: model,
+    })
+    await defaultModelReloaded.promise
+    await modelShown.promise
+    expect(events).toContainEqual({
+      type: "model",
+      model: "Resolved Model · Test Provider",
+      selection: { providerID: "test", modelID: "resolved" },
+    })
+    expect(lifecycle.onCycleVariant?.()).toMatchObject({ status: "variant low", variant: "low" })
+    lifecycle.onAgentSelect?.("review")
+    await ui.promptReady
+    expect(ui.submit("hello")).toBe(true)
+    await turnStarted.promise
+    expect(turnAgent).toBe("review")
+    expect(turnModel).toEqual({ providerID: "test", modelID: "resolved" })
+    await task
+  })
+
+  test("routes form responses to their owners with global location and local settlement", async () => {
+    const sdk = OpenCode.make({ baseUrl: "https://opencode.test" })
+    const api = footer()
+    const streamStarted = defer<void>()
+    let lifecycle!: LifecycleInput
+    const settled: Array<{ sessionID: string; formID: string }> = []
+    stubCatalogLists(sdk)
+    const reply = spyOn(sdk.session.form, "reply").mockImplementation(() => ok(undefined))
+
+    const task = runInteractiveDeferredMode(
+      {
+        host: host(),
+        sdk,
+        directory: "/tmp",
+        target: async () => ({
+          sessionID: "ses_root",
+          location: { directory: "/tmp", project: { id: "pro-1", directory: "/tmp", canonical: "/tmp" } },
           agent: "build",
           model: { providerID: "test", modelID: "model" },
           variant: undefined,
@@ -75,7 +192,6 @@ describe("run interactive runtime", () => {
         model: { providerID: "test", modelID: "model" },
         variant: undefined,
         files: [],
-        thinking: false,
       },
       {
         createRuntimeLifecycle: async (input) => {
@@ -84,6 +200,7 @@ describe("run interactive runtime", () => {
             footer: api,
             onResize: () => () => {},
             refreshTheme: () => {},
+            setTitle: () => {},
             resetForReplay: () => Promise.resolve(),
             close: () => Promise.resolve(),
           }
@@ -93,6 +210,8 @@ describe("run interactive runtime", () => {
             streamStarted.resolve()
             return {
               runPromptTurn: async () => {},
+              admitPromptTurn: async () => {},
+              waitForIdle: async () => {},
               interruptActiveTurn: async () => {},
               selectSubagent: () => {},
               settleForm: (sessionID: string, formID: string) => settled.push({ sessionID, formID }),
@@ -110,19 +229,18 @@ describe("run interactive runtime", () => {
       sessionID: "global",
       formID: "frm_global",
       answer: { value: "yes" },
-      location: { directory: "/remote work", workspaceID: "wrk_1" },
+      location: { directory: "/remote work" },
     })
     expect(reply).toHaveBeenCalledWith(
       {
         sessionID: "global",
         formID: "frm_global",
         answer: { value: "yes" },
-        location: { directory: "/remote work", workspaceID: "wrk_1" },
+        location: { directory: "/remote work" },
       },
       {
         headers: {
           "x-opencode-directory": "%2Fremote%20work",
-          "x-opencode-workspace": "wrk_1",
         },
       },
     )
@@ -158,7 +276,7 @@ describe("run interactive runtime", () => {
           return {
             sessionID: "ses-deferred",
             sessionTitle: "Deferred",
-            location: { directory: "/tmp", project: { id: "pro-1", directory: "/tmp" } },
+            location: { directory: "/tmp", project: { id: "pro-1", directory: "/tmp", canonical: "/tmp" } },
             agent: "build",
             model: { providerID: "openai", modelID: "gpt-5" },
             variant: undefined,
@@ -169,7 +287,6 @@ describe("run interactive runtime", () => {
         model: { providerID: "openai", modelID: "gpt-5" },
         variant: undefined,
         files: [],
-        thinking: false,
       },
       {
         createRuntimeLifecycle: async () => {
@@ -178,6 +295,7 @@ describe("run interactive runtime", () => {
             footer: api,
             onResize: () => () => {},
             refreshTheme: () => {},
+            setTitle: () => {},
             resetForReplay: () => Promise.resolve(),
             close: () => Promise.resolve(),
           }
@@ -197,6 +315,7 @@ describe("run interactive runtime", () => {
     const lifecycleStarted = defer<void>()
     const painted = defer<void>()
     const events: FooterEvent[] = []
+    const titles: Array<string | undefined> = []
     const api = footer(events)
     api.idle = () => painted.promise
     const event = api.event
@@ -244,7 +363,7 @@ describe("run interactive runtime", () => {
         target: async () => ({
           sessionID: "ses-resume",
           sessionTitle: "Resume",
-          location: { directory: "/tmp", project: { id: "pro-1", directory: "/tmp" } },
+          location: { directory: "/tmp", project: { id: "pro-1", directory: "/tmp", canonical: "/tmp" } },
           agent: "review",
           model: { providerID: "openai", modelID: "gpt-5" },
           variant: "high",
@@ -254,7 +373,6 @@ describe("run interactive runtime", () => {
         model: undefined,
         variant: undefined,
         files: [],
-        thinking: false,
       },
       {
         createRuntimeLifecycle: async () => {
@@ -263,6 +381,7 @@ describe("run interactive runtime", () => {
             footer: api,
             onResize: () => () => {},
             refreshTheme: () => {},
+            setTitle: (title) => titles.push(title),
             resetForReplay: () => Promise.resolve(),
             close: () => Promise.resolve(),
           }
@@ -280,6 +399,7 @@ describe("run interactive runtime", () => {
       history: [{ text: "previous prompt", parts: [] }],
     })
     expect(events).toContainEqual({ type: "agent", agent: "review" })
+    expect(titles).toEqual(["Resume"])
     expect(events).toContainEqual({
       type: "model",
       model: "Little Frank · OpenAI · high",
@@ -325,7 +445,7 @@ describe("run interactive runtime", () => {
         target: async () => ({
           sessionID: "ses-resume-abort",
           sessionTitle: "Cached title",
-          location: { directory: "/tmp", project: { id: "pro-1", directory: "/tmp" } },
+          location: { directory: "/tmp", project: { id: "pro-1", directory: "/tmp", canonical: "/tmp" } },
           agent: "build",
           model: undefined,
           variant: undefined,
@@ -335,13 +455,13 @@ describe("run interactive runtime", () => {
         model: undefined,
         variant: undefined,
         files: [],
-        thinking: false,
       },
       {
         createRuntimeLifecycle: async () => ({
           footer: api,
           onResize: () => () => {},
           refreshTheme: () => {},
+          setTitle: () => {},
           resetForReplay: () => Promise.resolve(),
           close: async (input) => {
             closedTitle = input.sessionTitle
@@ -365,7 +485,7 @@ describe("run interactive runtime", () => {
     expect(closedTitle).toBe("Cached title")
   })
 
-  test("adopts the deferred target location for catalogs, files, and runtime placement", async () => {
+  test("adopts deferred target placement and supplied TUI config", async () => {
     const sdk = OpenCode.make({ baseUrl: "https://opencode.test" })
     const lifecycleStarted = defer<void>()
     const painted = defer<void>()
@@ -375,6 +495,8 @@ describe("run interactive runtime", () => {
     let getDirectory: (() => string) | undefined
     let findFiles: ((query: string) => Promise<string[]>) | undefined
     let transportLocation: unknown
+    let runtimeConfig: LifecycleInput["tuiConfig"] | undefined
+    const tuiConfig = createTuiResolvedConfig({ keybinds: { "variant.cycle": "ctrl+g" } })
     const catalogs = stubCatalogLists(sdk, {
       location: { directory: "/session", workspaceID: "work-1" },
     })
@@ -382,7 +504,7 @@ describe("run interactive runtime", () => {
       location: {
         directory: "/session",
         workspaceID: "work-1",
-        project: { id: "pro-1", directory: "/session" },
+        project: { id: "pro-1", directory: "/session", canonical: "/session" },
       },
       data: [{ path: "src/index.ts", type: "file" }],
     } as never)
@@ -399,7 +521,7 @@ describe("run interactive runtime", () => {
             location: {
               directory: "/session",
               workspaceID: "work-1",
-              project: { id: "location-project", directory: "/session" },
+              project: { id: "location-project", directory: "/session", canonical: "/session" },
             },
             agent: "review",
             model: { providerID: "openai", modelID: "gpt-5" },
@@ -411,16 +533,19 @@ describe("run interactive runtime", () => {
         model: undefined,
         variant: undefined,
         files: [],
+        tuiConfig,
       },
       {
         createRuntimeLifecycle: async (input) => {
           getDirectory = input.getDirectory
           findFiles = input.findFiles
+          runtimeConfig = input.tuiConfig
           lifecycleStarted.resolve()
           return {
             footer: api,
             onResize: () => () => {},
             refreshTheme: () => {},
+            setTitle: () => {},
             resetForReplay: () => Promise.resolve(),
             close: () => Promise.resolve(),
           }
@@ -432,6 +557,8 @@ describe("run interactive runtime", () => {
             setTimeout(() => input.footer.close(), 0)
             return {
               runPromptTurn: async () => {},
+              admitPromptTurn: async () => {},
+              waitForIdle: async () => {},
               interruptActiveTurn: async () => {},
               selectSubagent: () => {},
               replayOnResize: async () => false,
@@ -449,15 +576,16 @@ describe("run interactive runtime", () => {
     painted.resolve()
     await task
 
-    const query = { location: { directory: "/session", workspace: "work-1" } }
+    const query = { location: { directory: "/session" } }
     expect(getDirectory?.()).toBe("/session")
+    if (!runtimeConfig) throw new Error("runtime lifecycle did not receive TUI config")
+    expect(await runtimeConfig).toBe(tuiConfig)
     expect(transportLocation).toMatchObject({ directory: "/session", workspaceID: "work-1" })
     expect(catalogs.provider).toHaveBeenCalledWith(query, { signal: expect.any(AbortSignal) })
     expect(catalogs.model).toHaveBeenCalledWith(query, { signal: expect.any(AbortSignal) })
     expect(catalogs.agent).toHaveBeenCalledWith(query, { signal: expect.any(AbortSignal) })
     expect(catalogs.reference).toHaveBeenCalledWith(query, { signal: expect.any(AbortSignal) })
     expect(catalogs.command).toHaveBeenCalledWith(query, { signal: expect.any(AbortSignal) })
-    expect(catalogs.skill).toHaveBeenCalledWith(query, { signal: expect.any(AbortSignal) })
     expect(fileFind).toHaveBeenCalledWith({ query: "index", type: "file", ...query })
   })
 })
